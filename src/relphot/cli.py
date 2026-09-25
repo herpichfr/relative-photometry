@@ -120,7 +120,10 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--out", required=True, help="output .npz path")
     ingest.add_argument(
         "--format", choices=["fits", "csv"], default=None,
-        help="catalogue format (default: guess per file from its extension)",
+        help=(
+            "catalogue format (default: auto — FITS catalogue HDU, using a "
+            "CSV's companion *_proc.fits when it has one)"
+        ),
     )
     ingest.add_argument(
         "--np", type=int, default=4, dest="np",

@@ -402,11 +402,43 @@ def read_csv_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
     )
 
 
+def resolve_catalog_source(path: Path, settings: Settings, fmt: str | None) -> tuple[Path, str]:
+    """Resolve the file and format actually read for ``path``.
+
+    An explicit ``fmt`` (``"fits"`` or ``"csv"``, or anything else a caller
+    passes) is returned unchanged. In auto mode (``fmt is None``), a ``.csv``
+    path is redirected to its companion ``*_proc.fits`` -- see
+    :func:`_companion_fits` -- when that companion exists and its
+    ``settings.catalog.hdu_name`` BinTableHDU is present; the HDU check opens
+    the companion with ``memmap=True`` and only inspects the HDU list, never
+    its data. Any failure to open the companion (``OSError``) or a missing
+    HDU falls back to reading the CSV itself. A non-``.csv`` path in auto
+    mode is always read as FITS.
+    """
+    if fmt is not None:
+        return path, fmt
+    if path.suffix.lower() != ".csv":
+        return path, "fits"
+    companion = _companion_fits(path)
+    if companion is not None:
+        try:
+            with fits.open(companion, memmap=True) as hdul:
+                if settings.catalog.hdu_name in hdul:
+                    logger.info("%s: using companion FITS catalogue %s", path, companion)
+                    return companion, "fits"
+        except OSError:
+            pass
+    return path, "csv"
+
+
 def read_catalog(path: Path | str, settings: Settings, fmt: str | None = None) -> FrameCatalog:
-    """Read one catalogue file, dispatching on ``fmt`` or the file extension."""
+    """Read one catalogue file, dispatching on ``fmt`` or the file extension.
+
+    In auto mode (``fmt is None``) a CSV is redirected to its companion FITS
+    when one is available -- see :func:`resolve_catalog_source`.
+    """
     path = Path(path)
-    if fmt is None:
-        fmt = "csv" if path.suffix.lower() == ".csv" else "fits"
+    path, fmt = resolve_catalog_source(path, settings, fmt)
     if fmt == "fits":
         return read_fits_catalog(path, settings)
     if fmt == "csv":
@@ -427,9 +459,33 @@ def read_catalogs(
     that follows it release the GIL for most of the work, and threads avoid
     the per-call pickling cost a process pool would pay for every returned
     :class:`FrameCatalog` (including its embedded WCS).
+
+    Each path is first resolved with :func:`resolve_catalog_source`. In auto
+    mode this can send two different inputs (e.g. a CSV and its companion
+    FITS) to the same underlying file and format; when that happens only the
+    first occurrence is kept, a warning names the dropped duplicate, and the
+    returned list preserves the order of the kept inputs.
     """
     if not paths:
         return []
+
+    resolved = [resolve_catalog_source(Path(p), settings, fmt) for p in paths]
+
+    seen: dict[tuple[Path, str], int] = {}
+    keep_indices: list[int] = []
+    for i, res in enumerate(resolved):
+        if res in seen:
+            first = paths[seen[res]]
+            logger.warning(
+                "%s: duplicate of %s (both resolve to %s); skipping",
+                paths[i], first, res[0],
+            )
+            continue
+        seen[res] = i
+        keep_indices.append(i)
+
+    kept = [resolved[i] for i in keep_indices]
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        results = list(pool.map(lambda p: read_catalog(p, settings, fmt), paths))
+        results = list(pool.map(lambda pf: read_catalog(pf[0], settings, pf[1]), kept))
     return results

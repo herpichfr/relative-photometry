@@ -61,8 +61,33 @@ def test_read_catalogs_preserves_order(fits_files) -> None:
     assert [c.meta.file for c in cats] == list(fits_files)
 
 
-def test_csv_without_companion_fits_raises_ingest_error(csv_files, tmp_path) -> None:
-    """When a CSV has no companion FITS, read_csv_catalog should raise IngestError."""
+def test_auto_mode_prefers_companion_fits(fits_files, csv_files) -> None:
+    """In auto mode, a CSV with a companion FITS is read as FITS instead."""
+    settings = Settings()
+    auto = read_catalog(csv_files[0], settings)
+    direct = read_fits_catalog(fits_files[0], settings)
+
+    assert auto.meta.file == fits_files[0]
+    assert auto.meta.file.suffix == ".fits"
+    np.testing.assert_array_equal(auto.ra, direct.ra)
+    np.testing.assert_array_equal(auto.dec, direct.dec)
+    np.testing.assert_array_equal(auto.x, direct.x)
+    np.testing.assert_array_equal(auto.y, direct.y)
+    np.testing.assert_array_equal(auto.flux, direct.flux)
+    np.testing.assert_array_equal(auto.fluxerr, direct.fluxerr)
+
+
+def test_explicit_csv_format_still_reads_csv(csv_files) -> None:
+    """An explicit fmt='csv' reads the CSV even when a companion FITS exists."""
+    settings = Settings()
+    cc = read_catalog(csv_files[0], settings, fmt="csv")
+    assert cc.meta.file == csv_files[0]
+    assert cc.meta.file.suffix == ".csv"
+
+
+def test_csv_without_companion_in_auto_mode(csv_files, tmp_path) -> None:
+    """In auto mode, a CSV with no companion FITS falls through to the CSV
+    reader, which raises IngestError."""
     settings = Settings()
     # Copy a CSV to tmp_path without its companion FITS
     csv = csv_files[0]
@@ -70,4 +95,13 @@ def test_csv_without_companion_fits_raises_ingest_error(csv_files, tmp_path) -> 
     csv_copy.write_bytes(csv.read_bytes())
 
     with pytest.raises(IngestError, match=r"companion FITS header.*is required"):
-        read_csv_catalog(csv_copy, settings)
+        read_catalog(csv_copy, settings)
+
+
+def test_duplicate_csv_and_fits_yields_one_catalog(fits_files, csv_files) -> None:
+    """Passing both a CSV and its companion FITS in auto mode yields one
+    catalogue -- the FITS version -- not two."""
+    settings = Settings()
+    cats = read_catalogs([csv_files[0], fits_files[0]], settings)
+    assert len(cats) == 1
+    assert cats[0].meta.file == fits_files[0]
