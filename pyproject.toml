@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "relphot"
+version = "0.1.0"
+description = "High-precision relative photometry for exoplanet transit detection from existing per-frame catalogues."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+authors = [{name = "F. R. Herpich", email = "fherpich@lna.br"}]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "astropy>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff"]
+
+[project.scripts]
+relphot = "relphot.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/relphot"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PTH", "C4", "ARG", "TID"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::astropy.wcs.wcs.FITSFixedWarning",
+]
