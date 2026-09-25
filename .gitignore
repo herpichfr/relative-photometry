@@ -8,3 +8,9 @@ build/
 dist/
 *.npz
 !tests/data/**/*.npz
+
+# Local session notes, not part of the package
+HANDOFF*
+handoff*
+PLAN*
+plan*
