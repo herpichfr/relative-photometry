@@ -53,9 +53,11 @@ class ComparisonResult:
     their core tile. ``ensemble``/``sigma_ensemble`` are ``(n_tiles, n_frames, n_aper)``
     in relative-flux units, normalized to ~1. ``sigma_star`` is ``(n_stars, n_aper)``
     final-round robust scatter; leave-one-out for members, full for the rest; NaN
-    outside the pool. ``mag`` is -2.5 log10 of nanmedian relative flux, tile-relative
-    (within-pool magnitude). ``n_comparison`` and ``n_rounds_used`` are
-    ``(n_tiles, n_aper)`` int. ``method`` is the ensemble statistic used.
+    outside the pool. ``mag`` is -2.5 log10 of nanmedian relative flux for every star
+    with a core tile and finite positive median, independent of pool membership;
+    used for decorrelation surface fits (same definition for pool and non-pool stars).
+    ``n_comparison`` and ``n_rounds_used`` are ``(n_tiles, n_aper)`` int. ``method``
+    is the ensemble statistic used.
     """
 
     mask: np.ndarray
@@ -368,6 +370,13 @@ def select_comparison_stars(
             # Store final sigma_star
             # LOO scores for members, full-ensemble scores for the rest of the pool
             sigma_star[pool, a] = sigma_pool[pool]
+
+        # Fill mag for all stars with a core tile and finite positive median
+        # (independent of pool membership, for use in decorrelation surface fits)
+        todo = (tilemap.core_tile >= 0) & np.isnan(mag[:, a])
+        med = nanmedian_quiet(reference_result.relative_flux[todo, :, a], axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mag[todo, a] = np.where(np.isfinite(med) & (med > 0), -2.5 * np.log10(med), np.nan)
 
     return ComparisonResult(
         mask=mask,

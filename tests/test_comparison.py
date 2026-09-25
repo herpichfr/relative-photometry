@@ -256,3 +256,45 @@ def test_weighted_loo_score_matches_exact_exclusion() -> None:
         q = q / np.median(q)
         expected = 1.4826 * np.median(np.abs(q - np.median(q)))
         assert np.isclose(result.sigma_star[idx[k], a], expected, rtol=1e-9)
+
+
+def test_excluded_star_has_finite_mag() -> None:
+    """A star flagged as variable (excluded from pool) still has finite comparison.mag.
+
+    Stars outside the comparison pool should still have magnitudes filled for use in
+    decorrelation surface fits.
+    """
+    night, _airmass, _flux0 = make_synthetic_night(n_stars=500, n_frames=40, seed=10)
+    settings = Settings()
+
+    # Build reference
+    variable_mask = np.zeros(night.n_stars, dtype=bool)
+    candidates = select_candidates(night, variable_mask, settings, aper=0)
+    tilemap = build_tilemap(night, candidates, settings)
+    frame_selection = select_reference_frames_and_stars(
+        night, tilemap, candidates, settings, aper=0
+    )
+    reference_result = build_references(night, tilemap, frame_selection, settings)
+
+    # Mark a few stars as variable after building reference
+    # Pick a star with a core tile
+    core_stars = tilemap.core_tile >= 0
+    candidates_idx = np.nonzero(core_stars)[0]
+
+    if len(candidates_idx) > 0:
+        # Mark first core star as variable
+        target_star = candidates_idx[0]
+        variable_mask[target_star] = True
+
+        # Build comparison with the variable star excluded from pool
+        comparison_result = select_comparison_stars(
+            night, tilemap, reference_result, variable_mask, settings
+        )
+
+        # The target star should have a core tile but be excluded from pool
+        assert tilemap.core_tile[target_star] >= 0, "Target should have a core tile"
+
+        # But mag should still be filled (for decorrelation)
+        a = 0  # aperture
+        assert np.isfinite(comparison_result.mag[target_star, a]), \
+            f"Excluded star {target_star} should have finite mag for decorrelation"
