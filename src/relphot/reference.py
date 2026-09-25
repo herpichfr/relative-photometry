@@ -19,7 +19,6 @@ outlier relative to a quadratic fit in time, not relative to a flat median.
 from __future__ import annotations
 
 import logging
-import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -27,6 +26,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from relphot.exceptions import ConfigError
+from relphot.numeric import nanmedian_quiet, unit_vectors, weighted_clipped_combine
 
 if TYPE_CHECKING:
     from relphot.config import ReferenceSettings, Settings
@@ -69,21 +69,6 @@ class ReferenceResult:
         return int(self.R.shape[2])
 
 
-def _unit_vectors(ra_deg: np.ndarray, dec_deg: np.ndarray) -> np.ndarray:
-    """(N, 3) unit vectors on the sky sphere for an array of RA/Dec in degrees."""
-    ra = np.radians(np.asarray(ra_deg, dtype=np.float64))
-    dec = np.radians(np.asarray(dec_deg, dtype=np.float64))
-    cosd = np.cos(dec)
-    return np.column_stack([cosd * np.cos(ra), cosd * np.sin(ra), np.sin(dec)])
-
-
-def _nanmedian_quiet(arr: np.ndarray, axis: int | None = None) -> np.ndarray:
-    """``np.nanmedian``, without the "All-NaN slice" warning an expected NaN result raises."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        return np.nanmedian(arr, axis=axis)
-
-
 def select_candidates(
     night: MatchedNight, variable_mask: np.ndarray, settings: Settings, aper: int
 ) -> np.ndarray:
@@ -108,13 +93,13 @@ def select_candidates(
     finite_snr = np.isfinite(night.snr)
     any_snr = finite_snr.any(axis=1)
     median_snr = np.full(n, np.nan)
-    median_snr[any_snr] = _nanmedian_quiet(night.snr[any_snr], axis=1)
+    median_snr[any_snr] = nanmedian_quiet(night.snr[any_snr], axis=1)
     snr_ok = median_snr >= ref.min_snr
 
     finite_pos = np.isfinite(night.ra) & np.isfinite(night.dec)
     isolated = np.zeros(n, dtype=bool)
     if np.any(finite_pos):
-        vec = _unit_vectors(night.ra[finite_pos], night.dec[finite_pos])
+        vec = unit_vectors(night.ra[finite_pos], night.dec[finite_pos])
         tree = cKDTree(vec)
         radius_rad = np.radians(ref.isolation_radius_arcsec / 3600.0)
         chord_radius = 2.0 * np.sin(radius_rad / 2.0)
@@ -161,8 +146,8 @@ def _fit_frame_outliers(
     with np.errstate(invalid="ignore", divide="ignore"):
         log_r = np.where(r_j > 0, np.log10(np.where(r_j > 0, r_j, 1.0)), np.nan)
     resid = log_r - fit_all
-    med = _nanmedian_quiet(resid[good])
-    mad = _nanmedian_quiet(np.abs(resid[good] - med))
+    med = nanmedian_quiet(resid[good])
+    mad = nanmedian_quiet(np.abs(resid[good] - med))
     robust_sigma = 1.4826 * mad if mad > 0 else np.inf
 
     ok = np.abs(resid - med) <= frame_outlier_sigma * robust_sigma
@@ -178,35 +163,9 @@ def _weighted_clipped_mean_frames(
     weight entries are never used. Returns ``(R, sigma_R, n_used)``, each
     ``(n_frames,)``.
     """
-    valid = np.isfinite(n_ij) & np.isfinite(w_ij) & (w_ij > 0)
-    mask = valid.copy()
-
-    def _weighted_mean(current_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        w_masked = np.where(current_mask, w_ij, 0.0)
-        sumw = w_masked.sum(axis=0)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            mean = np.where(
-                sumw > 0, np.nansum(np.where(current_mask, w_ij * n_ij, 0.0), axis=0) / sumw, np.nan
-            )
-        return mean, sumw
-
-    for _ in range(max(int(max_iter), 1)):
-        mean, _sumw = _weighted_mean(mask)
-        resid = n_ij - mean[np.newaxis, :]
-        masked_resid = np.where(mask, resid, np.nan)
-        med = _nanmedian_quiet(masked_resid, axis=0)
-        mad = _nanmedian_quiet(np.abs(masked_resid - med[np.newaxis, :]), axis=0)
-        sigma = np.where(mad > 0, 1.4826 * mad, np.inf)
-        new_mask = valid & (np.abs(resid - med[np.newaxis, :]) <= clip_sigma * sigma[np.newaxis, :])
-        if np.array_equal(new_mask, mask):
-            mask = new_mask
-            break
-        mask = new_mask
-
-    mean, sumw = _weighted_mean(mask)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        sigma_r = np.where(sumw > 0, np.sqrt(1.0 / sumw), np.nan)
-    n_used = mask.sum(axis=0)
+    mean, sigma_r, n_used, _mask = weighted_clipped_combine(
+        n_ij, w_ij, clip_sigma, max_iter, axis=0
+    )
     return mean, sigma_r, n_used
 
 
@@ -217,7 +176,7 @@ def _reference_weighted_clipped_mean(
     valid0 = np.isfinite(f) & np.isfinite(sigma_f) & (sigma_f > 0) & (f > 0)
     f_masked = np.where(valid0, f, np.nan)
 
-    baseline = _nanmedian_quiet(f_masked, axis=1)
+    baseline = nanmedian_quiet(f_masked, axis=1)
     baseline = np.where(np.isfinite(baseline) & (baseline > 0), baseline, np.nan)
 
     def _normalised(current_baseline: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -233,7 +192,7 @@ def _reference_weighted_clipped_mean(
         )
         frame_ok = _fit_frame_outliers(prelim_r, bjd_tdb, ref.frame_outlier_sigma)
         f_for_baseline = np.where(frame_ok[np.newaxis, :], f_masked, np.nan)
-        new_baseline = _nanmedian_quiet(f_for_baseline, axis=1)
+        new_baseline = nanmedian_quiet(f_for_baseline, axis=1)
         baseline = np.where(np.isfinite(new_baseline) & (new_baseline > 0), new_baseline, baseline)
 
     n_ij, w_ij = _normalised(baseline)
@@ -246,14 +205,14 @@ def _reference_median_normalised(
     """Fallback construction B: plain nanmedian of normalised fluxes."""
     valid0 = np.isfinite(f) & (f > 0)
     f_masked = np.where(valid0, f, np.nan)
-    baseline = _nanmedian_quiet(f_masked, axis=1)
+    baseline = nanmedian_quiet(f_masked, axis=1)
 
     with np.errstate(invalid="ignore", divide="ignore"):
         n_ij = f_masked / baseline[:, np.newaxis]
 
-    r_j = _nanmedian_quiet(n_ij, axis=0)
+    r_j = nanmedian_quiet(n_ij, axis=0)
     n_used = np.count_nonzero(np.isfinite(n_ij), axis=0)
-    mad = _nanmedian_quiet(np.abs(n_ij - r_j[np.newaxis, :]), axis=0)
+    mad = nanmedian_quiet(np.abs(n_ij - r_j[np.newaxis, :]), axis=0)
     with np.errstate(invalid="ignore", divide="ignore"):
         sigma_r = np.where(n_used > 0, 1.4826 * mad / np.sqrt(np.maximum(n_used, 1)), np.nan)
     return r_j, sigma_r, n_used

@@ -26,6 +26,8 @@ import numpy as np
 from astropy.table import Table, vstack
 from scipy.spatial import cKDTree
 
+from relphot.numeric import unit_vectors
+
 if TYPE_CHECKING:
     from relphot.config import Settings
     from relphot.match import MatchedNight
@@ -54,14 +56,6 @@ class VariableFetcher(Protocol):
     def __call__(
         self, ra_c: float, dec_c: float, radius_deg: float, settings: Settings
     ) -> Table: ...
-
-
-def _unit_vectors(ra_deg: np.ndarray, dec_deg: np.ndarray) -> np.ndarray:
-    """(N, 3) unit vectors on the sky sphere for an array of RA/Dec in degrees."""
-    ra = np.radians(np.asarray(ra_deg, dtype=np.float64))
-    dec = np.radians(np.asarray(dec_deg, dtype=np.float64))
-    cosd = np.cos(dec)
-    return np.column_stack([cosd * np.cos(ra), cosd * np.sin(ra), np.sin(dec)])
 
 
 def _sanitize(text: str) -> str:
@@ -164,8 +158,8 @@ def flag_known_variables(
 
     ra_c = float(np.median(night.ra[finite]))
     dec_c = float(np.median(night.dec[finite]))
-    field_vec = _unit_vectors(np.array([ra_c]), np.array([dec_c]))[0]
-    star_vec = _unit_vectors(night.ra[finite], night.dec[finite])
+    field_vec = unit_vectors(np.array([ra_c]), np.array([dec_c]))[0]
+    star_vec = unit_vectors(night.ra[finite], night.dec[finite])
     chord_to_centre = np.linalg.norm(star_vec - field_vec, axis=1)
     max_chord = float(np.max(chord_to_centre)) if chord_to_centre.size else 0.0
     max_sep_deg = np.degrees(2.0 * np.arcsin(np.clip(max_chord / 2.0, 0.0, 1.0)))
@@ -184,7 +178,7 @@ def flag_known_variables(
         logger.info("known-variable cross-match: no variables found in the field")
         return np.zeros(n, dtype=bool)
 
-    var_vec = _unit_vectors(np.asarray(table[_RA_COL]), np.asarray(table[_DEC_COL]))
+    var_vec = unit_vectors(np.asarray(table[_RA_COL]), np.asarray(table[_DEC_COL]))
     tree = cKDTree(var_vec)
     radius_rad = np.radians(settings.variable.match_radius_arcsec / 3600.0)
     chord_radius = 2.0 * np.sin(radius_rad / 2.0)

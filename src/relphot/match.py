@@ -20,6 +20,7 @@ from astropy.coordinates import SkyCoord
 from scipy.spatial import cKDTree
 
 from relphot.exceptions import MatchError
+from relphot.numeric import unit_vectors
 
 if TYPE_CHECKING:
     from relphot.config import Settings
@@ -83,14 +84,6 @@ class MatchedNight:
     @property
     def n_aper(self) -> int:
         return int(self.flux.shape[2]) if self.flux.ndim == 3 else 0
-
-
-def _unit_vectors(ra_deg: np.ndarray, dec_deg: np.ndarray) -> np.ndarray:
-    """(N, 3) unit vectors on the sky sphere for an array of RA/Dec in degrees."""
-    ra = np.radians(np.asarray(ra_deg, dtype=np.float64))
-    dec = np.radians(np.asarray(dec_deg, dtype=np.float64))
-    cosd = np.cos(dec)
-    return np.column_stack([cosd * np.cos(ra), cosd * np.sin(ra), np.sin(dec)])
 
 
 def select_master(catalogs: list[FrameCatalog]) -> int:
@@ -207,9 +200,9 @@ def match_night(catalogs: list[FrameCatalog], settings: Settings) -> MatchedNigh
             )
             continue
 
-        master_vec = _unit_vectors(np.asarray(master_ra), np.asarray(master_dec))
+        master_vec = unit_vectors(np.asarray(master_ra), np.asarray(master_dec))
         tree = cKDTree(master_vec)
-        frame_vec = _unit_vectors(cat.ra, cat.dec)
+        frame_vec = unit_vectors(cat.ra, cat.dec)
         dist, idx = tree.query(frame_vec, k=1)
         within = dist <= chord_radius
 
