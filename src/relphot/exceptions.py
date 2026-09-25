@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__all__ = ["ConfigError", "IngestError", "MatchError", "RelphotError"]
+__all__ = ["ConfigError", "IngestError", "MatchError", "RelphotError", "TilingError"]
 
 
 class RelphotError(Exception):
@@ -19,3 +19,7 @@ class IngestError(RelphotError):
 
 class MatchError(RelphotError):
     """Raised when cross-matching frames into a common star list fails."""
+
+
+class TilingError(RelphotError):
+    """Raised when the adaptive tiling loop cannot meet hard_min_ref_candidates."""

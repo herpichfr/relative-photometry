@@ -1,6 +1,6 @@
 # Relative photometry pipeline — plan
 
-Status: plan agreed 2026-09-25. Phase 1a (ingest, cross-match) done; next is 1b.
+Status: plan agreed 2026-09-25. Phase 1a (ingest, cross-match) done; Phase 1b (tiling, variable-star lookup, reference construction) done; next is 1c.
 
 ## Goal
 

@@ -1,9 +1,9 @@
-"""CLI smoke test: `relphot ingest` on the real cropped fixture frames."""
+"""CLI smoke tests: `relphot ingest` and `relphot reference` on the real cropped fixture frames."""
 
 from __future__ import annotations
 
 from relphot.cli import main
-from relphot.io import load_night
+from relphot.io import load_night, load_reference
 
 
 def test_ingest_smoke(fits_files, tmp_path) -> None:
@@ -27,3 +27,25 @@ def test_ingest_csv_format_smoke(csv_files, tmp_path) -> None:
     assert rc == 0
     night, _settings = load_night(out)
     assert night.n_stars_after_cut > 0
+
+
+def test_reference_smoke(fits_files, tmp_path) -> None:
+    night_out = tmp_path / "night.npz"
+    rc = main(["ingest", "--out", str(night_out), *[str(p) for p in fits_files]])
+    assert rc == 0
+
+    ref_out = tmp_path / "ref.npz"
+    rc = main(["reference", str(night_out), "--out", str(ref_out), "--no-variables"])
+    assert rc == 0
+    assert ref_out.is_file()
+
+    tiles_csv = ref_out.with_name("ref_tiles.csv")
+    reference_csv = ref_out.with_name("ref_reference.csv")
+    assert tiles_csv.is_file()
+    assert reference_csv.is_file()
+
+    tilemap, result, _settings = load_reference(ref_out)
+    assert tilemap.n_tiles >= 1
+    assert result.R.shape[0] == tilemap.n_tiles
+    night, _night_settings = load_night(night_out)
+    assert result.R.shape[1] == night.n_frames

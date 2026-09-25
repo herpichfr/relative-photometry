@@ -1,7 +1,10 @@
-"""Command-line entry point: ``relphot ingest``.
+"""Command-line entry points: ``relphot ingest`` and ``relphot reference``.
 
-Reads a night's per-frame catalogues, cross-matches them, and writes the
-result as a ``.npz`` next to a CSV match report.
+``ingest`` reads a night's per-frame catalogues, cross-matches them, and
+writes the result as a ``.npz`` next to a CSV match report. ``reference``
+takes that ``.npz``, builds the adaptive tile grid and per-tile reference
+fluxes, and writes them as a ``.npz`` next to a tile-map CSV and a
+per-tile-per-frame reference CSV.
 """
 
 from __future__ import annotations
@@ -14,11 +17,16 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
+
 from relphot.config import Settings, load_settings
 from relphot.exceptions import RelphotError
 from relphot.ingest import read_catalogs
-from relphot.io import save_night
+from relphot.io import load_night, save_night, save_reference
 from relphot.match import match_night
+from relphot.reference import build_references, select_candidates
+from relphot.tiles import build_tilemap
+from relphot.variables import flag_known_variables
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +64,24 @@ def _write_report_csv(night, path: Path) -> None:
         writer.writeheader()
         for report in night.reports:
             writer.writerow(asdict(report))
+
+
+def _write_reference_csv(night, tilemap, result, aper: int, path: Path) -> None:
+    """Write one row per (tile, frame): bjd_tdb, airmass, and the reference at ``aper``."""
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["tile", "frame", "bjd_tdb", "airmass", "R", "sigma_R", "n_used"])
+        for t in range(tilemap.n_tiles):
+            for j, meta in enumerate(night.frame_meta):
+                writer.writerow([
+                    t,
+                    j,
+                    meta.bjd_tdb,
+                    meta.airmass,
+                    result.R[t, j, aper],
+                    result.sigma_R[t, j, aper],
+                    int(result.n_used[t, j, aper]),
+                ])
 
 
 def _run_ingest(args: argparse.Namespace) -> int:
@@ -111,6 +137,70 @@ def _run_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_reference(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    try:
+        night, _ingest_settings = load_night(args.night)
+    except (OSError, RelphotError):
+        logger.exception("failed to load %s", args.night)
+        return 1
+
+    if night.n_aper == 0:
+        logger.error("%s has no apertures", args.night)
+        return 1
+    aper = args.aper if args.aper is not None else night.n_aper // 2
+    if not (0 <= aper < night.n_aper):
+        logger.error("--aper %d out of range [0, %d)", aper, night.n_aper)
+        return 1
+
+    t0 = time.monotonic()
+    if args.no_variables:
+        logger.info("known-variable cross-match skipped (--no-variables)")
+        variable_mask = np.zeros(night.n_stars, dtype=bool)
+    else:
+        variable_mask = flag_known_variables(night, settings)
+    t1 = time.monotonic()
+    logger.info("variables: %.2f s (%d flagged)", t1 - t0, int(variable_mask.sum()))
+
+    candidates = select_candidates(night, variable_mask, settings, aper)
+
+    try:
+        tilemap = build_tilemap(night, candidates, settings)
+    except RelphotError:
+        logger.exception("tiling failed")
+        return 1
+    t2 = time.monotonic()
+    logger.info("tiling: %.2f s (%d tiles)", t2 - t1, tilemap.n_tiles)
+
+    result = build_references(night, tilemap, candidates, settings)
+    t3 = time.monotonic()
+    logger.info("reference: %.2f s", t3 - t2)
+
+    out_path = Path(args.out)
+    save_reference(tilemap, result, settings, out_path)
+
+    tiles_csv = out_path.with_name(f"{out_path.stem}_tiles.csv")
+    tilemap.to_csv(tiles_csv)
+    reference_csv = out_path.with_name(f"{out_path.stem}_reference.csv")
+    _write_reference_csv(night, tilemap, result, aper, reference_csv)
+
+    print(f"stars: {night.n_stars}, tiles: {tilemap.n_tiles}, aperture: {aper}")
+    print(f"candidates: {int(candidates.sum())}")
+    print(f"wrote {out_path}")
+    print(f"wrote {tiles_csv}")
+    print(f"wrote {reference_csv}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="relphot")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -131,6 +221,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ingest.add_argument("files", nargs="+", help="catalogue files, or @list.txt")
     ingest.set_defaults(func=_run_ingest)
+
+    reference = subparsers.add_parser(
+        "reference", help="build the adaptive tile grid and per-tile reference fluxes"
+    )
+    reference.add_argument("night", help="input .npz written by `relphot ingest`")
+    reference.add_argument("--config", type=Path, default=None, help="TOML settings file")
+    reference.add_argument("--out", required=True, help="output .npz path")
+    reference.add_argument(
+        "--no-variables", action="store_true",
+        help="skip the known-variable cross-match (flag no star as a known variable)",
+    )
+    reference.add_argument(
+        "--aper", type=int, default=None,
+        help=(
+            "aperture index for candidate selection and the reference CSV "
+            "(default: the middle aperture)"
+        ),
+    )
+    reference.set_defaults(func=_run_reference)
 
     return parser
 

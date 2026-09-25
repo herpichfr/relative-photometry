@@ -20,8 +20,11 @@ from relphot.exceptions import ConfigError
 __all__ = [
     "CatalogSettings",
     "ColumnMap",
+    "ReferenceSettings",
     "Settings",
     "SiteSettings",
+    "TileSettings",
+    "VariableSettings",
     "load_settings",
     "settings_from_dict",
     "settings_to_dict",
@@ -90,11 +93,79 @@ class SiteSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class TileSettings:
+    """Adaptive rectangular tiling of the master frame's pixel projection.
+
+    See :mod:`relphot.tiles`. ``tile_size_px`` is the nominal edge length of
+    the regular starting grid; ``overlap_px`` extends each tile's candidate
+    catchment beyond its core rectangle without moving any star's own light
+    curve out of its core tile. The adaptive loop merges tiles short of
+    ``min_ref_candidates`` clean reference candidates until every tile meets
+    it (or only one tile is left); a final tile below
+    ``hard_min_ref_candidates`` raises :class:`~relphot.exceptions.TilingError`.
+    """
+
+    tile_size_px: float = 1000.0
+    overlap_px: float = 100.0
+    min_ref_candidates: int = 50
+    hard_min_ref_candidates: int = 20
+
+
+@dataclass(frozen=True, slots=True)
+class VariableSettings:
+    """Known-variable-star cross-match, used to exclude reference candidates.
+
+    ``catalogs`` are VizieR catalogue identifiers queried through
+    ``astroquery.vizier`` (an optional dependency -- see the ``variables``
+    extra); ``extra_catalogs`` appends further VizieR IDs (e.g. OGLE for
+    Magellanic fields) without displacing the defaults. Results are cached
+    per (catalogue, rounded field centre, radius) as ECSV under
+    ``cache_dir``. Disabled, offline, or with astroquery missing, the
+    cross-match logs a warning and flags nothing -- see
+    :func:`relphot.variables.flag_known_variables`.
+    """
+
+    enabled: bool = True
+    #: AAVSO VSX; Gaia DR3 variable-classification results; ASAS-SN variables
+    #: (Jayasinghe et al. catv2021 table -- "II/366/catalog" does not exist).
+    catalogs: tuple[str, ...] = ("B/vsx/vsx", "I/358/vclassre", "II/366/catv2021")
+    extra_catalogs: tuple[str, ...] = ()
+    match_radius_arcsec: float = 2.0
+    cache_dir: str = "~/.cache/relphot/variables"
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceSettings:
+    """Reference-candidate selection and per-tile reference construction.
+
+    See :mod:`relphot.reference` and PLAN.md's "Reference-star investigation".
+    ``method`` selects construction D (``"weighted_clipped_mean"``, default,
+    the investigation's best performer) or the fallback B
+    (``"median_normalised"``).
+    """
+
+    min_snr: float = 15.0
+    isolation_radius_arcsec: float = 5.0
+    clip_sigma: float = 3.0
+    max_iter: int = 5
+    baseline_iter: int = 2
+    frame_outlier_sigma: float = 3.0
+    #: A frame whose reference combines fewer stars than this (after
+    #: clipping) gets ``R = sigma_R = NaN`` in that tile, rather than a
+    #: reference built from a handful of stars.
+    min_used_per_frame: int = 20
+    method: str = "weighted_clipped_mean"
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
-    """Top-level relphot settings for Phase 1a."""
+    """Top-level relphot settings."""
 
     catalog: CatalogSettings = field(default_factory=CatalogSettings)
     site: SiteSettings = field(default_factory=SiteSettings)
+    tile: TileSettings = field(default_factory=TileSettings)
+    variable: VariableSettings = field(default_factory=VariableSettings)
+    reference: ReferenceSettings = field(default_factory=ReferenceSettings)
 
 
 def _build(cls: type, data: dict[str, Any], origin: str, path: str) -> Any:
@@ -106,7 +177,9 @@ def _build(cls: type, data: dict[str, Any], origin: str, path: str) -> Any:
     not a field of ``cls``. Nested dataclass fields are resolved via
     :func:`typing.get_type_hints` because ``from __future__ import
     annotations`` turns every ``dataclasses.Field.type`` into a plain string.
-    ``path`` is the dotted location for error messages, empty at the root.
+    A tuple-typed field receives a TOML/JSON list as a tuple, since neither
+    source format has a tuple literal. ``path`` is the dotted location for
+    error messages, empty at the root.
     """
     hints = typing.get_type_hints(cls)
     field_names = {f.name for f in fields(cls)}
@@ -122,6 +195,8 @@ def _build(cls: type, data: dict[str, Any], origin: str, path: str) -> Any:
         sub_path = f"{path}.{name}" if path else name
         if is_dataclass(hint) and isinstance(value, dict):
             kwargs[name] = _build(hint, value, origin, sub_path)
+        elif typing.get_origin(hint) is tuple and isinstance(value, list):
+            kwargs[name] = tuple(value)
         else:
             kwargs[name] = value
     return cls(**kwargs)

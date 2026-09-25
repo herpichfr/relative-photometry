@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff"]
+variables = ["astroquery>=0.4"]
 
 [project.scripts]
 relphot = "relphot.cli:main"
