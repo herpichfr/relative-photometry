@@ -24,7 +24,7 @@ from relphot.exceptions import RelphotError
 from relphot.ingest import read_catalogs
 from relphot.io import load_night, save_night, save_reference
 from relphot.match import match_night
-from relphot.reference import build_references, select_candidates
+from relphot.reference import build_references, select_candidates, select_reference_frames_and_stars
 from relphot.tiles import build_tilemap
 from relphot.variables import flag_known_variables
 
@@ -66,12 +66,23 @@ def _write_report_csv(night, path: Path) -> None:
             writer.writerow(asdict(report))
 
 
-def _write_reference_csv(night, tilemap, result, aper: int, path: Path) -> None:
-    """Write one row per (tile, frame): bjd_tdb, airmass, and the reference at ``aper``."""
+def _write_reference_csv(night, tilemap, result, aper: int, frame_selection, path: Path) -> None:
+    """Write one row per (tile, frame): bjd_tdb, airmass, reference at ``aper``, and star counts."""
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["tile", "frame", "bjd_tdb", "airmass", "R", "sigma_R", "n_used"])
+        writer.writerow([
+            "tile",
+            "frame",
+            "bjd_tdb",
+            "airmass",
+            "R",
+            "sigma_R",
+            "n_used",
+            "frame_kept",
+            "n_reference_stars",
+        ])
         for t in range(tilemap.n_tiles):
+            n_reference_stars = len(frame_selection.tile_stars[t])
             for j, meta in enumerate(night.frame_meta):
                 writer.writerow([
                     t,
@@ -81,6 +92,8 @@ def _write_reference_csv(night, tilemap, result, aper: int, path: Path) -> None:
                     result.R[t, j, aper],
                     result.sigma_R[t, j, aper],
                     int(result.n_used[t, j, aper]),
+                    int(result.frame_kept[j]),
+                    n_reference_stars,
                 ])
 
 
@@ -157,7 +170,9 @@ def _run_reference(args: argparse.Namespace) -> int:
     if night.n_aper == 0:
         logger.error("%s has no apertures", args.night)
         return 1
-    aper = args.aper if args.aper is not None else night.n_aper // 2
+    aper = (
+        args.aper if args.aper is not None else (1 if night.n_aper >= 2 else 0)
+    )
     if not (0 <= aper < night.n_aper):
         logger.error("--aper %d out of range [0, %d)", aper, night.n_aper)
         return 1
@@ -181,9 +196,25 @@ def _run_reference(args: argparse.Namespace) -> int:
     t2 = time.monotonic()
     logger.info("tiling: %.2f s (%d tiles)", t2 - t1, tilemap.n_tiles)
 
-    result = build_references(night, tilemap, candidates, settings)
+    try:
+        frame_selection = select_reference_frames_and_stars(
+            night, tilemap, candidates, settings, aper
+        )
+    except RelphotError:
+        logger.exception("frame/star selection failed")
+        return 1
     t3 = time.monotonic()
-    logger.info("reference: %.2f s", t3 - t2)
+    logger.info("frame/star selection: %.2f s", t3 - t2)
+    n_kept = int(np.sum(frame_selection.frame_kept))
+    n_total = night.n_frames
+    logger.info("frames kept: %d/%d", n_kept, n_total)
+    if frame_selection.dropped_frames:
+        dropped_files = [night.frame_meta[i].file.name for i in frame_selection.dropped_frames]
+        logger.info("dropped frames: %s", ", ".join(dropped_files))
+
+    result = build_references(night, tilemap, frame_selection, settings)
+    t4 = time.monotonic()
+    logger.info("reference: %.2f s", t4 - t3)
 
     out_path = Path(args.out)
     save_reference(tilemap, result, settings, out_path)
@@ -191,10 +222,11 @@ def _run_reference(args: argparse.Namespace) -> int:
     tiles_csv = out_path.with_name(f"{out_path.stem}_tiles.csv")
     tilemap.to_csv(tiles_csv)
     reference_csv = out_path.with_name(f"{out_path.stem}_reference.csv")
-    _write_reference_csv(night, tilemap, result, aper, reference_csv)
+    _write_reference_csv(night, tilemap, result, aper, frame_selection, reference_csv)
 
     print(f"stars: {night.n_stars}, tiles: {tilemap.n_tiles}, aperture: {aper}")
     print(f"candidates: {int(candidates.sum())}")
+    print(f"frames kept: {n_kept}/{n_total}")
     print(f"wrote {out_path}")
     print(f"wrote {tiles_csv}")
     print(f"wrote {reference_csv}")
@@ -236,7 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--aper", type=int, default=None,
         help=(
             "aperture index for candidate selection and the reference CSV "
-            "(default: the middle aperture)"
+            "(default: index 1 if n_aper >= 2, else 0)"
         ),
     )
     reference.set_defaults(func=_run_reference)

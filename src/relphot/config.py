@@ -20,6 +20,9 @@ from relphot.exceptions import ConfigError
 __all__ = [
     "CatalogSettings",
     "ColumnMap",
+    "ComparisonSettings",
+    "DecorrelationSettings",
+    "LightcurveSettings",
     "ReferenceSettings",
     "Settings",
     "SiteSettings",
@@ -138,23 +141,85 @@ class VariableSettings:
 class ReferenceSettings:
     """Reference-candidate selection and per-tile reference construction.
 
-    See :mod:`relphot.reference` and PLAN.md's "Reference-star investigation".
-    ``method`` selects construction D (``"weighted_clipped_mean"``, default,
-    the investigation's best performer) or the fallback B
-    (``"median_normalised"``).
+    Per-tile reference is built from a fixed star set S_t valid in every kept frame
+    of the night. A frame with too few reference stars is flagged and dropped from
+    the whole night, not per-tile. See :func:`relphot.reference.select_reference_frames_and_stars`
+    for frame-dropping logic. ``method`` selects ``"weighted_fixed_mean"`` (default,
+    inverse-variance weighted mean) or ``"median_fixed"`` (plain median).
     """
 
     min_snr: float = 15.0
     isolation_radius_arcsec: float = 5.0
-    clip_sigma: float = 3.0
-    max_iter: int = 5
     baseline_iter: int = 2
     frame_outlier_sigma: float = 3.0
-    #: A frame whose reference combines fewer stars than this (after
-    #: clipping) gets ``R = sigma_R = NaN`` in that tile, rather than a
-    #: reference built from a handful of stars.
-    min_used_per_frame: int = 20
-    method: str = "weighted_clipped_mean"
+    #: Minimum number of reference stars in S_t for every tile in every kept frame.
+    min_ref_stars: int = 20
+    #: Maximum fraction of frames allowed to be dropped from the whole night.
+    max_dropped_frame_fraction: float = 0.3
+    #: Sigma threshold for per-star outlier rejection in reference star set selection.
+    star_outlier_sigma: float = 5.0
+    #: Maximum iterations for per-star outlier rejection loop.
+    star_reject_iter: int = 5
+    method: str = "weighted_fixed_mean"
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonSettings:
+    """Stage-4 comparison-star selection and ensemble construction.
+
+    Pool criteria mirror ReferenceSettings (presence, FLAGS==0, not a known
+    variable) but relax the SNR floor and drop the isolation cut by default
+    -- see comparison.py's module docstring.
+    """
+
+    min_snr: float = 5.0
+    require_isolation: bool = False
+    isolation_radius_arcsec: float = 5.0
+    k_floor: float = 2.0
+    k_floor_growth: float = 1.5
+    max_k_floor: float = 8.0
+    n_rounds: int = 3
+    n_mag_bins: int = 20
+    min_bin_stars: int = 5
+    min_comparison_stars: int = 5
+    clip_sigma: float = 3.0
+    max_iter: int = 5
+    ensemble_statistic: str = "weighted_clipped_mean"
+
+
+@dataclass(frozen=True, slots=True)
+class LightcurveSettings:
+    """Stage-5 light curves, statistics, and best-aperture selection."""
+
+    n_mag_bins: int = 20
+    bad_flag_mask: int = 252
+    keep_all_apertures_in_table: bool = False
+    output_format: str = "auto"
+    make_plot: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DecorrelationSettings:
+    """Tile-level seeing/airmass decorrelation for light curves.
+
+    Fits per-star and then per-tile surface models to remove frame-level
+    and stellar-property-dependent scatter before output.
+    """
+
+    enabled: bool = True
+    min_epochs_per_star: int = 15
+    clip_sigma_star: float = 4.0
+    max_iter_star: int = 3
+    mag_degree: int = 2
+    use_crowding: bool = True
+    crowding_degree: int = 1
+    clip_sigma_surface: float = 4.0
+    max_iter_surface: int = 2
+    scope: str = "pooled"
+    min_comparison_stars_per_tile: int = 30
+    min_comparison_stars_total: int = 200
+    use_airmass: bool = True
+    max_missing_airmass_frac: float = 0.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +231,9 @@ class Settings:
     tile: TileSettings = field(default_factory=TileSettings)
     variable: VariableSettings = field(default_factory=VariableSettings)
     reference: ReferenceSettings = field(default_factory=ReferenceSettings)
+    comparison: ComparisonSettings = field(default_factory=ComparisonSettings)
+    lightcurve: LightcurveSettings = field(default_factory=LightcurveSettings)
+    decorrelation: DecorrelationSettings = field(default_factory=DecorrelationSettings)
 
 
 def _build(cls: type, data: dict[str, Any], origin: str, path: str) -> Any:

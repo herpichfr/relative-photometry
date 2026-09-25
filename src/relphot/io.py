@@ -168,7 +168,8 @@ def save_reference(
     core_flat, core_offsets = _ragged_to_flat(tilemap.core_indices)
     ext_flat, ext_offsets = _ragged_to_flat(tilemap.extended_indices)
     config_json = json.dumps(settings_to_dict(settings))
-    meta_json = json.dumps({"method": result.method})
+    dropped_frames = [int(i) for i in result.frame_kept == False]  # noqa: E712
+    meta_json = json.dumps({"method": result.method, "dropped_frames": dropped_frames})
 
     np.savez(
         path,
@@ -186,6 +187,7 @@ def save_reference(
         sigma_R=result.sigma_R,
         n_used=result.n_used,
         relative_flux=result.relative_flux,
+        frame_kept=result.frame_kept,
         config_json=config_json,
         meta_json=meta_json,
     )
@@ -215,6 +217,7 @@ def load_reference(path: Path | str) -> tuple[TileMap, ReferenceResult, Settings
             n_used=data["n_used"],
             relative_flux=data["relative_flux"],
             method=meta["method"],
+            frame_kept=data["frame_kept"],
         )
         settings = settings_from_dict(json.loads(str(data["config_json"])))
     return tilemap, result, settings

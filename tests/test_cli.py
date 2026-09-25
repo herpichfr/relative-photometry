@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+
 from relphot.cli import main
 from relphot.io import load_night, load_reference
 
@@ -49,3 +51,16 @@ def test_reference_smoke(fits_files, tmp_path) -> None:
     assert result.R.shape[0] == tilemap.n_tiles
     night, _night_settings = load_night(night_out)
     assert result.R.shape[1] == night.n_frames
+
+    # Check reference CSV has the new columns
+    with reference_csv.open("r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames
+        assert "frame_kept" in fieldnames
+        assert "n_reference_stars" in fieldnames
+        rows = list(reader)
+        assert len(rows) > 0
+        # Check that frame_kept is 0 or 1
+        for row in rows:
+            assert row["frame_kept"] in ("0", "1")
+            assert int(row["n_reference_stars"]) >= 0
