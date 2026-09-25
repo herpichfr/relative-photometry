@@ -170,3 +170,76 @@ def test_lightcurve_raw_equals_relative_flux_over_ensemble() -> None:
                     atol=1e-10,
                     err_msg=f"lc_raw mismatch for star {i}",
                 )
+
+
+def test_lightcurve_best_aperture_selection() -> None:
+    """Best aperture: aperture 0 quieter for bright, aperture 1 for faint."""
+    night, _airmass, _flux0 = make_synthetic_night(n_stars=500, n_frames=40, n_aper=2, seed=14)
+
+    from dataclasses import replace
+
+    settings = Settings()
+    settings = replace(settings, decorrelation=replace(settings.decorrelation, enabled=False))
+
+    # Scale noise per aperture: aper 0 smaller for bright stars, aper 1 smaller for faint
+    # We'll scale fluxerr as a function of magnitude
+    from relphot.numeric import nanmedian_quiet
+
+    variable_mask = np.zeros(night.n_stars, dtype=bool)
+    candidates = select_candidates(night, variable_mask, settings, aper=0)
+    tilemap = build_tilemap(night, candidates, settings)
+
+    # Get initial mag estimates
+    frame_selection = select_reference_frames_and_stars(
+        night, tilemap, candidates, settings, aper=0
+    )
+    reference_result = build_references(night, tilemap, frame_selection, settings)
+    comparison_result = select_comparison_stars(
+        night, tilemap, reference_result, variable_mask, settings
+    )
+
+    mag = comparison_result.mag[:, 0]
+    mag_median = nanmedian_quiet(mag[np.isfinite(mag)])
+
+    # Scale fluxerr so aper 0 is quieter for bright (mag < median) and aper 1 for faint
+    for i in range(night.n_stars):
+        if np.isfinite(mag[i]):
+            if mag[i] < mag_median:
+                # Bright: make aper 0 quieter (smaller error)
+                night.fluxerr[i, :, 1] *= 2.0
+            else:
+                # Faint: make aper 1 quieter (smaller error)
+                night.fluxerr[i, :, 0] *= 2.0
+
+    # Re-run pipeline with the modified fluxerr
+    candidates2 = select_candidates(night, variable_mask, settings, aper=0)
+    tilemap2 = build_tilemap(night, candidates2, settings)
+    frame_selection2 = select_reference_frames_and_stars(
+        night, tilemap2, candidates2, settings, aper=0
+    )
+    reference_result2 = build_references(night, tilemap2, frame_selection2, settings)
+    comparison_result2 = select_comparison_stars(
+        night, tilemap2, reference_result2, variable_mask, settings
+    )
+
+    lc_result = compute_light_curves(
+        night, tilemap2, reference_result2, comparison_result2, settings
+    )
+
+    from relphot.stats import compute_star_stats, select_best_aperture
+
+    star_stats = compute_star_stats(lc_result)
+    best_aper_per_tile, _bin_edges = select_best_aperture(
+        tilemap2, comparison_result2, star_stats, settings, mag_aper=0
+    )
+
+    # Check that best aperture differs between bright and faint bins for at least one tile
+    differs = False
+    for t in range(tilemap2.n_tiles):
+        best_apers = best_aper_per_tile[t, :]
+        best_apers = best_apers[best_apers >= 0]
+        if len(set(best_apers)) > 1:
+            differs = True
+            break
+
+    assert differs, "Best aperture should differ between magnitude bins for at least one tile"

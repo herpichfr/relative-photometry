@@ -64,3 +64,42 @@ def test_reference_smoke(fits_files, tmp_path) -> None:
         for row in rows:
             assert row["frame_kept"] in ("0", "1")
             assert int(row["n_reference_stars"]) >= 0
+
+
+def test_lightcurves_smoke(fits_files, tmp_path) -> None:
+    night_out = tmp_path / "night.npz"
+    rc = main(["ingest", "--out", str(night_out), *[str(p) for p in fits_files]])
+    assert rc == 0
+
+    ref_out = tmp_path / "ref.npz"
+    rc = main(["reference", str(night_out), "--out", str(ref_out), "--no-variables"])
+    assert rc == 0
+
+    lc_out = tmp_path / "lc"
+    rc = main([
+        "lightcurves",
+        str(night_out),
+        str(ref_out),
+        "--out", str(lc_out),
+        "--no-variables",
+        "--format", "fits",
+        "--no-plot",
+    ])
+    assert rc == 0
+
+    # Check output files exist
+    assert (lc_out.parent / f"{lc_out.name}.npz").is_file()
+    assert (lc_out.parent / f"{lc_out.name}_lightcurves.fits").is_file()
+    assert (lc_out.parent / f"{lc_out.name}_starstats.fits").is_file()
+    assert (lc_out.parent / f"{lc_out.name}_comparison.csv").is_file()
+
+    # Check that light curve table is readable
+    try:
+        from astropy.table import Table
+        lc_table = Table.read(str(lc_out.parent / f"{lc_out.name}_lightcurves.fits"), format="fits")
+        assert "star_id" in lc_table.colnames
+        assert "lc" in lc_table.colnames
+        assert "lc_err" in lc_table.colnames
+        assert len(lc_table) > 0
+    except ImportError:
+        pass  # astropy not available, skip check

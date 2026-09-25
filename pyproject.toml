@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff"]
 variables = ["astroquery>=0.4"]
+lightcurve = ["pyarrow>=14", "matplotlib>=3.8"]
 
 [project.scripts]
 relphot = "relphot.cli:main"
