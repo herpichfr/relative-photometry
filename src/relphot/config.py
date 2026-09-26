@@ -24,6 +24,7 @@ __all__ = [
     "DecorrelationSettings",
     "LightcurveSettings",
     "ReferenceSettings",
+    "SearchSettings",
     "Settings",
     "SiteSettings",
     "TileSettings",
@@ -224,6 +225,128 @@ class DecorrelationSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SearchSettings:
+    """Stage 6: cotrending basis vectors, single-event transit search, and
+    star-variability characterisation (see :mod:`relphot.cotrend`,
+    :mod:`relphot.transit_search`, :mod:`relphot.variability`,
+    :mod:`relphot.catalogs`).
+
+    The transit search never fits a free systematics model to a star's own
+    light curve before searching it -- only the population-level
+    cotrending basis vectors (:mod:`relphot.cotrend`) and a joint
+    poly+CBV+box regression are used, so an injected transit is never
+    absorbed by star-specific detrending. Per-star free CBV regression is
+    used only downstream, for variability characterisation, where that
+    concern does not apply.
+    """
+
+    # --- cotrending basis vectors (relphot.cotrend) ---
+    #: Maximum number of leading principal components kept per (tile, aperture).
+    n_cbv: int = 3
+    #: Cumulative explained-variance fraction beyond which further components
+    #: are dropped, even if ``n_cbv`` allows more.
+    cbv_explained_variance: float = 0.95
+    cbv_clip_sigma: float = 5.0
+    cbv_max_iter: int = 3
+    #: A frame is "systematic" for a tile/aperture when more than this
+    #: fraction of its comparison-star ensemble is a simultaneous >3-sigma
+    #: outlier there (relphot.cotrend.detect_systematic_frames).
+    systematic_frame_fraction: float = 0.3
+
+    # --- single-event transit search (relphot.transit_search) ---
+    #: Minimum number of good epochs at a star's best aperture to search it at all.
+    min_epochs: int = 60
+    #: Rolling-median-clip threshold (robust sigma) applied to a star's own
+    #: light curve before any nuisance or box fit, to remove isolated
+    #: single-epoch outliers (cosmic rays, dropped frames) that a box
+    #: search would otherwise happily fit as part of an event. Not a
+    #: systematics model -- a fixed global threshold this far out cannot
+    #: remove a real percent-level transit dip.
+    lc_clip_sigma: float = 6.0
+    lc_clip_window: int = 15
+    duration_min_hours: float = 0.4
+    duration_max_hours: float = 2.5
+    n_durations: int = 15
+    #: Minimum in-transit points for a (duration, mid-time) trial to be evaluated.
+    min_in_transit_points: int = 5
+    #: Minimum fraction of the trial box's time span that overlaps the data span.
+    min_box_coverage: float = 0.5
+    #: Degree of the polynomial-in-time nuisance term (in addition to the CBVs).
+    poly_degree: int = 2
+    #: Transit-candidate SNR cut. On ROBO43 20250911 (516 stars, 3.1 h) the
+    #: best-event SNR of stars without a real signal peaked at 4.9 (p99 4.7).
+    snr_threshold: float = 6.0
+    #: SNR floor for a star's own best event to count toward another star's
+    #: coincidence count.
+    coincidence_snr_threshold: float = 5.0
+    coincidence_fraction_threshold: float = 0.3
+    #: Absolute floor on coincidence_count before SHARED_EPOCH can be set,
+    #: so a tiny tile pool (where one match is already a large fraction)
+    #: does not trip the flag on a single coincidence.
+    coincidence_min_count: int = 2
+    #: A candidate's cross-aperture depth chi2/dof above this value is
+    #: flagged APERTURE_INCONSISTENT.
+    aperture_inconsistent_sigma: float = 3.0
+    too_deep_fraction: float = 0.30
+    #: Fraction of the trial duration used as the edge-touching margin.
+    edge_fraction: float = 0.25
+    high_beta_threshold: float = 3.0
+    #: Minimum occupied time-bins (at the trial duration) required before
+    #: the Pont et al. (2006) beta estimate is trusted; below this it
+    #: defaults to 1.0 (see relphot.transit_search._red_noise_beta's
+    #: docstring for why too few bins makes the estimator itself noisy).
+    beta_min_bins: int = 8
+    #: STEP_LIKE when the step model's chi2 is within this of the box model's.
+    step_delta_chi2_threshold: float = 3.0
+    #: A candidate's in-transit point count below this is flagged FEW_POINTS.
+    few_points_threshold: int = 8
+    #: Minimum epochs required on both sides of a candidate step position
+    #: for the STEP_LIKE test to be evaluated there; a step position too
+    #: close to either data edge is statistically indistinguishable from
+    #: the box itself and would otherwise report a spurious perfect match.
+    step_min_side_points: int = 10
+    #: Per-frame error-inflation factor bounds (relphot.cotrend.compute_frame_error_scale).
+    #: Below 1 is allowed (a quieter-than-typical frame is not penalised);
+    #: the ceiling keeps one catastrophic frame from zeroing out a trial
+    #: instead of merely down-weighting it.
+    frame_error_scale_min: float = 0.5
+    frame_error_scale_max: float = 10.0
+
+    # --- variability characterisation (relphot.variability) ---
+    excess_rms_threshold: float = 3.0
+    von_neumann_sigma_threshold: float = 3.0
+    ls_fap_threshold: float = 1.0e-3
+    ls_min_period_minutes: float = 10.0
+    ls_max_period_factor: float = 2.0
+    variability_n_mag_bins: int = 20
+    variability_min_bin_stars: int = 5
+    #: Eclipse-like classification: fraction of points below this many robust
+    #: sigma from the median needed to call the variability "eclipse-like".
+    eclipse_depth_sigma: float = 3.0
+    eclipse_min_fraction: float = 0.01
+
+    # --- catalogue cross-match (relphot.catalogs) ---
+    catalogs_enabled: bool = True
+    neighbour_radius_arcsec: float = 8.0
+    gaia_match_radius_arcsec: float = 2.0
+    known_variable_match_radius_arcsec: float = 2.0
+    known_planet_match_radius_arcsec: float = 5.0
+    gaia_catalog: str = "I/355/gaiadr3"
+    cache_dir: str = "~/.cache/relphot/search"
+    #: Catalogue variability-type substrings (case-insensitive, matched
+    #: against each ``|``-separated token of the catalogue's own type
+    #: string) that disqualify a star from transit candidacy outright.
+    #: A generic/weak automated classification (e.g. Gaia's own
+    #: "SOLAR_LIKE" or "ROT") is deliberately absent -- low-amplitude
+    #: rotational modulation does not preclude a real transiting planet,
+    #: and a known transiting host is routinely also catalogued this way.
+    disqualifying_variable_types: tuple[str, ...] = (
+        "EA", "EB", "EW", "ECL", "EC", "ESD", "RR", "CEP", "SR", "LPV",
+        "CV", "UG", "DQ", "AM", "DSCT", "GDOR", "SXPHE", "M",
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Top-level relphot settings."""
 
@@ -235,6 +358,7 @@ class Settings:
     comparison: ComparisonSettings = field(default_factory=ComparisonSettings)
     lightcurve: LightcurveSettings = field(default_factory=LightcurveSettings)
     decorrelation: DecorrelationSettings = field(default_factory=DecorrelationSettings)
+    search: SearchSettings = field(default_factory=SearchSettings)
 
 
 def _build(cls: type, data: dict[str, Any], origin: str, path: str) -> Any:

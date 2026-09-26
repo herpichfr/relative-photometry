@@ -16,6 +16,7 @@ __all__ = [
     "mad_sigma",
     "nanmedian_quiet",
     "quantile_bin_edges",
+    "robust_clip_series",
     "unit_vectors",
     "weighted_clipped_combine",
 ]
@@ -254,3 +255,44 @@ def fit_noise_floor(
         return 10.0**log10_floor
 
     return interp_floor
+
+
+def robust_clip_series(y: np.ndarray, clip_sigma: float, window: int) -> np.ndarray:
+    """Boolean keep-mask from a rolling-median robust-sigma clip.
+
+    Flags a point bad when it deviates from a rolling median (window
+    ``window``, taken over the series in whatever order ``y`` is already
+    in -- callers pass a time-sorted series) by more than ``clip_sigma``
+    robust standard deviations (:func:`mad_sigma` of the rolling-median
+    residual, computed once over the whole series). Meant to remove
+    isolated single-epoch outliers (cosmic rays, satellite trails, a
+    dropped frame) before a downstream fit, without touching a real,
+    sustained multi-epoch feature at ordinary scatter levels -- a fixed,
+    global clip threshold this far out cannot mistake a percent-level
+    transit dip for a point in need of clipping. Returns all-``True`` when
+    ``y`` is too short (< 3 points) or the residual scatter is zero/non-finite.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Time-sorted 1-D series.
+    clip_sigma : float
+        Clipping threshold in robust standard deviations.
+    window : int
+        Rolling-median window size (points), capped to ``len(y)``.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean keep-mask, same shape as ``y``.
+    """
+    from scipy.ndimage import median_filter
+
+    if y.size < 3:
+        return np.ones_like(y, dtype=bool)
+    running_med = median_filter(y, size=max(min(int(window), y.size), 1), mode="nearest")
+    resid = y - running_med
+    sigma = mad_sigma(resid)
+    if not np.isfinite(sigma) or sigma <= 0:
+        return np.ones_like(y, dtype=bool)
+    return np.abs(resid) <= clip_sigma * sigma
