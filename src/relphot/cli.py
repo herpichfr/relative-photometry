@@ -772,6 +772,8 @@ def _run_search(args: argparse.Namespace) -> int:
 
     final_transit_candidate = transit_result.candidate & ~variable_candidate
 
+    min_ep = settings.search.effective_min_epochs(int(np.count_nonzero(frame_kept)))
+
     transits_dir = Path(args.transits_dir)
     variables_dir = Path(args.variables_dir)
     transits_dir.mkdir(parents=True, exist_ok=True)
@@ -920,7 +922,7 @@ def _run_search(args: argparse.Namespace) -> int:
 
         ok_ep, _a_v, t_g, y_norm, err_norm, cbv_rows, _idx = select_star_epochs(
             tilemap, cotrend_result, bjd, lc, lc_err, epoch_ok, frame_kept, star_best_aper,
-            settings.search.min_epochs, i,
+            min_ep, i,
         )
         prefix = "KNOWN_" if known else "NEW_"
         if ok_ep:

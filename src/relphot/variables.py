@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import re
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -433,6 +433,9 @@ def compute_star_variability(
     :func:`relphot.cotrend.detect_systematic_frames`'s output.
     """
     search = settings.search
+    n_kept = int(np.count_nonzero(frame_kept))
+    search = replace(search, min_epochs=search.effective_min_epochs(n_kept))
+    logger.info("variability: min epochs %d (%d kept frames)", search.min_epochs, n_kept)
     n_stars = night.n_stars
     n_aper = night.n_aper
     bjd = np.array([m.bjd_tdb for m in night.frame_meta], dtype=np.float64)
@@ -571,6 +574,12 @@ def compute_star_variability(
         )
         for i in range(n_stars)
     ]
+
+    if n_stars > 0 and not searched.any():
+        logger.warning(
+            "variability: no star has >= %d good epochs (%d kept frames); nothing searched",
+            search.min_epochs, n_kept,
+        )
 
     logger.info(
         "variability: %d/%d searched, %d candidates",

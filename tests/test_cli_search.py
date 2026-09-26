@@ -34,6 +34,7 @@ def test_search_smoke(fits_files, tmp_path) -> None:
     config.write_text(
         "[search]\n"
         "min_epochs = 2\n"
+        "min_epoch_fraction = 0.0\n"
         "n_cbv = 1\n"
         "cbv_explained_variance = 0.999\n"
         "duration_min_hours = 0.01\n"

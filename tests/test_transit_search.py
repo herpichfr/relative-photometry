@@ -384,6 +384,30 @@ def test_partial_event_is_flagged_and_still_a_candidate() -> None:
     assert (result.flags[target] & FLAG_STEP_LIKE) == 0
 
 
+def test_effective_min_epochs_below_floor(caplog) -> None:
+    """A night shorter than the absolute min_epochs floor searches nothing and warns."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    # Small night: 10 frames with default min_epoch_fraction=0.5 would need ceil(5)=5 epochs,
+    # but absolute floor min_epochs=20 means we need 20 -- impossible with 10 frames.
+    # So nothing gets searched and a warning is logged.
+    night, tilemap, lc, lc_err, epoch_ok, frame_kept, star_best_aper, _bjd = _scenario(
+        n_stars=5, n_frames=10, seed=42
+    )
+    comparison_mask = np.ones((5, 1), dtype=bool)
+    settings = Settings()
+    # Default: min_epochs=20, min_epoch_fraction=0.5
+    result = _run_search(
+        night, tilemap, lc, lc_err, epoch_ok, frame_kept, star_best_aper, comparison_mask,
+        settings,
+    )
+    # No stars searched because all need 20 epochs minimum, but only 10 frames available
+    assert result.searched.sum() == 0
+    # Check that the warning was logged
+    assert any("no star has >= 20 good epochs" in record.message for record in caplog.records)
+
+
 def test_no_python_loop_over_trial_grid() -> None:
     """search_one_star's trial grid is array-vectorised, not a Python loop over trials."""
     import ast

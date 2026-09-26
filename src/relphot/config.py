@@ -9,6 +9,7 @@ does nothing.
 from __future__ import annotations
 
 import dataclasses
+import math
 import tomllib
 import typing
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -254,8 +255,12 @@ class SearchSettings:
     systematic_frame_fraction: float = 0.3
 
     # --- single-event transit search (relphot.transit_search) ---
-    #: Minimum number of good epochs at a star's best aperture to search it at all.
-    min_epochs: int = 60
+    #: Absolute floor on good epochs at a star's best aperture (see ``min_epoch_fraction``).
+    min_epochs: int = 20
+    #: Required good epochs as a fraction of the night's kept frames; the effective cut
+    #: is ``max(min_epochs, ceil(min_epoch_fraction * n_kept))``, so the cut scales with
+    #: night length (a 45-frame night and a 351-frame night).
+    min_epoch_fraction: float = 0.5
     #: Rolling-median-clip threshold (robust sigma) applied to a star's own
     #: light curve before any nuisance or box fit, to remove isolated
     #: single-epoch outliers (cosmic rays, dropped frames) that a box
@@ -344,6 +349,10 @@ class SearchSettings:
         "EA", "EB", "EW", "ECL", "EC", "ESD", "RR", "CEP", "SR", "LPV",
         "CV", "UG", "DQ", "AM", "DSCT", "GDOR", "SXPHE", "M",
     )
+
+    def effective_min_epochs(self, n_kept: int) -> int:
+        """Good-epoch cut for a night with ``n_kept`` kept frames (see ``min_epoch_fraction``)."""
+        return max(int(self.min_epochs), math.ceil(self.min_epoch_fraction * n_kept), 1)
 
 
 @dataclass(frozen=True, slots=True)

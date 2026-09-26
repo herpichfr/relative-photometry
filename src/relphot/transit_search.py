@@ -50,7 +50,7 @@ comparison ensemble's own per-frame scatter (:func:`relphot.cotrend.compute_fram
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -725,6 +725,9 @@ def search_transits(
     star without any per-star fit.
     """
     search = settings.search
+    n_kept = int(np.count_nonzero(frame_kept))
+    search = replace(search, min_epochs=search.effective_min_epochs(n_kept))
+    logger.info("transit search: min epochs %d (%d kept frames)", search.min_epochs, n_kept)
     n_stars = night.n_stars
     n_frames = night.n_frames
     n_aper = night.n_aper
@@ -881,6 +884,12 @@ def search_transits(
 
     candidate = searched & np.isfinite(snr) & (snr >= search.snr_threshold)
     candidate &= (flags & HARD_REJECT_FLAGS) == 0
+
+    if n_stars > 0 and not searched.any():
+        logger.warning(
+            "transit search: no star has >= %d good epochs (%d kept frames); nothing searched",
+            search.min_epochs, n_kept,
+        )
 
     return TransitSearchResult(
         searched=searched,

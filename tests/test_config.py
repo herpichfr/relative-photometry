@@ -94,3 +94,27 @@ def test_lightcurve_unknown_key_raises(tmp_path) -> None:
     cfg.write_text("[lightcurve]\nunknown_field = true\n")
     with pytest.raises(ConfigError):
         load_settings(cfg)
+
+
+def test_effective_min_epochs() -> None:
+    """Test SearchSettings.effective_min_epochs computes correct floor."""
+    s = Settings()
+    # Defaults: min_epochs=20, min_epoch_fraction=0.5
+    assert s.search.effective_min_epochs(10) == 20  # max(20, ceil(0.5*10)) = 20
+    assert s.search.effective_min_epochs(43) == 22  # max(20, ceil(0.5*43)) = 22
+    assert s.search.effective_min_epochs(351) == 176  # max(20, ceil(0.5*351)) = 176
+    # Custom: min_epochs=2, min_epoch_fraction=0.0
+    s2 = Settings(search=s.search.__class__(min_epochs=2, min_epoch_fraction=0.0, **{
+        f.name: getattr(s.search, f.name) for f in s.search.__dataclass_fields__.values()
+        if f.name not in ('min_epochs', 'min_epoch_fraction')
+    }))
+    assert s2.search.effective_min_epochs(43) == 2  # max(2, 0) = 2
+
+
+def test_effective_min_epochs_toml_override(tmp_path) -> None:
+    """Test SearchSettings.effective_min_epochs with TOML override."""
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text("[search]\nmin_epoch_fraction = 0.7\n")
+    s = load_settings(cfg)
+    assert s.search.min_epoch_fraction == 0.7
+    assert s.search.effective_min_epochs(100) == max(20, 70)  # max(20, ceil(0.7*100))
