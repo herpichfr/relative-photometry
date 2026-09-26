@@ -158,6 +158,8 @@ def _sexagesimal_deg(raw: object, *, is_ra: bool) -> float | None:
 def _site_from_header(header: fits.Header, settings: Settings) -> EarthLocation | None:
     """Build an :class:`~astropy.coordinates.EarthLocation` from header keys.
 
+    Header keys are tried first: ``LATITUDE``/``LONGITUD``/``ALTITUDE`` (T80S),
+    then ``SITELAT``/``SITELONG``/``SITEELEV`` (N.I.N.A./ASCOM, as written for ROBO43).
     Falls back to ``settings.site`` for any missing piece; returns ``None``
     only when latitude or longitude is unavailable from either source.
     """
@@ -167,6 +169,16 @@ def _site_from_header(header: fits.Header, settings: Settings) -> EarthLocation 
         elev = float(header["ALTITUDE"]) if header.get("ALTITUDE") is not None else None
     except (TypeError, ValueError):
         elev = None
+
+    if lat is None:
+        lat = _sexagesimal_deg(header.get("SITELAT"), is_ra=False)
+    if lon is None:
+        lon = _sexagesimal_deg(header.get("SITELONG"), is_ra=False)
+    if elev is None:
+        try:
+            elev = float(header["SITEELEV"]) if header.get("SITEELEV") is not None else None
+        except (TypeError, ValueError):
+            elev = None
 
     if lat is None:
         lat = settings.site.latitude_deg

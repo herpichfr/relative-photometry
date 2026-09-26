@@ -85,9 +85,10 @@ class CatalogSettings:
 class SiteSettings:
     """Fallback observatory geodetic position.
 
-    Used only when a frame's primary header lacks ``LATITUDE``/``LONGITUD``
-    (sexagesimal-degree strings) or ``ALTITUDE`` (metres) -- real ROBO43/T80S
-    headers carry all three, so this is a last resort for other data.
+    Header keys are tried first: ``LATITUDE``/``LONGITUD``/``ALTITUDE`` (T80S),
+    then ``SITELAT``/``SITELONG``/``SITEELEV`` (N.I.N.A./ASCOM, as written for ROBO43).
+    This fallback is used only when both key sets are missing -- a last resort
+    for other data.
     """
 
     latitude_deg: float | None = None

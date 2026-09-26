@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from astropy.io import fits
 
 from relphot.config import Settings
 from relphot.exceptions import IngestError
-from relphot.ingest import read_catalog, read_catalogs, read_csv_catalog, read_fits_catalog
+from relphot.ingest import (
+    _compute_times,
+    _site_from_header,
+    read_catalog,
+    read_catalogs,
+    read_csv_catalog,
+    read_fits_catalog,
+)
 
 
 def test_fits_and_csv_adapters_agree(fits_files, csv_files) -> None:
@@ -105,3 +113,65 @@ def test_duplicate_csv_and_fits_yields_one_catalog(fits_files, csv_files) -> Non
     cats = read_catalogs([csv_files[0], fits_files[0]], settings)
     assert len(cats) == 1
     assert cats[0].meta.file == fits_files[0]
+
+
+def test_site_from_header_with_nina_sitelat_sitelong_siteelev() -> None:
+    """A header with only SITELAT/SITELONG/SITEELEV floats gives correct
+    EarthLocation matching those values to 1e-6 deg / 1e-3 m."""
+    settings = Settings()
+    header = fits.Header()
+    header["SITELAT"] = -22.534556
+    header["SITELONG"] = -45.5825
+    header["SITEELEV"] = 1864.0
+
+    site = _site_from_header(header, settings)
+    assert site is not None
+    np.testing.assert_allclose(site.lat.deg, -22.534556, atol=1e-6)
+    np.testing.assert_allclose(site.lon.deg, -45.5825, atol=1e-6)
+    np.testing.assert_allclose(site.height.to("m").value, 1864.0, atol=1e-3)
+
+
+def test_compute_times_with_nina_site_returns_finite_bjd_tdb() -> None:
+    """_compute_times on a header with SITELAT/SITELONG/SITEELEV floats and
+    valid DATE-OBS/EXPTIME/RA/DEC returns a finite bjd_tdb with proper
+    barycentric correction."""
+    settings = Settings()
+    header = fits.Header()
+    header["DATE-OBS"] = "2025-09-12T01:52:44.447"
+    header["EXPTIME"] = 30.0
+    header["SITELAT"] = -22.534556
+    header["SITELONG"] = -45.5825
+    header["SITEELEV"] = 1864.0
+    # Use sexagesimal strings to avoid issues with RA as float hours
+    header["RA"] = "21:29:00.9"  # 21:29:00.9 in hourangle = 322.2537644 deg
+    header["DEC"] = "-58:50:10.1"  # -58:50:10.1 in deg
+
+    jd_utc, bjd_tdb = _compute_times(header, None, settings)
+
+    # BJD_TDB should be finite
+    assert np.isfinite(bjd_tdb)
+    # Barycentric correction should be at most ~8.3 min + TT-UTC (0.08 d)
+    assert np.isfinite(jd_utc)
+    assert abs(bjd_tdb - jd_utc) < 0.01
+
+
+def test_latitude_longitud_take_precedence_over_sitelat_sitelong() -> None:
+    """LATITUDE/LONGITUD take precedence over SITELAT/SITELONG when both are
+    present."""
+    settings = Settings()
+    header = fits.Header()
+    # Primary keys (T80S)
+    header["LATITUDE"] = "-22.5"
+    header["LONGITUD"] = "-45.5"
+    header["ALTITUDE"] = 1850.0
+    # ASCOM/N.I.N.A. keys that should be ignored
+    header["SITELAT"] = -22.534556
+    header["SITELONG"] = -45.5825
+    header["SITEELEV"] = 1864.0
+
+    site = _site_from_header(header, settings)
+    assert site is not None
+    # Should match LATITUDE/LONGITUD, not SITELAT/SITELONG
+    np.testing.assert_allclose(site.lat.deg, -22.5, atol=1e-6)
+    np.testing.assert_allclose(site.lon.deg, -45.5, atol=1e-6)
+    np.testing.assert_allclose(site.height.to("m").value, 1850.0, atol=1e-3)
