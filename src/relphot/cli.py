@@ -43,6 +43,29 @@ from relphot.io import (
 )
 from relphot.lightcurve import compute_light_curves
 from relphot.match import match_night
+from relphot.multinight import (
+    build_multinight_lightcurves,
+    check_compatible,
+    crossmatch_nights,
+    load_multinight,
+    load_night_products,
+    plot_tie_diagnostics,
+    resolve_anchor_index,
+    save_floor_report,
+    save_multinight,
+    save_multinight_tables,
+    save_tie_report,
+    tie_nights,
+)
+from relphot.multinight_search import (
+    build_search_metrics_columns,
+    plot_candidate_star,
+    run_multisearch,
+    save_period_compat_csvs,
+    save_search_metrics_table,
+    save_transits_csv,
+    save_variables_csv,
+)
 from relphot.numeric import nanmedian_quiet
 from relphot.reference import build_references, select_candidates, select_reference_frames_and_stars
 from relphot.stats import (
@@ -992,6 +1015,200 @@ def _run_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_multinight(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    if len(args.night_dirs) < 2:
+        logger.error("relphot multinight requires at least 2 night directories")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    if args.aper is not None:
+        settings = replace(settings, multinight=replace(settings.multinight, aperture=args.aper))
+    if args.anchor is not None:
+        settings = replace(settings, multinight=replace(settings.multinight, anchor=args.anchor))
+
+    if args.labels is not None:
+        labels: list[str | None] = args.labels.split(",")
+        if len(labels) != len(args.night_dirs):
+            logger.error(
+                "--labels count (%d) does not match number of night directories (%d)",
+                len(labels), len(args.night_dirs),
+            )
+            return 1
+    else:
+        labels = [None] * len(args.night_dirs)
+
+    t0 = time.monotonic()
+    try:
+        nights = [
+            load_night_products(Path(d), label=lbl)
+            for d, lbl in zip(args.night_dirs, labels, strict=True)
+        ]
+        nights = check_compatible(nights)
+        anchor_index = resolve_anchor_index(nights, settings.multinight.anchor)
+        xmatch = crossmatch_nights(nights, anchor_index, settings.multinight.match_radius_arcsec)
+        tie = tie_nights(nights, xmatch, anchor_index, settings.multinight)
+        mlc = build_multinight_lightcurves(nights, xmatch, tie, settings.multinight)
+    except RelphotError:
+        logger.exception("multinight processing failed")
+        return 1
+    t1 = time.monotonic()
+    logger.info("multinight: %.2f s", t1 - t0)
+
+    out_stem = Path(args.out)
+    npz_path = out_stem.with_suffix(".npz")
+    save_multinight(npz_path, nights, xmatch, tie, mlc, settings)
+
+    tie_csv = out_stem.with_name(f"{out_stem.name}_tie.csv")
+    save_tie_report(tie_csv, tie)
+
+    floor_csv = out_stem.with_name(f"{out_stem.name}_floor.csv")
+    save_floor_report(floor_csv, tie)
+
+    stars_path, lc_path = save_multinight_tables(out_stem, xmatch, tie, mlc, args.format)
+
+    valid_aper = mlc.aperture[mlc.aperture >= 0]
+    a_report = int(np.argmax(np.bincount(valid_aper))) if valid_aper.size else 0
+
+    plot_path = None
+    if not args.no_plot and valid_aper.size:
+        plot_path = out_stem.with_name(f"{out_stem.name}_tie_aper{a_report}.png")
+        try:
+            plot_tie_diagnostics(plot_path, tie, a_report)
+        except RelphotError as exc:
+            logger.warning("failed to plot tie diagnostics: %s", exc)
+
+    for n, night in enumerate(nights):
+        floor_bright_mmag = float(tie.floor[n, a_report, 0]) * 1000.0
+        chi2_val = float(tie.chi2_after[n, a_report])
+        chi2_holdout_val = float(tie.chi2_holdout[n, a_report])
+        logger.info(
+            "night %s: frames kept %d/%d, stars %d, matched %d, tie stars %d, "
+            "resid bright %.2f mmag, floor(bright) %.2f mmag, chi2_after %.2f, "
+            "chi2_holdout %.2f",
+            night.label, int(np.count_nonzero(night.frame_kept)), night.n_frames, night.n_stars,
+            int(xmatch.n_matched[n]), int(tie.n_tie[n, a_report]),
+            float(tie.resid_mad_bright[n, a_report]) * 1000.0,
+            floor_bright_mmag if np.isfinite(floor_bright_mmag) else float("nan"),
+            chi2_val if np.isfinite(chi2_val) else float("nan"),
+            chi2_holdout_val if np.isfinite(chi2_holdout_val) else float("nan"),
+        )
+
+    print(f"nights: {len(nights)}, global stars: {xmatch.ra.shape[0]}")
+    print(f"wrote {npz_path}")
+    print(f"wrote {tie_csv}")
+    print(f"wrote {floor_csv}")
+    print(f"wrote {stars_path}")
+    print(f"wrote {lc_path}")
+    if plot_path is not None:
+        print(f"wrote {plot_path}")
+    return 0
+
+
+def _run_multisearch(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+    if args.all_stars:
+        settings = replace(
+            settings, multinight=replace(settings.multinight, periodogram_stars="all")
+        )
+
+    try:
+        xmatch, tie, mlc, night_info, _mn_settings = load_multinight(args.multi_npz)
+    except (OSError, RelphotError):
+        logger.exception("failed to load %s", args.multi_npz)
+        return 1
+
+    t0 = time.monotonic()
+    try:
+        result = run_multisearch(xmatch, tie, mlc, night_info, settings.multinight)
+    except RelphotError:
+        logger.exception("multisearch failed")
+        return 1
+    t1 = time.monotonic()
+    logger.info("multisearch: %.2f s", t1 - t0)
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    columns = build_search_metrics_columns(
+        xmatch, mlc, result["internight"], result["cross_ref"], result
+    )
+    metrics_path = save_search_metrics_table(
+        columns, out_dir / "multinight_search_metrics", args.format
+    )
+
+    variables_csv = out_dir / "multinight_variables.csv"
+    n_var = save_variables_csv(
+        variables_csv, xmatch, mlc, result["internight"], result["cross_ref"], result["ls"]
+    )
+
+    transits_csv = out_dir / "multinight_transits.csv"
+    n_transits = save_transits_csv(
+        transits_csv, xmatch, mlc, result["cross_ref"], result["bls"], result["period_compat"]
+    )
+
+    period_compat_dir = out_dir / "period_compat"
+    save_period_compat_csvs(period_compat_dir, result["period_compat"])
+
+    plot_paths: list[Path] = []
+    if not args.no_plot:
+        internight = result["internight"]
+        cross_ref = result["cross_ref"]
+        has_events = np.zeros(xmatch.ra.shape[0], dtype=bool)
+        if cross_ref.events:
+            has_events[np.array(list(cross_ref.events.keys()), dtype=np.int64)] = True
+        cand_mask = (
+            internight["candidate"]
+            | result["ls"]["candidate"]
+            | cross_ref.recurrent_variable
+            | result["bls"]["candidate"]
+            | has_events
+        )
+        cand_idx = np.nonzero(cand_mask)[0]
+        order = np.argsort(-np.nan_to_num(internight["chi2"][cand_idx], nan=-1.0))
+        cand_idx = cand_idx[order][: max(int(args.plot_limit), 0)]
+        plots_dir = out_dir / "plots"
+        for g in cand_idx:
+            path_png = plots_dir / f"g{int(g)}.png"
+            try:
+                plot_candidate_star(
+                    path_png, int(g), tie, mlc, result["ls"], result["bls"], result["period_compat"]
+                )
+                plot_paths.append(path_png)
+            except RelphotError as exc:
+                logger.warning("failed to plot star %d: %s", g, exc)
+
+    print(f"stars: {xmatch.ra.shape[0]}")
+    print(f"inter-night candidates: {int(np.count_nonzero(result['internight']['candidate']))}")
+    print(f"recurrent variables: {int(np.count_nonzero(result['cross_ref'].recurrent_variable))}")
+    print(f"periodic candidates: {int(np.count_nonzero(result['ls']['candidate']))}")
+    print(f"transit-event stars: {len(result['cross_ref'].events)}")
+    print(f"BLS candidates: {int(np.count_nonzero(result['bls']['candidate']))}")
+    print(f"wrote {metrics_path}")
+    print(f"wrote {variables_csv} ({n_var} rows)")
+    print(f"wrote {transits_csv} ({n_transits} rows)")
+    print(f"wrote {period_compat_dir} ({len(result['period_compat'])} files)")
+    for p in plot_paths:
+        print(f"wrote {p}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="relphot")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1093,6 +1310,54 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-plot", action="store_true", help="skip per-candidate/per-star PNG diagnostics",
     )
     search.set_defaults(func=_run_search)
+
+    multinight = subparsers.add_parser(
+        "multinight", help="cross-match and zero-point tie two or more nights"
+    )
+    multinight.add_argument("night_dirs", nargs="+", help="relphot/ directories, one per night")
+    multinight.add_argument("--out", required=True, help="output stem (without extension)")
+    multinight.add_argument(
+        "--labels", default=None,
+        help="comma-separated night labels, one per night_dirs entry",
+    )
+    multinight.add_argument(
+        "--anchor", default=None, help="override settings.multinight.anchor",
+    )
+    multinight.add_argument(
+        "--aper", type=int, default=None, help="override settings.multinight.aperture",
+    )
+    multinight.add_argument("--config", type=Path, default=None, help="TOML settings file")
+    multinight.add_argument(
+        "--format", choices=["auto", "parquet", "fits"], default="auto",
+        help="output table format (default: auto — parquet if pyarrow available, else fits)",
+    )
+    multinight.add_argument(
+        "--no-plot", action="store_true", help="skip the tie-diagnostics PNG",
+    )
+    multinight.set_defaults(func=_run_multinight)
+
+    multisearch = subparsers.add_parser(
+        "multisearch", help="cross-night variability and transit search on a tied multinight.npz"
+    )
+    multisearch.add_argument("multi_npz", help="input .npz written by `relphot multinight`")
+    multisearch.add_argument("--out-dir", required=True, help="output directory")
+    multisearch.add_argument("--config", type=Path, default=None, help="TOML settings file")
+    multisearch.add_argument(
+        "--all-stars", action="store_true",
+        help="override settings.multinight.periodogram_stars to 'all'",
+    )
+    multisearch.add_argument(
+        "--no-plot", action="store_true", help="skip per-candidate PNG diagnostics",
+    )
+    multisearch.add_argument(
+        "--format", choices=["auto", "parquet", "fits"], default="auto",
+        help="output table format (default: auto — parquet if pyarrow available, else fits)",
+    )
+    multisearch.add_argument(
+        "--plot-limit", type=int, default=50,
+        help="maximum candidate PNGs to write, highest inter-night chi2 first (default: 50)",
+    )
+    multisearch.set_defaults(func=_run_multisearch)
 
     return parser
 

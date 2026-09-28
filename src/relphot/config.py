@@ -24,6 +24,7 @@ __all__ = [
     "ComparisonSettings",
     "DecorrelationSettings",
     "LightcurveSettings",
+    "MultiNightSettings",
     "ReferenceSettings",
     "SearchSettings",
     "Settings",
@@ -138,6 +139,91 @@ class VariableSettings:
     extra_catalogs: tuple[str, ...] = ()
     match_radius_arcsec: float = 2.0
     cache_dir: str = "~/.cache/relphot/variables"
+
+
+@dataclass(frozen=True, slots=True)
+class MultiNightSettings:
+    """Phase 2: cross-match and zero-point tie of two or more already-processed nights.
+
+    See :mod:`relphot.multinight`. Every star's reference magnitude is tied
+    across nights by a per-(night, aperture) zero-point surface
+    ``Z_n(xi, eta, M)``, fixed to zero for the anchor night; ``xi``/``eta``
+    are tangent-plane coordinates of the field, ``M`` the star's calibrated
+    mean magnitude. ``min_tie_stars`` guards against fitting that surface to
+    too few comparison stars.
+    """
+
+    #: Cross-match radius, in arcsec, used to link the same star across nights.
+    match_radius_arcsec: float = 1.0
+    #: Night label of the zero-point anchor (Z ≡ 0); "auto" picks the night
+    #: with the most kept frames (ties: earliest).
+    anchor: str = "auto"
+    #: Aperture index used for every star; -1 chooses per star (see
+    #: :func:`relphot.multinight.build_multinight_lightcurves`).
+    aperture: int = -1
+    #: Degree of the tangent-plane spatial polynomial in the zero-point model.
+    spatial_degree: int = 2
+    #: Degree of the magnitude-dependent polynomial in the zero-point model.
+    mag_degree: int = 2
+    #: Added in quadrature to per-star errors when weighting the tie fit.
+    tie_err_floor_mag: float = 0.003
+    #: Star-level clipping threshold (robust sigma) in the zero-point tie.
+    clip_sigma: float = 4.0
+    #: Maximum alternating-fit iterations.
+    max_iter: int = 20
+    #: Alternating-fit convergence: max |ΔZ| change over tie stars.
+    tol_mag: float = 1e-5
+    #: Minimum tie stars required for a (night, aperture); fewer raises
+    #: :class:`~relphot.exceptions.MultiNightError`.
+    min_tie_stars: int = 50
+    #: Equal-count magnitude bins for the per-night calibration floor
+    #: (see :func:`relphot.multinight.tie_nights`/:meth:`~relphot.multinight.NightTie.floor_at`).
+    floor_n_bins: int = 6
+    #: Minimum common tie stars in a (night pair, magnitude bin) for that
+    #: bin's calibration-floor variance to be fit directly (an unmet bin is
+    #: filled by :meth:`~relphot.multinight.NightTie.floor_at`'s interpolation).
+    floor_min_bin_stars: int = 100
+
+    # --- Unit B: cross-night search (relphot.multinight_search) ---
+    #: Inter-night (long-term) variability chi2 p-value threshold.
+    internight_p_threshold: float = 1e-4
+    #: Minimum max-min nightly-mean spread (mag) also required for an
+    #: inter-night variability candidate.
+    internight_min_amplitude_mag: float = 0.005
+    #: Which stars get the combined Lomb-Scargle periodogram (B4)/BLS search
+    #: (B6): "candidates" (union of variability/transit-flagged stars) or "all".
+    periodogram_stars: str = "candidates"
+    periodogram_max_freq: float = 50.0
+    periodogram_samples_per_peak: int = 10
+    ls_fap_threshold: float = 1e-3
+    period_min_days: float = 0.2
+    period_max_days: float = 30.0
+    period_grid_oversample: int = 5
+    bls_durations_hours: tuple[float, ...] = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0)
+    #: A trial duration longer than this fraction of the median night span
+    #: is dropped before the BLS search -- a "transit" close to or longer
+    #: than a night's own span is a night-to-night step, not a transit.
+    bls_max_duration_fraction: float = 0.5
+    #: Minimum out-of-transit epochs a night must have, alongside >= 1
+    #: in-transit epoch, to count toward that candidate's ``nights_in_transit``.
+    bls_min_out_of_transit: int = 5
+    bls_snr_threshold: float = 7.0
+    bls_min_nights_in_transit: int = 2
+    #: Sigma thresholds for :func:`relphot.multinight_search.period_compatibility`.
+    event_exclusion_sigma: float = 3.0
+    event_min_box_coverage: float = 0.5
+    depth_consistency_sigma: float = 3.0
+    #: Minimum nights with a finite nightly magnitude for a star to enter
+    #: the inter-night variability search.
+    min_nights: int = 2
+    #: Minimum nights of finite epoch data for a star to enter the combined
+    #: Lomb-Scargle periodogram (B4) or BLS (B6) search at all -- a period
+    #: longer than a night's own span is unconstrained by fewer nights than
+    #: this, and their false-alarm probabilities are unreliable besides
+    #: (red/systematic, not white, noise). A star with fewer nights gets
+    #: NaN/False LS and BLS columns; skipped stars are logged once, not
+    #: per star.
+    min_nights_periodic: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +454,7 @@ class Settings:
     lightcurve: LightcurveSettings = field(default_factory=LightcurveSettings)
     decorrelation: DecorrelationSettings = field(default_factory=DecorrelationSettings)
     search: SearchSettings = field(default_factory=SearchSettings)
+    multinight: MultiNightSettings = field(default_factory=MultiNightSettings)
 
 
 def _build(cls: type, data: dict[str, Any], origin: str, path: str) -> Any:

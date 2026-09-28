@@ -7,6 +7,7 @@ __all__ = [
     "ConfigError",
     "IngestError",
     "MatchError",
+    "MultiNightError",
     "ReferenceFrameError",
     "RelphotError",
     "TilingError",
@@ -27,6 +28,10 @@ class IngestError(RelphotError):
 
 class MatchError(RelphotError):
     """Raised when cross-matching frames into a common star list fails."""
+
+
+class MultiNightError(RelphotError):
+    """Raised when multi-night cross-matching or the zero-point tie fails."""
 
 
 class ReferenceFrameError(RelphotError):
