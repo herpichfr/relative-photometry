@@ -1,0 +1,15 @@
+.git
+.gitignore
+tests/
+docs/
+deploy/
+data/
+*.npz
+*.parquet
+*.fits
+*.png
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

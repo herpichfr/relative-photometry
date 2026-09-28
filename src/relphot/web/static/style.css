@@ -1,0 +1,208 @@
+body {
+    font-family: 'system-ui', 'Segoe UI', Roboto, Arial, sans-serif;
+    max-width: 1280px;
+    margin: 0 auto;
+    background: #f7f7f9;
+    color: #1a1a1a;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.app-header {
+    padding: 1rem 0;
+    border-bottom: 1px solid #ddd;
+}
+
+.app-header h1 {
+    font-size: 1.5rem;
+    margin: 0;
+    font-weight: bold;
+}
+
+.panel {
+    background: white;
+    border: 1px solid #ddd;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    border-radius: 6px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.filter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 0.75rem;
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+}
+
+.field-wide {
+    grid-column: 1 / -1;
+}
+
+.button-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 0.75rem;
+}
+
+button {
+    background: #2b6cb0;
+    color: white;
+    padding: 0.35rem 0.5rem;
+    border: none;
+    border-radius: 4px;
+    font-size: inherit;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+button:hover {
+    background: #1e4e8c;
+}
+
+button:disabled {
+    background: #aaa;
+    cursor: not-allowed;
+}
+
+#advanced-sql {
+    margin-top: 1rem;
+}
+
+#advanced-sql summary {
+    font-weight: bold;
+    cursor: pointer;
+}
+
+fieldset {
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    padding: 0.5rem;
+}
+
+legend {
+    font-weight: bold;
+    font-size: 12px;
+}
+
+#sql-textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: monospace;
+}
+
+.error {
+    color: #b00020;
+    margin: 0.5rem 0;
+}
+
+.table-scroll {
+    overflow-x: auto;
+    max-height: 480px;
+    overflow-y: auto;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+
+thead th {
+    position: sticky;
+    top: 0;
+    background: #f0f0f2;
+    font-weight: bold;
+}
+
+th,
+td {
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid #e5e5e5;
+    text-align: left;
+    font-size: 13px;
+}
+
+th:hover {
+    background: #e0e0e2;
+}
+
+tbody tr:hover {
+    background: #f5f8fc;
+}
+
+tbody tr:nth-child(even) {
+    background: #fafafa;
+}
+
+#detail-meta th {
+    width: 160px;
+    font-weight: normal;
+    text-align: right;
+    color: #555;
+}
+
+#detail-meta td {
+    padding-left: 1rem;
+}
+
+.detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+}
+
+@media (max-width: 900px) {
+    .detail-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.plot {
+    width: 100%;
+    min-height: 380px;
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+#night-buttons {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.5rem;
+}
+
+#edit-box label {
+    display: inline-flex;
+    gap: 0.3rem;
+    align-items: center;
+}
+
+.note {
+    font-style: italic;
+    color: #666;
+    margin-top: 0.4rem;
+}
+
+input,
+select,
+textarea {
+    padding: 0.35rem 0.5rem;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: inherit;
+    transition: border-color 0.3s;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+    border-color: #007bff;
+}

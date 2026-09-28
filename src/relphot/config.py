@@ -22,6 +22,7 @@ __all__ = [
     "CatalogSettings",
     "ColumnMap",
     "ComparisonSettings",
+    "DbSettings",
     "DecorrelationSettings",
     "LightcurveSettings",
     "MultiNightSettings",
@@ -293,6 +294,54 @@ class ComparisonSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class DbSettings:
+    """Results-database noise cut and cross-match (see docs/DB_PLAN.md).
+
+    A star of a night is stored in the results database iff its rms is
+    finite, it passes the night's epoch cut, and its predicted per-point
+    noise at the best aperture is at most ``max_expected_noise`` -- unless
+    it is a transit or variability candidate of that night's search, which
+    is always stored when ``keep_candidates`` is true.
+    """
+
+    #: Maximum predicted per-point noise (fractional) at the best aperture
+    #: for a non-candidate star to be stored.
+    max_expected_noise: float = 0.05
+    #: Always store a night's transit/variability search candidates, even
+    #: when they fail the noise cut.
+    keep_candidates: bool = True
+    #: Cross-match radius, in arcsec, used to link a star to an existing
+    #: ``object`` row when loading a night.
+    match_radius_arcsec: float = 1.0
+    #: Lomb-Scargle period-grid floor (days) for ``relphot db analyze``.
+    ls_min_period_days: float = 0.02
+    #: Lomb-Scargle period-grid ceiling (days); capped by the data's own time span.
+    ls_max_period_days: float = 100.0
+    #: Frequency-grid oversampling factor for both the LS and BLS grids
+    #: (same convention as ``MultiNightSettings.periodogram_samples_per_peak``).
+    ls_samples_per_peak: int = 10
+    #: Frequency-grid size above which a periodogram's ``df`` is coarsened
+    #: (increased) to fit, and ``periodogram.coarsened`` is set.
+    max_periodogram_points: int = 200000
+    #: False-alarm-probability threshold for a combined Lomb-Scargle PERIOD (VAR).
+    ls_fap_threshold: float = 0.01
+    #: BLS period-grid floor (days).
+    bls_min_period_days: float = 0.2
+    #: BLS period-grid ceiling (days); also capped by combined_span / 1.5.
+    bls_max_period_days: float = 30.0
+    #: Trial transit durations for the combined BLS search; a duration not
+    #: shorter than ``bls_min_period_days`` is dropped.
+    bls_durations_hours: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0, 5.0)
+    #: Minimum BLS depth SNR (``periodogram.extra['depth_snr']``) for a
+    #: combined BLS PERIOD (EXOP).
+    bls_min_snr: float = 7.0
+    #: Multi-night detection kinds that count towards CLASS; 'bls',
+    #: 'ls_periodic', 'internight' are stored and queryable but excluded
+    #: until their thresholds are calibrated.
+    class_multinight_kinds: tuple[str, ...] = ("recurrent",)
+
+
+@dataclass(frozen=True, slots=True)
 class LightcurveSettings:
     """Stage-5 light curves, statistics, and best-aperture selection."""
 
@@ -471,6 +520,7 @@ class Settings:
     decorrelation: DecorrelationSettings = field(default_factory=DecorrelationSettings)
     search: SearchSettings = field(default_factory=SearchSettings)
     multinight: MultiNightSettings = field(default_factory=MultiNightSettings)
+    db: DbSettings = field(default_factory=DbSettings)
 
 
 def _build(cls: type, data: dict[str, Any], origin: str, path: str) -> Any:

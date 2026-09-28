@@ -1209,6 +1209,180 @@ def _run_multisearch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_db_init(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect, init_schema
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    try:
+        applied = init_schema(conn)
+    finally:
+        conn.close()
+
+    if applied:
+        print(f"applied migrations: {', '.join(str(v) for v in applied)}")
+    else:
+        print("schema already up to date")
+    return 0
+
+
+def _run_db_load_night(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    if args.label is not None and len(args.night_dirs) > 1:
+        logger.error("--label may only be used with a single NIGHT_RELPHOT_DIR")
+        return 1
+
+    try:
+        from relphot.db import connect, load_night
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    exit_code = 0
+    try:
+        for night_dir in args.night_dirs:
+            try:
+                report = load_night(
+                    conn, night_dir, telescope=args.telescope, label=args.label,
+                    lc_stem=args.lc_stem, settings=settings,
+                )
+            except (OSError, RelphotError):
+                logger.exception("failed to load %s", night_dir)
+                exit_code = 1
+                continue
+            print(
+                f"{night_dir}: night_id={report.night_id} telescope={report.telescope} "
+                f"label={report.label} frames={report.n_kept}/{report.n_frames} kept "
+                f"stars={report.n_stars} passed_cut={report.n_passed_cut} "
+                f"forced={report.n_candidates_forced} stored={report.n_stored} "
+                f"objects(new={report.n_new_objects},matched={report.n_matched_objects}) "
+                f"lightcurve(stars={report.lightcurve_stars},points={report.lightcurve_points}) "
+                f"detections(transit={report.n_transit_detections},"
+                f"variable={report.n_variable_detections}) "
+                f"catalog_matches={report.n_catalog_matches} "
+                f"elapsed={report.elapsed_s:.1f}s"
+            )
+    finally:
+        conn.close()
+    return exit_code
+
+
+def _run_db_load_multinight(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect, load_multinight
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    exit_code = 0
+    try:
+        report = load_multinight(
+            conn, args.stem, search_dir=args.search_dir, settings=settings,
+        )
+    except (OSError, RelphotError):
+        logger.exception("failed to load %s", args.stem)
+        exit_code = 1
+    finally:
+        conn.close()
+    if exit_code:
+        return exit_code
+
+    print(
+        f"{args.stem}: mn_run_id={report.mn_run_id} labels={','.join(report.labels)} "
+        f"anchor={report.anchor} tie_rows={report.n_tie_rows} "
+        f"objects_mapped={report.n_objects_mapped} "
+        f"globals_unmapped={report.n_globals_unmapped} conflicts={report.n_conflicts} "
+        f"detections(internight={report.n_detections_internight},"
+        f"ls_periodic={report.n_detections_ls_periodic},"
+        f"bls={report.n_detections_bls},"
+        f"recurrent={report.n_detections_recurrent}) "
+        f"elapsed={report.elapsed_s:.1f}s"
+    )
+    return 0
+
+
+def _run_db_analyze(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import analyze, connect
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    try:
+        report = analyze(
+            conn, all_candidates=args.all, obj_ids=args.obj_id, settings=settings,
+            workers=args.workers,
+        )
+    finally:
+        conn.close()
+
+    print(
+        f"objects={report.n_objects} ls_night={report.n_ls_night} "
+        f"ls_combined={report.n_ls_combined} bls={report.n_bls} "
+        f"coarsened={report.n_coarsened} elapsed={report.elapsed_s:.1f}s"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="relphot")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1358,6 +1532,103 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum candidate PNGs to write, highest inter-night chi2 first (default: 50)",
     )
     multisearch.set_defaults(func=_run_multisearch)
+
+    db = subparsers.add_parser("db", help="relphot results-database operations")
+    db_subparsers = db.add_subparsers(dest="db_command", required=True)
+
+    db_init = db_subparsers.add_parser(
+        "init", help="create or upgrade the results-database schema"
+    )
+    db_init.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_init.set_defaults(func=_run_db_init)
+
+    db_load_night = db_subparsers.add_parser(
+        "load-night", help="load one or more nights' relphot outputs into the results database"
+    )
+    db_load_night.add_argument(
+        "night_dirs", nargs="+", metavar="NIGHT_RELPHOT_DIR",
+        help="a night's relphot/ directory (holding night.npz, ref.npz, lc/)",
+    )
+    db_load_night.add_argument(
+        "--telescope", default=None,
+        help="telescope name (default: inferred from a '<TEL>_reduced' path component)",
+    )
+    db_load_night.add_argument(
+        "--label", default=None,
+        help=(
+            "night label (default: the night directory's parent directory name); "
+            "only allowed with a single NIGHT_RELPHOT_DIR"
+        ),
+    )
+    db_load_night.add_argument(
+        "--lc-stem", default=None,
+        help=(
+            "lc/<stem>_*.parquet stem (default: discovered; required if more than "
+            "one *_starstats.parquet is present)"
+        ),
+    )
+    db_load_night.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_load_night.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.search/settings.db drive the noise cut)",
+    )
+    db_load_night.set_defaults(func=_run_db_load_night)
+
+    db_analyze = db_subparsers.add_parser(
+        "analyze", help="recompute periodograms and PERIOD for candidate objects"
+    )
+    db_analyze.add_argument(
+        "--all", action="store_true",
+        help="analyse every candidate object, not just those needing re-analysis",
+    )
+    db_analyze.add_argument(
+        "--obj-id", type=int, action="append", default=None, dest="obj_id",
+        help="analyse only this object id (repeatable); overrides --all and the default selection",
+    )
+    db_analyze.add_argument(
+        "--workers", type=int, default=None,
+        help="parallel worker processes (default: the number of CPUs)",
+    )
+    db_analyze.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_analyze.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.db drives the period grids and thresholds)",
+    )
+    db_analyze.set_defaults(func=_run_db_analyze)
+
+    db_load_multinight = db_subparsers.add_parser(
+        "load-multinight",
+        help="load one multi-night tie run's tie rows and detections into the results database",
+    )
+    db_load_multinight.add_argument(
+        "stem", metavar="STEM",
+        help="multi-night output stem passed to `relphot multinight --out` (STEM.npz)",
+    )
+    db_load_multinight.add_argument(
+        "--search-dir", default=None,
+        help=(
+            "output directory of a matching `relphot multisearch` run "
+            "(multinight_search_metrics.parquet); omit to skip multi-night detections"
+        ),
+    )
+    db_load_multinight.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_load_multinight.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.db drives the BLS/LS PERIOD thresholds)",
+    )
+    db_load_multinight.set_defaults(func=_run_db_load_multinight)
 
     return parser
 

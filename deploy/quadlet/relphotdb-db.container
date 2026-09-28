@@ -1,0 +1,23 @@
+[Unit]
+Description=relphot results database (PostgreSQL 17 + q3c)
+After=network-online.target
+
+[Container]
+Image=localhost/relphotdb-db:latest
+ContainerName=relphotdb-db
+Network=relphotdb.network
+PublishPort=127.0.0.1:5433:5432
+UserNS=keep-id:uid=999,gid=999
+Volume=/ssdsto1/data/relphotDB/pgdata:/var/lib/postgresql/data:Z
+EnvironmentFile=%h/.config/relphot/relphotdb.env
+HealthCmd=pg_isready -U postgres
+HealthInterval=10s
+HealthTimeout=5s
+HealthRetries=5
+HealthStartPeriod=30s
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

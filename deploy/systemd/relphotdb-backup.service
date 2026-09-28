@@ -1,0 +1,8 @@
+[Unit]
+Description=relphot results-database nightly backup (pg_dump)
+After=relphotdb-db.service
+Requires=relphotdb-db.service
+
+[Service]
+Type=oneshot
+ExecStart=__REPO_DIR__/deploy/backup.sh

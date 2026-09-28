@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>relphot results database</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/plotly.min.js"></script>
+</head>
+<body>
+<header class="app-header">
+  <h1>relphot results database</h1>
+</header>
+
+<main>
+  <section id="search-panel" class="panel">
+    <h2>Query window</h2>
+    <form id="search-form">
+      <div class="filter-grid">
+        <fieldset>
+          <legend>Class</legend>
+          <label><input type="checkbox" name="class" value="UNC"> UNC</label>
+          <label><input type="checkbox" name="class" value="EXOP"> EXOP</label>
+          <label><input type="checkbox" name="class" value="VAR"> VAR</label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Detection kind</legend>
+          <label><input type="checkbox" name="detection_kind" value="transit"> transit</label>
+          <label><input type="checkbox" name="detection_kind" value="variable"> variable</label>
+          <label><input type="checkbox" name="detection_kind" value="bls"> bls</label>
+          <label><input type="checkbox" name="detection_kind" value="ls_periodic"> ls_periodic</label>
+          <label><input type="checkbox" name="detection_kind" value="internight"> internight</label>
+          <label><input type="checkbox" name="detection_kind" value="recurrent"> recurrent</label>
+          <label>Scope
+            <select id="filter-detection-scope" name="detection_scope">
+              <option value="">any</option>
+              <option value="night">night</option>
+              <option value="multinight">multinight</option>
+            </select>
+          </label>
+        </fieldset>
+
+        <label class="field">Known
+          <select id="filter-known" name="known">
+            <option value="">any</option>
+            <option value="true">yes</option>
+            <option value="false">no</option>
+          </select>
+        </label>
+
+        <label class="field">Source DB
+          <input type="text" id="filter-source-db" name="source_db">
+        </label>
+
+        <label class="field">Status
+          <select id="filter-status" name="status">
+            <option value="">any</option>
+            <option value="UNCONFIRMED">UNCONFIRMED</option>
+            <option value="CONFIRMED">CONFIRMED</option>
+            <option value="REJECTED">REJECTED</option>
+          </select>
+        </label>
+
+        <label class="field">Telescope
+          <input type="text" id="filter-telescope" name="telescope">
+        </label>
+
+        <label class="field">Name / Gaia ID
+          <input type="text" id="filter-name" name="name" placeholder="name substring">
+          <input type="text" id="filter-gaia-id" name="gaia_id" placeholder="Gaia ID">
+        </label>
+
+        <fieldset>
+          <legend>Cone search</legend>
+          <label>RA (deg) <input type="number" step="any" id="filter-ra" name="ra"></label>
+          <label>Dec (deg) <input type="number" step="any" id="filter-dec" name="dec"></label>
+          <label>Radius (arcsec) <input type="number" step="any" id="filter-radius" name="radius"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Magnitude</legend>
+          <label>min <input type="number" step="any" id="filter-mag-min" name="mag_min"></label>
+          <label>max <input type="number" step="any" id="filter-mag-max" name="mag_max"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Period (days)</legend>
+          <label>min <input type="number" step="any" id="filter-period-min" name="period_min"></label>
+          <label>max <input type="number" step="any" id="filter-period-max" name="period_max"></label>
+        </fieldset>
+
+        <label class="field">Min SNR
+          <input type="number" step="any" id="filter-snr-min" name="snr_min">
+        </label>
+
+        <label class="field">Min depth
+          <input type="number" step="any" id="filter-depth-min" name="depth_min">
+        </label>
+
+        <label class="field">Max tier
+          <input type="number" step="1" id="filter-tier-max" name="tier_max">
+        </label>
+
+        <label class="field">Min nights
+          <input type="number" step="1" id="filter-n-nights-min" name="n_nights_min">
+        </label>
+
+        <fieldset>
+          <legend>Night date range</legend>
+          <label>from <input type="date" id="filter-night-from" name="night_from"></label>
+          <label>to <input type="date" id="filter-night-to" name="night_to"></label>
+        </fieldset>
+
+        <label class="field">Has periodogram
+          <select id="filter-has-periodogram" name="has_periodogram">
+            <option value="">any</option>
+            <option value="true">yes</option>
+            <option value="false">no</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="button-row">
+        <button type="submit" id="btn-search">Search</button>
+        <button type="button" id="btn-reset">Reset</button>
+        <button type="button" id="btn-export-csv">Export CSV</button>
+      </div>
+    </form>
+
+    <details id="advanced-sql">
+      <summary>Advanced SQL</summary>
+      <textarea id="sql-textarea" rows="4" placeholder="SELECT * FROM relphot.object LIMIT 20"></textarea>
+      <div class="button-row">
+        <button type="button" id="btn-run-sql">Run</button>
+      </div>
+      <div id="sql-error" class="error" hidden></div>
+      <div id="sql-result-container" class="table-scroll"></div>
+    </details>
+  </section>
+
+  <section id="results-panel" class="panel">
+    <h2>Results</h2>
+    <div id="results-info"></div>
+    <div class="table-scroll">
+      <table id="results-table">
+        <thead><tr></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="button-row">
+      <button type="button" id="btn-prev-page">Prev</button>
+      <span id="page-info"></span>
+      <button type="button" id="btn-next-page">Next</button>
+      <label>Page size
+        <select id="page-size-select">
+          <option value="25">25</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="250">250</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <section id="detail-panel" class="panel" hidden>
+    <h2>Object detail</h2>
+
+    <div class="detail-grid">
+      <div>
+        <h3>Metadata</h3>
+        <table id="detail-meta"></table>
+      </div>
+      <div>
+        <h3>Catalogue matches</h3>
+        <table id="detail-catalog-matches">
+          <thead><tr><th>Catalog</th><th>Name</th><th>Type</th><th>Period</th><th>Sep (")</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <h3>Detections</h3>
+        <table id="detail-detections">
+          <thead>
+            <tr><th>Kind</th><th>Source</th><th>SNR</th><th>Depth</th><th>Duration (h)</th>
+                <th>Tier</th><th>Period</th><th>FAP</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <h3>Manual edit</h3>
+    <div id="edit-box" class="button-row">
+      <label>Class
+        <select id="edit-class-select">
+          <option value="">-</option>
+          <option value="UNC">UNC</option>
+          <option value="EXOP">EXOP</option>
+          <option value="VAR">VAR</option>
+        </select>
+      </label>
+      <button type="button" id="btn-reset-class-auto">reset class to auto</button>
+      <label>Status
+        <select id="edit-status-select">
+          <option value="">-</option>
+          <option value="UNCONFIRMED">UNCONFIRMED</option>
+          <option value="CONFIRMED">CONFIRMED</option>
+          <option value="REJECTED">REJECTED</option>
+        </select>
+      </label>
+      <label>Period (days)
+        <input type="number" step="any" id="edit-period-input">
+      </label>
+      <button type="button" id="btn-reset-period-auto">reset period to auto</button>
+      <label class="field-wide">Notes
+        <textarea id="edit-notes-textarea" rows="2"></textarea>
+      </label>
+      <button type="button" id="btn-save-edit">Save</button>
+      <span id="edit-status-msg"></span>
+    </div>
+
+    <h3>Light curves</h3>
+    <div id="night-buttons" class="button-row"></div>
+    <div id="plot-lightcurve" class="plot"></div>
+
+    <h3>Phase diagram</h3>
+    <div class="button-row">
+      <label>Period (days) <input type="number" step="any" id="phase-period-input"></label>
+      <button type="button" id="btn-phase-x2">x2</button>
+      <button type="button" id="btn-phase-div2">/2</button>
+      <span id="phase-period-note" class="note"></span>
+    </div>
+    <div id="plot-phase" class="plot"></div>
+
+    <h3>Periodogram</h3>
+    <div class="button-row">
+      <label>Scope
+        <select id="periodogram-scope-select"></select>
+      </label>
+      <label>Method
+        <select id="periodogram-method-select"></select>
+      </label>
+    </div>
+    <div id="periodogram-message"></div>
+    <div id="plot-periodogram" class="plot"></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

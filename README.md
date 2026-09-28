@@ -17,3 +17,11 @@ pip install -e .
 relphot ingest --out night.npz /path/to/*_proc.fits
 relphot reference night.npz --out ref.npz --no-variables
 ```
+
+## Results database
+
+Loaded night-by-night outputs (light curves, transit/variability detections,
+catalogue cross-matches) live in a queryable PostgreSQL database with a web
+front end -- see [`deploy/README.md`](deploy/README.md) for the operator
+guide (install, nightly workflow, CLASS/PERIOD rules, backups) and
+[`docs/DB_PLAN.md`](docs/DB_PLAN.md) for the design.
