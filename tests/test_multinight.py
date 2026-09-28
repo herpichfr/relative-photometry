@@ -12,11 +12,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from relphot.config import MultiNightSettings, settings_to_dict
+from relphot.decorrelate import compute_crowding
 from relphot.exceptions import MultiNightError
 from relphot.multinight import (
     NightCrossMatch,
@@ -502,10 +504,12 @@ def test_save_load_round_trip(tmp_path) -> None:
 
     assert tie.anchor_index == tie2.anchor_index
     assert tie.basis_terms == tie2.basis_terms
+    assert tie.seeing_basis_terms == tie2.seeing_basis_terms
     for field_name in (
         "coef", "xi", "eta", "mag0", "zp", "mean_mag", "night_mag", "night_mag_err",
         "tie_star", "rejected", "floor_mag_centres", "floor", "n_tie", "resid_mad",
         "resid_mad_bright", "chi2_after", "chi2_holdout", "chi2_holdout_bins", "n_iter",
+        "seeing_coef", "seeing_mag0", "seeing_crowd0", "night_fwhm", "crowding",
     ):
         np.testing.assert_array_equal(getattr(tie, field_name), getattr(tie2, field_name))
 
@@ -564,3 +568,198 @@ def test_save_tie_report_and_tables(tmp_path) -> None:
     lc_table = Table.read(lc_path)
     assert "night_label" in lc_table.colnames
     assert len(lc_table) > 0
+
+
+def _synthetic_seeing_scenario(
+    *,
+    n_nights: int = 3,
+    n_stars: int = 4000,
+    frames_per_night: int = 60,
+    seed: int = 42,
+    fwhm_by_night: list[float] | None = None,
+    floor_mmag_true: list[float] | None = None,
+    b_mag_true: float = 0.006,
+    b_crowd_true: float = 0.05,
+    anchor_index: int = 0,
+    comparison_frac: float = 0.6,
+    mag_range: tuple[float, float] = (13.0, 19.0),
+    field_deg: float = 1.0,
+    ra0: float = 150.0,
+    dec0: float = -30.0,
+    sigma_mag: float = 0.006,
+) -> tuple[list[NightProducts], dict]:
+    """A 1-aperture, no-jitter synthetic scenario with an injected pooled seeing term.
+
+    Every star gets an injected shift ``beta_true(mag, crowding) * (F_n -
+    F_anchor)`` -- linear in centred mean magnitude (coefficient
+    ``b_mag_true``) and in centred crowding (``b_crowd_true``,
+    :func:`~relphot.decorrelate.compute_crowding`, computed once directly on
+    the (identical, unjittered) star positions) -- plus independent
+    per-night Gaussian floor noise ``floor_mmag_true[n]``. No spatial/mag
+    zero-point offset is injected (``Z_n`` truth is 0 everywhere) so every
+    non-anchor night's residual against the anchor isolates the seeing
+    term + floor.
+    """
+    rng = np.random.default_rng(seed)
+    fwhm_by_night = fwhm_by_night or [2.13, 2.42, 2.97][:n_nights]
+    floor_mmag_true = floor_mmag_true or [3.0, 4.0, 3.5][:n_nights]
+    assert len(fwhm_by_night) == n_nights
+    assert len(floor_mmag_true) == n_nights
+
+    ra_true = ra0 + rng.uniform(-field_deg / 2, field_deg / 2, n_stars) / np.cos(np.radians(dec0))
+    dec_true = dec0 + rng.uniform(-field_deg / 2, field_deg / 2, n_stars)
+    mag_i = rng.uniform(mag_range[0], mag_range[1], n_stars)
+    mag0_truth = float(np.median(mag_i))
+    mag_c_true = mag_i - mag0_truth
+
+    # compute_crowding only reads .ra/.dec/.n_stars -- reuse it directly on a
+    # bare stand-in rather than duplicating its nearest-neighbour formula.
+    crowd_true = compute_crowding(SimpleNamespace(ra=ra_true, dec=dec_true, n_stars=n_stars))
+    crowd0_truth = float(np.median(crowd_true))
+    crowd_c_true = crowd_true - crowd0_truth
+
+    beta_true = b_mag_true * mag_c_true + b_crowd_true * crowd_c_true
+    comparison_mask_1d = rng.uniform(size=n_stars) < comparison_frac
+    labels = [f"N{n}" for n in range(n_nights)]
+
+    nights: list[NightProducts] = []
+    for n in range(n_nights):
+        core_tile = np.zeros(n_stars, dtype=np.int64)
+        bjd_tdb = 2460000.0 + 10.0 * n + np.linspace(0.0, 0.25, frames_per_night)
+        airmass = np.clip(1.0 + 0.5 * np.linspace(-1, 1, frames_per_night) ** 2, 1.0, None)
+        fwhm = np.full(frames_per_night, fwhm_by_night[n])
+        frame_kept = np.ones(frames_per_night, dtype=bool)
+        epoch_ok = np.ones((n_stars, frames_per_night), dtype=bool)
+
+        d_fwhm_n = fwhm_by_night[n] - fwhm_by_night[anchor_index]
+        seeing_shift = beta_true * d_fwhm_n
+        floor_shift = rng.normal(0.0, floor_mmag_true[n] / 1000.0, n_stars)
+        base_mag = mag_i + seeing_shift + floor_shift
+
+        noise = rng.normal(0.0, sigma_mag, (n_stars, frames_per_night))
+        mag_obs = base_mag[:, None] + noise
+        flux = 10.0 ** (-0.4 * (mag_obs - 25.0))
+        lc = flux.astype(np.float32)[:, :, None]
+        lc_err = (flux * sigma_mag / 1.0857).astype(np.float32)[:, :, None]
+        rms = np.full((n_stars, 1), sigma_mag / 1.0857, dtype=np.float64)
+        n_epochs = np.full((n_stars, 1), frames_per_night, dtype=np.int64)
+        comparison_mask = comparison_mask_1d[:, None]
+        star_best_aper = np.zeros(n_stars, dtype=np.int64)
+
+        nights.append(
+            NightProducts(
+                label=labels[n], directory=Path(f"synthetic_seeing_{labels[n]}"),
+                ra=ra_true.copy(), dec=dec_true.copy(), core_tile=core_tile,
+                bjd_tdb=bjd_tdb, airmass=airmass, fwhm=fwhm, frame_kept=frame_kept,
+                lc=lc, lc_err=lc_err, epoch_ok=epoch_ok, rms=rms, n_epochs=n_epochs,
+                comparison_mask=comparison_mask, star_best_aper=star_best_aper,
+                filter="R", object="synthetic", aperture_radii=(3.0,),
+            )
+        )
+
+    xmatch = NightCrossMatch(
+        ra=ra_true, dec=dec_true,
+        index=np.tile(np.arange(n_stars), (n_nights, 1)),
+        labels=tuple(labels), n_matched=np.zeros(n_nights, dtype=np.int64),
+    )
+    truth = {
+        "fwhm_by_night": fwhm_by_night,
+        "floor_mmag_true": floor_mmag_true,
+        "b_mag_true": b_mag_true,
+        "b_crowd_true": b_crowd_true,
+        "anchor_index": anchor_index,
+    }
+    return nights, xmatch, truth
+
+
+def test_seeing_term_recovers_beta_and_floor_where_old_model_clips(caplog) -> None:
+    # Reproduces the real T80S failure this feature targets: an unmodelled
+    # star-dependent, seeing-dependent term makes the per-night calibration
+    # floor's v_nk = f_n + f_k additivity assumption fail (v_04_06 >
+    # v_04_05 + v_05_06 in the real data), so NNLS clips some night's floor
+    # to exactly 0 in every bin. use_seeing_term=True must remove that
+    # non-additivity (recovering the true, non-zero, per-night floor) by
+    # absorbing the seeing x crowding term into the pooled beta surface.
+    nights, xmatch, truth = _synthetic_seeing_scenario()
+    anchor_index = truth["anchor_index"]
+    settings_common = MultiNightSettings(floor_min_bin_stars=100)
+
+    caplog.set_level("WARNING", logger="relphot.multinight")
+    caplog.clear()
+    settings_off = replace(settings_common, use_seeing_term=False)
+    tie_off = tie_nights(nights, xmatch, anchor_index, settings_off)
+    clip_messages_off = [r.message for r in caplog.records if "NNLS clipped" in r.message]
+    assert clip_messages_off, "expected the unmodelled seeing term to force an NNLS floor clip"
+    # Some night's floor is exactly 0 in (at least most of) every bin.
+    assert np.any(np.all(tie_off.floor[:, 0, :] == 0.0, axis=1))
+    assert tie_off.seeing_basis_terms == ()
+    assert tie_off.seeing_coef.shape == (1, 0)
+
+    caplog.clear()
+    settings_on = replace(settings_common, use_seeing_term=True)
+    tie_on = tie_nights(nights, xmatch, anchor_index, settings_on)
+    clip_messages_on = [r.message for r in caplog.records if "NNLS clipped" in r.message]
+    assert not clip_messages_on, clip_messages_on
+
+    # No night's recovered floor collapses to (near) 0, and every night's
+    # floor is close to its true, injected value in every bin.
+    floor_on_mmag = tie_on.floor[:, 0, :] * 1000.0
+    assert np.all(floor_on_mmag > 0.5)
+    for n, true_mmag in enumerate(truth["floor_mmag_true"]):
+        assert np.max(np.abs(floor_on_mmag[n] - true_mmag)) < 3.0, (n, floor_on_mmag[n])
+    assert np.all((tie_on.chi2_after[:, 0] >= 0.7) & (tie_on.chi2_after[:, 0] <= 1.3))
+    assert np.all((tie_on.chi2_holdout[:, 0] >= 0.6) & (tie_on.chi2_holdout[:, 0] <= 1.4))
+
+    # The pooled beta surface's crowding coefficient is recovered; its
+    # magnitude coefficient is not asserted -- with mag_degree >= 1 in the
+    # per-night poly(M) (the default), a magnitude-only component of beta is
+    # exactly degenerate with that night's own poly(M) coefficient for any
+    # number of nights (see the module docstring), so it is absorbed there
+    # instead, by design, not a recovery failure.
+    cc_index = tie_on.seeing_basis_terms.index("cc")
+    cc_coef = tie_on.seeing_coef[0, cc_index]
+    assert abs(cc_coef - truth["b_crowd_true"]) < 0.02, tie_on.seeing_coef[0]
+
+    np.testing.assert_array_equal(tie_on.night_fwhm, np.asarray(truth["fwhm_by_night"]))
+
+
+def test_seeing_term_off_is_inert_without_true_seeing_signal() -> None:
+    # _synthetic_tie_scenario's nights all share the same constant FWHM
+    # (F_n - F_anchor == 0 for every non-anchor night), so the pooled
+    # seeing-fit step contributes nothing to add (every night is skipped in
+    # _fit_pooled_seeing) regardless of the toggle: on and off must be
+    # bit-for-bit identical here.
+    nights, _truth = _synthetic_tie_scenario(n_nights=3, n_stars=1500, seed=20)
+    nights = check_compatible(nights)
+    anchor_index = resolve_anchor_index(nights, "auto")
+    xmatch = crossmatch_nights(nights, anchor_index, radius_arcsec=1.0)
+
+    tie_off = tie_nights(nights, xmatch, anchor_index, MultiNightSettings(use_seeing_term=False))
+    tie_on = tie_nights(nights, xmatch, anchor_index, MultiNightSettings(use_seeing_term=True))
+
+    np.testing.assert_array_equal(tie_off.zp, tie_on.zp)
+    np.testing.assert_array_equal(tie_off.coef, tie_on.coef)
+    np.testing.assert_array_equal(tie_off.floor, tie_on.floor)
+    np.testing.assert_array_equal(tie_off.chi2_after, tie_on.chi2_after)
+    assert tie_off.seeing_basis_terms == ()
+    assert tie_on.seeing_basis_terms != ()
+    assert np.all(tie_on.seeing_coef == 0.0)
+
+
+def test_seeing_term_two_nights_degeneracy_warning(caplog) -> None:
+    nights, xmatch, truth = _synthetic_seeing_scenario(
+        n_nights=2, fwhm_by_night=[2.13, 2.42], floor_mmag_true=[3.0, 4.0], seed=21,
+    )
+    anchor_index = truth["anchor_index"]
+
+    caplog.set_level("WARNING", logger="relphot.multinight")
+    caplog.clear()
+    tie_nights(nights, xmatch, anchor_index, MultiNightSettings(seeing_crowding_degree=0))
+    assert any("degenerate" in r.message for r in caplog.records)
+
+    caplog.clear()
+    tie_two = tie_nights(nights, xmatch, anchor_index, MultiNightSettings())
+    assert not any("degenerate" in r.message for r in caplog.records)
+    # Still runs and produces a usable (finite) crowding-surface coefficient.
+    cc_index = tie_two.seeing_basis_terms.index("cc")
+    assert np.isfinite(tie_two.seeing_coef[0, cc_index])

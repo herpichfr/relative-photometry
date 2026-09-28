@@ -183,6 +183,22 @@ class MultiNightSettings:
     #: bin's calibration-floor variance to be fit directly (an unmet bin is
     #: filled by :meth:`~relphot.multinight.NightTie.floor_at`'s interpolation).
     floor_min_bin_stars: int = 100
+    #: Add a pooled seeing term ``beta(M, crowding) * (F_n - F_anchor)`` to
+    #: the zero-point model, ``F_n`` the night's median FWHM (px) over kept
+    #: frames -- see :mod:`relphot.multinight`'s module docstring. ``beta``
+    #: is one surface shared by every night (never a free per-star fit).
+    #: ``False`` reproduces the model without this term.
+    use_seeing_term: bool = True
+    #: Degree of the pooled seeing-surface polynomial in centred mean
+    #: magnitude.
+    seeing_mag_degree: int = 1
+    #: Degree of the pooled seeing-surface polynomial in centred crowding
+    #: (:func:`relphot.decorrelate.compute_crowding`). With exactly 2 nights
+    #: this is what separates ``beta`` from the per-night ``poly(M)`` term,
+    #: which is otherwise nearly degenerate with it (see the module
+    #: docstring); 0 disables the crowding dependence and should only be
+    #: used with >= 3 nights.
+    seeing_crowding_degree: int = 1
 
     # --- Unit B: cross-night search (relphot.multinight_search) ---
     #: Inter-night (long-term) variability chi2 p-value threshold.

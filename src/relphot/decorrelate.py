@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from relphot.comparison import ComparisonResult
     from relphot.config import DecorrelationSettings
     from relphot.match import MatchedNight
+    from relphot.multinight import NightProducts
     from relphot.tiles import TileMap
 
 logger = logging.getLogger(__name__)
@@ -58,17 +59,22 @@ class DecorrelationResult:
     diagnostics: dict[str, np.ndarray]
 
 
-def compute_crowding(night: MatchedNight) -> np.ndarray:
+def compute_crowding(night: MatchedNight | NightProducts) -> np.ndarray:
     """Crowding index for each star: log10(nearest-neighbor separation in arcsec).
 
     Uses a 3-D unit-vector cKDTree to find k=2 nearest neighbours (the first
     is the star itself). Separation is computed as arcsec on the sphere, bounded
     below at 0.05 arcsec. Stars with non-finite RA/Dec get NaN.
 
+    Only ``night.ra``/``night.dec``/``night.n_stars`` are used, so a
+    :class:`~relphot.multinight.NightProducts` works here too (reused, with
+    the same definition, as the crowding regressor of the multi-night tie's
+    pooled seeing surface -- see :mod:`relphot.multinight`).
+
     Parameters
     ----------
-    night : MatchedNight
-        Matched night data.
+    night : MatchedNight | NightProducts
+        Matched night data, or one night's multi-night-tie products.
 
     Returns
     -------

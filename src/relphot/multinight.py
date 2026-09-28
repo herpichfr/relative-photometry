@@ -12,7 +12,15 @@ anchor night -- to comparison stars common to at least two nights
 (:func:`tie_nights`), and finally assembles multi-night calibrated light
 curves (:func:`build_multinight_lightcurves`). ``xi``/``eta`` are gnomonic
 tangent-plane coordinates of the field; the anchor is the night with the
-most kept frames by default. An empirical per-night calibration floor is
+most kept frames by default. Optionally (``settings.use_seeing_term``, on by
+default) the model also carries a pooled seeing term ``beta(M, crowding) *
+(F_n - F_anchor)``, ``F_n`` the night's median FWHM (px) over kept frames and
+``beta`` one magnitude+crowding surface shared by every night -- fit jointly
+with the per-night polynomials inside the same alternating fit -- so that a
+star-dependent, seeing-dependent excess (crowding/aperture loss growing with
+the seeing difference between two nights) is absorbed by the tie itself
+rather than left for the per-night calibration floor below to (mis)represent
+as a per-night constant. An empirical per-night calibration floor is
 estimated from the night-to-night scatter of tie stars after convergence and
 added in quadrature to the reported errors, so that ``chi2_after`` comes out
 close to 1 when the tie is self-consistent.
@@ -37,6 +45,7 @@ from scipy.optimize import nnls
 from scipy.spatial import cKDTree
 
 from relphot.config import MultiNightSettings, Settings, settings_from_dict, settings_to_dict
+from relphot.decorrelate import compute_crowding
 from relphot.exceptions import MultiNightError
 from relphot.io import load_lightcurves_npz, load_night, load_reference
 from relphot.match import _resolve_duplicates
@@ -405,13 +414,29 @@ def _make_basis_terms(spatial_degree: int, mag_degree: int) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _evaluate_basis_term(
-    name: str, xi: np.ndarray, eta: np.ndarray, dm: np.ndarray
-) -> np.ndarray:
+def _make_seeing_basis_terms(mag_degree: int, crowding_degree: int) -> tuple[str, ...]:
+    """Basis-term names of the pooled seeing surface ``beta(M, crowding)``.
+
+    E.g. ``("1", "mc", "mc^2", "cc")`` for ``mag_degree=2, crowding_degree=1``
+    -- ``"mc"``/``"cc"`` are the centred mean-magnitude/crowding regressors
+    (see :func:`_evaluate_basis_term`'s ``variables``), additive (no
+    mag*crowding cross terms), matching :func:`relphot.decorrelate.fit_coefficient_surface`'s
+    convention.
+    """
+    names = ["1"]
+    for k in range(1, mag_degree + 1):
+        names.append("mc" if k == 1 else f"mc^{k}")
+    for k in range(1, crowding_degree + 1):
+        names.append("cc" if k == 1 else f"cc^{k}")
+    return tuple(names)
+
+
+def _evaluate_basis_term(name: str, variables: dict[str, np.ndarray]) -> np.ndarray:
+    """``name`` (e.g. ``"xi^2"``, ``"xi*eta"``, ``"mc"``) evaluated against ``variables``."""
+    reference = next(iter(variables.values()))
     if name == "1":
-        return np.ones_like(xi, dtype=np.float64)
-    value = np.ones_like(xi, dtype=np.float64)
-    variables = {"xi": xi, "eta": eta, "dm": dm}
+        return np.ones_like(reference, dtype=np.float64)
+    value = np.ones_like(reference, dtype=np.float64)
     for factor in name.split("*"):
         base, _, power_str = factor.partition("^")
         power = int(power_str) if power_str else 1
@@ -419,11 +444,9 @@ def _evaluate_basis_term(
     return value
 
 
-def _design_matrix(
-    xi: np.ndarray, eta: np.ndarray, dm: np.ndarray, basis_terms: tuple[str, ...]
-) -> np.ndarray:
-    """``(len(xi), len(basis_terms))`` design matrix for the zero-point model."""
-    return np.column_stack([_evaluate_basis_term(t, xi, eta, dm) for t in basis_terms])
+def _design_matrix(variables: dict[str, np.ndarray], basis_terms: tuple[str, ...]) -> np.ndarray:
+    """``(len(next(iter(variables.values()))), len(basis_terms))`` design matrix."""
+    return np.column_stack([_evaluate_basis_term(t, variables) for t in basis_terms])
 
 
 def _weighted_lstsq(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> np.ndarray | None:
@@ -434,6 +457,47 @@ def _weighted_lstsq(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> np.ndarray |
         return np.linalg.solve(xtwx, xtwy)
     except np.linalg.LinAlgError:
         return None
+
+
+def _fit_pooled_seeing(
+    seeing_design: np.ndarray, d_fwhm: np.ndarray, residual: np.ndarray, weight: np.ndarray,
+    rows_mask: np.ndarray,
+) -> np.ndarray | None:
+    """Pooled seeing-surface coefficients ``alpha``, stacked over every non-anchor night.
+
+    One shared ``alpha`` (not per night -- "beta shared by all nights", see
+    the module docstring) is fit by weighted least squares on the stacked
+    rows ``{(n, star): rows_mask[n, star]}`` of every night ``n`` with
+    ``d_fwhm[n] != 0`` (the anchor, and degenerately any other night whose
+    ``F_n`` happens to equal ``F_anchor``, contribute an all-zero regressor
+    row and are skipped rather than sent into a singular solve).
+    ``seeing_design`` is ``(n_global, n_seeing_terms)`` (the star-only part
+    ``beta(M, crowding)``'s design matrix, the same for every night);
+    ``residual``/``weight``/``rows_mask`` are ``(n_nights, n_global)``.
+    Returns ``None`` if no night contributes, or the stacked system is
+    singular or under-determined.
+    """
+    n_nights = residual.shape[0]
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    ws: list[np.ndarray] = []
+    for n in range(n_nights):
+        if d_fwhm[n] == 0.0:
+            continue
+        rows = rows_mask[n]
+        if not np.any(rows):
+            continue
+        xs.append(seeing_design[rows] * d_fwhm[n])
+        ys.append(residual[n, rows])
+        ws.append(weight[n, rows])
+    if not xs:
+        return None
+    x = np.concatenate(xs, axis=0)
+    if x.shape[0] < x.shape[1] + 1:
+        return None
+    y = np.concatenate(ys, axis=0)
+    w = np.concatenate(ws, axis=0)
+    return _weighted_lstsq(x, y, w)
 
 
 def _weighted_mean_and_loo(
@@ -500,6 +564,7 @@ def _solve_floor_variance(d2: np.ndarray, s2sum: np.ndarray) -> float:
 def _fit_floor_bins(
     mn: np.ndarray, z: np.ndarray, sn: np.ndarray, tie_fit: np.ndarray, tie_eval: np.ndarray,
     bin_idx: np.ndarray, n_bins: int, n_nights: int, min_bin_stars: int,
+    *, warn_night_labels: tuple[str, ...] | None = None, aperture: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-bin calibration-floor variance solved on ``tie_fit``, evaluated (chi2) on ``tie_eval``.
 
@@ -512,6 +577,16 @@ def _fit_floor_bins(
     per-night floors by equal division (2 nights) or non-negative least
     squares (:func:`scipy.optimize.nnls`, >2 nights). A bin/night with no
     contributing pair is NaN.
+
+    When ``warn_night_labels`` is given (the primary, non-holdout call
+    only -- the holdout calls leave it ``None`` so they do not double-log),
+    a night whose >2-nights NNLS solve clips its floor to exactly 0 despite
+    contributing a pair in that bin logs a
+    :func:`~logging.Logger.warning`: NNLS forces a non-negative solution, so
+    an exact 0 here can mean the night-pair excess variances in that bin are
+    not well described by the additive ``v_nk = f_n + f_k`` model (e.g. one
+    pair's excess exceeds the sum of the other two), not that the night
+    truly needs no floor -- a diagnostic for model inadequacy.
 
     Returns ``(floor[n_nights, n_bins]`` (mag, i.e. already square-rooted),
     ``chi2_by_night[n_nights]``, ``chi2_by_bin[n_nights, n_bins])``.
@@ -546,6 +621,15 @@ def _fit_floor_bins(
                 b_vec[row] = v_nk
             f_b, _resid_norm = nnls(design, b_vec)
             has_pair = design.sum(axis=0) > 0
+            if warn_night_labels is not None:
+                clipped = has_pair & (f_b == 0.0)
+                for n_clip in np.nonzero(clipped)[0]:
+                    logger.warning(
+                        "aperture %s, bin %d: NNLS clipped night %s's calibration floor "
+                        "to 0 (possible model inadequacy -- non-additive night-pair "
+                        "excess variance)",
+                        aperture, b, warn_night_labels[n_clip],
+                    )
             f_b = np.where(has_pair, f_b, np.nan)
         floor[:, b] = f_b
 
@@ -627,6 +711,19 @@ class NightTie:
     ``resid_mad``/``resid_mad_bright`` are the tie-star leave-one-out
     residual scatter (mag), overall and for the brightest 10% by
     ``mean_mag``.
+
+    ``seeing_coef`` is the pooled seeing-surface ``beta(M, crowding)``
+    coefficients, ``(n_aper, n_seeing_terms)`` -- one surface shared by
+    every night, not per-night (empty last axis if
+    ``settings.use_seeing_term`` was ``False``). ``seeing_mag0``/
+    ``seeing_crowd0`` are its per-aperture centring constants (subtracted
+    from ``mean_mag``/``crowding`` before evaluating ``seeing_basis_terms``,
+    NaN if unused). ``night_fwhm`` is each night's seeing measure ``F_n``
+    (median FWHM, px, over kept frames); ``crowding`` is each global star's
+    pooled (median-over-nights) crowding index
+    (:func:`relphot.decorrelate.compute_crowding`). See
+    :func:`evaluate_zero_point` for how these combine into
+    ``beta(M, crowding) * (F_n - F_anchor)``.
     """
 
     labels: tuple[str, ...]
@@ -653,6 +750,12 @@ class NightTie:
     chi2_holdout: np.ndarray
     chi2_holdout_bins: np.ndarray
     n_iter: np.ndarray
+    seeing_basis_terms: tuple[str, ...]
+    seeing_coef: np.ndarray
+    seeing_mag0: np.ndarray
+    seeing_crowd0: np.ndarray
+    night_fwhm: np.ndarray
+    crowding: np.ndarray
 
     def floor_at(self, night_index: int, aperture: int, mag) -> np.ndarray:
         """Calibration floor (mag) at magnitude ``mag``, night ``night_index``, ``aperture``.
@@ -703,6 +806,12 @@ def tie_nights(
 
     basis_terms = _make_basis_terms(settings.spatial_degree, settings.mag_degree)
     n_coef = len(basis_terms)
+    seeing_terms = (
+        _make_seeing_basis_terms(settings.seeing_mag_degree, settings.seeing_crowding_degree)
+        if settings.use_seeing_term
+        else ()
+    )
+    n_seeing_coef = len(seeing_terms)
 
     local_mag_err = [_nightly_mag_err(night) for night in nights]
     night_mag = _project_to_global(
@@ -714,6 +823,35 @@ def tie_nights(
     night_pool = _project_to_global(
         xmatch.index, [night.comparison_mask for night in nights], False
     )
+
+    # Per-night seeing measure F_n (median FWHM, px, over kept frames) and each
+    # global star's pooled crowding index (median over the nights it appears
+    # in) -- the two regressors of the pooled seeing term beta(M, crowding) *
+    # (F_n - F_anchor); see the module docstring. Computed unconditionally
+    # (cheap; a KDTree per night) so they always round-trip in NightTie, even
+    # with settings.use_seeing_term=False.
+    night_fwhm = np.array(
+        [float(nanmedian_quiet(night.fwhm[night.frame_kept])) for night in nights],
+        dtype=np.float64,
+    )
+    d_fwhm = night_fwhm - night_fwhm[anchor_index]
+    local_crowding = [compute_crowding(night) for night in nights]
+    crowding_global = nanmedian_quiet(
+        _project_to_global(xmatch.index, local_crowding, np.nan), axis=0
+    )
+    logger.info(
+        "per-night seeing F_n (median FWHM, px, kept frames): %s",
+        {label: round(float(f), 3) for label, f in zip(labels, night_fwhm, strict=True)},
+    )
+    if settings.use_seeing_term and n_nights == 2 and settings.seeing_crowding_degree < 1:
+        logger.warning(
+            "use_seeing_term with exactly 2 nights and seeing_crowding_degree=0: the "
+            "seeing term beta(M)*(F_n-F_anchor) is then fit from a single non-anchor "
+            "night's tie stars against the same magnitude the per-night poly(M) term "
+            "already uses, and is nearly degenerate with it; increase "
+            "seeing_crowding_degree (crowding is what separates them) or set "
+            "use_seeing_term=False",
+        )
 
     finite = np.isfinite(night_mag) & np.isfinite(night_mag_err)
     count_finite = finite.sum(axis=0)  # (n_global, n_aper)
@@ -734,6 +872,9 @@ def tie_nights(
     chi2_holdout_bins = np.full((n_nights, n_aper, n_bins), np.nan, dtype=np.float64)
     n_iter = np.zeros(n_aper, dtype=np.int64)
     mag0 = np.full(n_aper, np.nan, dtype=np.float64)
+    seeing_coef = np.zeros((n_aper, n_seeing_coef), dtype=np.float64)
+    seeing_mag0 = np.full(n_aper, np.nan, dtype=np.float64)
+    seeing_crowd0 = np.full(n_aper, np.nan, dtype=np.float64)
 
     for a in range(n_aper):
         mn = night_mag[:, :, a]
@@ -754,8 +895,12 @@ def tie_nights(
         w = np.where(finite_a, 1.0 / (sn**2 + settings.tie_err_floor_mag**2), 0.0)
 
         z = np.zeros((n_nights, n_global), dtype=np.float64)
+        seeing_z = np.zeros((n_nights, n_global), dtype=np.float64)
         rej = np.zeros(n_global, dtype=bool)
         mag0_a: float | None = None
+        seeing_mag0_a: float | None = None
+        seeing_crowd0_a: float | None = None
+        alpha_a: np.ndarray | None = None
         it_used = 0
         delta = np.inf
 
@@ -768,25 +913,52 @@ def tie_nights(
                 any_tie0 = tie_base.any(axis=0)
                 mag0_a = float(nanmedian_quiet(np.where(any_tie0, m_all, np.nan)))
                 mag0[a] = mag0_a
+                if settings.use_seeing_term:
+                    seeing_mag0_a = mag0_a
+                    seeing_crowd0_a = float(
+                        nanmedian_quiet(np.where(any_tie0, crowding_global, np.nan))
+                    )
 
             tie_eff = tie_base & ~rej[None, :]
-            z_new = z.copy()
+            z_poly = np.zeros((n_nights, n_global), dtype=np.float64)
             coef_a = coef[:, a, :].copy()
             for n in range(n_nights):
                 if n == anchor_index:
                     continue
                 dm_all = m_loo[n] - mag0_a
-                design_all = _design_matrix(xi, eta, dm_all, basis_terms)
+                design_all = _design_matrix({"xi": xi, "eta": eta, "dm": dm_all}, basis_terms)
                 rows = tie_eff[n]
                 if np.count_nonzero(rows) < n_coef + 1:
                     continue
-                y = mn[n, rows] - m_loo[n, rows]
+                y = mn[n, rows] - m_loo[n, rows] - seeing_z[n, rows]
                 fit = _weighted_lstsq(design_all[rows], y, w[n, rows])
                 if fit is None:
                     continue
                 coef_a[n] = fit
-                z_new[n] = design_all @ fit
+                z_poly[n] = design_all @ fit
             coef[:, a, :] = coef_a
+
+            if settings.use_seeing_term:
+                mag_c_pool = m_all - seeing_mag0_a
+                crowd_c_pool = crowding_global - seeing_crowd0_a
+                seeing_design_all = _design_matrix(
+                    {"mc": mag_c_pool, "cc": crowd_c_pool}, seeing_terms
+                )
+                residual_pool = mn - m_loo - z_poly
+                fit_alpha = _fit_pooled_seeing(seeing_design_all, d_fwhm, residual_pool, w, tie_eff)
+                if fit_alpha is not None:
+                    alpha_a = fit_alpha
+                if alpha_a is not None:
+                    beta_pool = seeing_design_all @ alpha_a
+                    seeing_z_new = d_fwhm[:, None] * beta_pool[None, :]
+                    seeing_z_new[anchor_index, :] = 0.0
+                else:
+                    seeing_z_new = np.zeros((n_nights, n_global), dtype=np.float64)
+            else:
+                seeing_z_new = np.zeros((n_nights, n_global), dtype=np.float64)
+
+            z_new = z_poly + seeing_z_new
+            seeing_z = seeing_z_new
 
             active = tie_eff
             if np.any(active):
@@ -847,6 +1019,9 @@ def tie_nights(
         rejected[:, a] = rej
         n_tie[:, a] = tie_eff.sum(axis=1)
         n_iter[a] = it_used
+        seeing_coef[a, :] = alpha_a if alpha_a is not None else 0.0
+        seeing_mag0[a] = seeing_mag0_a if seeing_mag0_a is not None else np.nan
+        seeing_crowd0[a] = seeing_crowd0_a if seeing_crowd0_a is not None else np.nan
 
         for n in range(n_nights):
             rows = tie_eff[n]
@@ -874,6 +1049,7 @@ def tie_nights(
 
         floor_a, chi2_after_a, _chi2_bin_full = _fit_floor_bins(
             mn, z, sn, tie_eff, tie_eff, bin_idx, n_bins, n_nights, settings.floor_min_bin_stars,
+            warn_night_labels=labels, aperture=a,
         )
         floor[:, a, :] = floor_a
         chi2_after[:, a] = chi2_after_a
@@ -929,12 +1105,18 @@ def tie_nights(
         chi2_holdout=chi2_holdout,
         chi2_holdout_bins=chi2_holdout_bins,
         n_iter=n_iter,
+        seeing_basis_terms=seeing_terms,
+        seeing_coef=seeing_coef,
+        seeing_mag0=seeing_mag0,
+        seeing_crowd0=seeing_crowd0,
+        night_fwhm=night_fwhm,
+        crowding=crowding_global,
     )
 
 
 def evaluate_zero_point(
     tie: NightTie, night_index: int, aperture: int, xi: np.ndarray, eta: np.ndarray,
-    mag: np.ndarray,
+    mag: np.ndarray, crowding: np.ndarray | None = None,
 ) -> np.ndarray:
     """``Z_n(xi, eta, mag)`` of the fitted model in ``tie``, for arbitrary star
     positions/magnitudes.
@@ -942,14 +1124,33 @@ def evaluate_zero_point(
     Zero for the anchor night. ``xi``/``eta`` must already be in the same
     scaled tangent-plane system as ``tie.xi``/``tie.eta`` (divide raw
     gnomonic coordinates, in degrees, by ``tie.scale_deg``).
+
+    ``crowding`` (:func:`relphot.decorrelate.compute_crowding`'s
+    log10-arcsec index, one per star) adds the pooled seeing term
+    ``beta(mag, crowding) * (F_n - F_anchor)`` -- see the module docstring
+    and :func:`tie_nights`. It is required whenever ``tie.seeing_basis_terms``
+    is non-empty (``settings.use_seeing_term`` was ``True``); with an empty
+    ``tie.seeing_basis_terms`` (``use_seeing_term=False``) it is ignored.
     """
     xi = np.asarray(xi, dtype=np.float64)
     if night_index == tie.anchor_index:
         return np.zeros_like(xi)
     eta = np.asarray(eta, dtype=np.float64)
     dm = np.asarray(mag, dtype=np.float64) - tie.mag0[aperture]
-    design = _design_matrix(xi, eta, dm, tie.basis_terms)
-    return design @ tie.coef[night_index, aperture]
+    design = _design_matrix({"xi": xi, "eta": eta, "dm": dm}, tie.basis_terms)
+    z = design @ tie.coef[night_index, aperture]
+
+    if tie.seeing_basis_terms:
+        if crowding is None:
+            msg = "tie has a fitted seeing term (use_seeing_term=True); crowding is required"
+            raise MultiNightError(msg)
+        mag_c = np.asarray(mag, dtype=np.float64) - tie.seeing_mag0[aperture]
+        crowd_c = np.asarray(crowding, dtype=np.float64) - tie.seeing_crowd0[aperture]
+        seeing_design = _design_matrix({"mc": mag_c, "cc": crowd_c}, tie.seeing_basis_terms)
+        beta = seeing_design @ tie.seeing_coef[aperture]
+        d_fwhm = tie.night_fwhm[night_index] - tie.night_fwhm[tie.anchor_index]
+        z = z + beta * d_fwhm
+    return z
 
 
 @dataclass(slots=True)
@@ -1157,6 +1358,12 @@ def save_multinight(
         tie_chi2_holdout=tie.chi2_holdout,
         tie_chi2_holdout_bins=tie.chi2_holdout_bins,
         tie_n_iter=tie.n_iter,
+        tie_seeing_basis_terms_json=json.dumps(list(tie.seeing_basis_terms)),
+        tie_seeing_coef=tie.seeing_coef,
+        tie_seeing_mag0=tie.seeing_mag0,
+        tie_seeing_crowd0=tie.seeing_crowd0,
+        tie_night_fwhm=tie.night_fwhm,
+        tie_crowding=tie.crowding,
         mlc_night_of_frame=mlc.night_of_frame,
         mlc_frame_in_night=mlc.frame_in_night,
         mlc_bjd_tdb=mlc.bjd_tdb,
@@ -1217,6 +1424,12 @@ def load_multinight(
             chi2_holdout=data["tie_chi2_holdout"],
             chi2_holdout_bins=data["tie_chi2_holdout_bins"],
             n_iter=data["tie_n_iter"],
+            seeing_basis_terms=tuple(json.loads(str(data["tie_seeing_basis_terms_json"]))),
+            seeing_coef=data["tie_seeing_coef"],
+            seeing_mag0=data["tie_seeing_mag0"],
+            seeing_crowd0=data["tie_seeing_crowd0"],
+            night_fwhm=data["tie_night_fwhm"],
+            crowding=data["tie_crowding"],
         )
         mlc = MultiNightLightCurves(
             labels=labels,
@@ -1248,15 +1461,22 @@ def save_tie_report(path_csv: Path | str, tie: NightTie) -> None:
     centres and held-out chi2, is in :func:`save_floor_report`.
     ``chi2_after`` is close to 1 by construction for 2 nights (see
     :class:`NightTie`'s docstring) -- ``chi2_holdout`` is the real check.
+    ``night_fwhm``/``d_fwhm_anchor`` and the ``seeing_*`` columns are the
+    pooled seeing term's inputs/fitted surface (one shared ``beta`` per
+    aperture, so the ``seeing_*`` values repeat identically across a given
+    aperture's night rows); all-empty/zero when ``settings.use_seeing_term``
+    was ``False``.
     """
     path_csv = Path(path_csv)
     n_nights = len(tie.labels)
     n_aper = tie.coef.shape[1]
+    seeing_fieldnames = [f"seeing_{name}" for name in tie.seeing_basis_terms]
     fieldnames = [
         "label", "aperture", "is_anchor", "n_tie", "n_rejected",
         "resid_mad_mmag", "resid_mad_bright_mmag", "floor_bright_mmag",
         "chi2_after", "chi2_holdout", "n_iter",
-        *tie.basis_terms,
+        "night_fwhm", "d_fwhm_anchor", "seeing_mag0", "seeing_crowd0",
+        *tie.basis_terms, *seeing_fieldnames,
     ]
     with path_csv.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1276,9 +1496,15 @@ def save_tie_report(path_csv: Path | str, tie: NightTie) -> None:
                     "chi2_after": float(tie.chi2_after[n, a]),
                     "chi2_holdout": float(tie.chi2_holdout[n, a]),
                     "n_iter": int(tie.n_iter[a]),
+                    "night_fwhm": float(tie.night_fwhm[n]),
+                    "d_fwhm_anchor": float(tie.night_fwhm[n] - tie.night_fwhm[tie.anchor_index]),
+                    "seeing_mag0": float(tie.seeing_mag0[a]),
+                    "seeing_crowd0": float(tie.seeing_crowd0[a]),
                 }
                 for t, name in enumerate(tie.basis_terms):
                     row[name] = float(tie.coef[n, a, t])
+                for t, name in enumerate(seeing_fieldnames):
+                    row[name] = float(tie.seeing_coef[a, t])
                 writer.writerow(row)
     logger.info("wrote %s (%d rows)", path_csv, n_nights * n_aper)
 

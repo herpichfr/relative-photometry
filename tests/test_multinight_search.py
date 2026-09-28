@@ -181,6 +181,12 @@ def _toy_tie(n_nights: int, n_aper: int = 1, labels: tuple[str, ...] | None = No
         chi2_holdout=np.zeros((n_nights, n_aper)),
         chi2_holdout_bins=np.zeros((n_nights, n_aper, n_bins)),
         n_iter=np.zeros(n_aper, dtype=np.int64),
+        seeing_basis_terms=(),
+        seeing_coef=np.zeros((n_aper, 0)),
+        seeing_mag0=np.full(n_aper, np.nan),
+        seeing_crowd0=np.full(n_aper, np.nan),
+        night_fwhm=np.zeros(n_nights),
+        crowding=np.zeros(0),
     )
 
 
