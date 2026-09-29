@@ -8,6 +8,12 @@ See docs/DB_PLAN.md for the schema and the noise cut this implements.
 ``relphot.night``/``frame``/``star_night``/``lightcurve``/``detection``/
 ``catalog_match``, matching stars to existing ``relphot.object`` rows (or
 creating new ones) by position. Everything happens in one transaction.
+
+A reload deletes the night's detections, but a person's ``status``/``notes`` on them
+are saved first and re-attached to the matching new detection (or, when none
+matches, kept in ``relphot.detection_review_orphan``); an object a person touched is
+never dropped as an orphan. A transit detection whose flags include EDGE or PARTIAL
+is stored with ``duration_lower_limit`` set (its duration is only a minimum).
 """
 
 from __future__ import annotations
@@ -155,6 +161,78 @@ def _row_extra(row: dict, cols: list[str]) -> dict[str, object]:
 
 def _nan_to_none(value: float | None) -> float | None:
     return None if value is None or not math.isfinite(value) else float(value)
+
+
+def _is_incomplete_transit(flags_str: str, partial: bool) -> bool:
+    """Whether a transit event is incomplete (EDGE/PARTIAL), so its duration is a minimum."""
+    tokens = set(flags_str.split("|"))
+    return partial or "EDGE" in tokens or "PARTIAL" in tokens
+
+
+def _restore_detection_reviews(
+    cur: psycopg.Cursor, night_id: int, saved: list[tuple]
+) -> tuple[int, int]:
+    """Re-attach saved detection reviews to the reloaded night's detections.
+
+    ``saved`` holds ``(obj_id, kind, tc, duration_h, status, notes)`` rows.
+
+    A saved transit goes to the new detection of the same object and kind whose ``tc``
+    differs by at most half the transit duration (the nearest one); any other kind goes
+    to the same object and kind. What cannot be matched is logged as a warning and
+    kept in ``relphot.detection_review_orphan``. Returns ``(n_restored, n_orphaned)``.
+    """
+    cur.execute(
+        "SELECT det_id, obj_id, kind, tc_bjd_tdb, duration_h FROM relphot.detection "
+        "WHERE night_id = %s ORDER BY det_id",
+        (night_id,),
+    )
+    candidates: dict[tuple[int, str], list[tuple[int, float | None, float | None]]] = {}
+    for det_id, obj_id, kind, tc, dur in cur.fetchall():
+        candidates.setdefault((obj_id, kind), []).append((det_id, tc, dur))
+
+    used: set[int] = set()
+    n_restored = n_orphaned = 0
+    for obj_id, kind, tc, duration_h, status, notes in saved:
+        pool = [c for c in candidates.get((obj_id, kind), []) if c[0] not in used]
+        if kind == "transit" and tc is not None:
+            pool = [
+                c for c in pool
+                if c[1] is not None
+                and abs(c[1] - tc)
+                <= 0.5 * (duration_h if duration_h is not None else (c[2] or 0.0)) / 24.0
+            ]
+            pool.sort(key=lambda c: abs(c[1] - tc))
+        if pool:
+            used.add(pool[0][0])
+            cur.execute(
+                "UPDATE relphot.detection SET status = %s, notes = %s WHERE det_id = %s",
+                (status, notes, pool[0][0]),
+            )
+            n_restored += 1
+        else:
+            logger.warning(
+                "night %d reload: no detection matches the saved review (obj_id=%d, kind=%s, "
+                "tc=%s, status=%s); kept in relphot.detection_review_orphan",
+                night_id, obj_id, kind, tc, status,
+            )
+            cur.execute(
+                "INSERT INTO relphot.detection_review_orphan "
+                "(obj_id, night_id, kind, tc_bjd_tdb, status, notes) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (obj_id, night_id, kind, tc, status, notes),
+            )
+            n_orphaned += 1
+    return n_restored, n_orphaned
+
+
+def _optional_col(row: object, name: str) -> float | None:
+    """``row.<name>`` as a finite float, or ``None`` when the column is absent or NaN.
+
+    For metrics columns that only newer ``relphot search`` outputs (or another
+    producer) carry, e.g. a catalogue period uncertainty.
+    """
+    value = getattr(row, name, None)
+    return None if value is None else _nan_to_none(value)
 
 
 #: PostgreSQL's ``real`` (float4) underflows on a nonzero magnitude below this
@@ -406,6 +484,14 @@ def load_night(
             (night_id,) = cur.fetchone()
 
             # --- reload: drop this night's previous frame/star_night/detection rows ---
+            # a person's status/notes on a detection are saved first and re-attached below
+            cur.execute(
+                "SELECT obj_id, kind, tc_bjd_tdb, duration_h, status, notes "
+                "FROM relphot.detection WHERE night_id = %s "
+                "AND (status IS DISTINCT FROM 'UNCONFIRMED' OR notes IS NOT NULL)",
+                (night_id,),
+            )
+            saved_reviews = cur.fetchall()
             cur.execute("DELETE FROM relphot.detection WHERE night_id = %s", (night_id,))
             cur.execute("DELETE FROM relphot.star_night WHERE night_id = %s", (night_id,))
             cur.execute("DELETE FROM relphot.frame WHERE night_id = %s", (night_id,))
@@ -595,6 +681,9 @@ def load_night(
                                 _real_safe(row.transit_duration_hours), int(row.transit_tier),
                                 str(row.transit_flags_str), None, None, None, None,
                                 Jsonb(_row_extra(row_d, transit_extra_cols)),
+                                _is_incomplete_transit(
+                                    str(row.transit_flags_str), bool(row.transit_partial)
+                                ),
                             )
                         )
                         n_transit_detections += 1
@@ -608,6 +697,7 @@ def load_night(
                                 _nan_to_none(row.variability_ls_period_days),
                                 _real_safe(row.variability_ls_fap),
                                 Jsonb(_row_extra(row_d, _VARIABLE_EXTRA_COLS)),
+                                False,
                             )
                         )
                         n_variable_detections += 1
@@ -620,6 +710,7 @@ def load_night(
                                 obj_id, _infer_variable_catalog(var_name), var_name,
                                 var_type or None,
                                 _nan_to_none(row.known_variable_period_days),
+                                _optional_col(row, "known_variable_period_err_days"),
                             )
                         )
                     planet_name = str(row.known_planet_name) if row.known_planet else ""
@@ -630,6 +721,7 @@ def load_night(
                                 "TOI" if row.known_planet_is_toi else "NASA Exoplanet Archive",
                                 planet_name, None,
                                 _nan_to_none(row.known_planet_period_days),
+                                _optional_col(row, "known_planet_period_err_days"),
                             )
                         )
 
@@ -642,7 +734,8 @@ def load_night(
                     with cur.copy(
                         "COPY relphot.detection "
                         "(obj_id, night_id, kind, snr, depth, tc_bjd_tdb, duration_h, tier, "
-                        "flags, amplitude, excess, period, fap, extra) FROM STDIN"
+                        "flags, amplitude, excess, period, fap, extra, duration_lower_limit) "
+                        "FROM STDIN"
                     ) as copy:
                         for r in detection_rows:
                             copy.write_row(r)
@@ -650,10 +743,12 @@ def load_night(
                 if catalog_rows:
                     cur.executemany(
                         """
-                        INSERT INTO relphot.catalog_match (obj_id, catalog, name, type, period)
-                        VALUES (%s, %s, %s, %s, %s)
+                        INSERT INTO relphot.catalog_match
+                            (obj_id, catalog, name, type, period, period_err)
+                        VALUES (%s, %s, %s, %s, %s, %s)
                         ON CONFLICT (obj_id, catalog, name) DO UPDATE SET
-                            type = EXCLUDED.type, period = EXCLUDED.period
+                            type = EXCLUDED.type, period = EXCLUDED.period,
+                            period_err = EXCLUDED.period_err
                         """,
                         catalog_rows,
                     )
@@ -686,11 +781,20 @@ def load_night(
                         """
                     )
 
-            # --- drop objects this reload (or a prior one) left with no star_night ---
+            if saved_reviews:
+                _restore_detection_reviews(cur, night_id, saved_reviews)
+
+            # --- drop objects this reload (or a prior one) left with no star_night, except
+            # those a person has touched: any manual flag or period, a status, or notes ---
             cur.execute(
                 """
                 DELETE FROM relphot.object o
                 WHERE o.class_source IS DISTINCT FROM 'manual'
+                    AND o.exop_source IS DISTINCT FROM 'manual'
+                    AND o.var_source IS DISTINCT FROM 'manual'
+                    AND o.period_source IS DISTINCT FROM 'manual'
+                    AND COALESCE(o.status, 'UNCONFIRMED') = 'UNCONFIRMED'
+                    AND o.notes IS NULL
                     AND NOT EXISTS (
                         SELECT 1 FROM relphot.star_night sn WHERE sn.obj_id = o.obj_id
                     )

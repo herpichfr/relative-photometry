@@ -80,6 +80,7 @@ from relphot.transit_search import (
     FLAG_NEIGHBOUR_BLEND,
     FLAG_TOO_DEEP,
     fit_nuisance_model,
+    flag_on_variable,
     flags_to_string,
     plot_transit_candidate,
     search_one_star,
@@ -767,12 +768,12 @@ def _run_search(args: argparse.Namespace) -> int:
     )
     transit_result.flags[blend] |= FLAG_NEIGHBOUR_BLEND
 
-    # Route TOO_DEEP transit events to variables (as eclipsing), and exclude
-    # any star the variability search independently calls variable -- or that
-    # a catalogue already lists as a known variable, whether or not this
-    # night's own statistics reach significance for it -- from the transit
-    # candidate list. A real periodic/eclipsing variable is not a
-    # single-event transit, whichever check happened to catch it.
+    # Route TOO_DEEP transit events to variables (as eclipsing). A star the
+    # variability search independently calls variable -- or that a catalogue
+    # already lists as a known variable of a disqualifying type -- is also
+    # listed as a variable, but it stays a transit candidate: a planet host can
+    # be variable too, and a multi-planet system can show events of different
+    # depth. Its transit events only carry the informational ON_VARIABLE flag.
     variable_candidate = variability_result.variable_candidate.copy()
     variable_class = list(variability_result.variable_class)
     too_deep = (transit_result.flags & FLAG_TOO_DEEP).astype(bool) & transit_result.searched
@@ -793,7 +794,7 @@ def _run_search(args: argparse.Namespace) -> int:
     for i in np.nonzero(known_only)[0]:
         variable_class[i] = "known (catalogue only)"
 
-    final_transit_candidate = transit_result.candidate & ~variable_candidate
+    flag_on_variable(transit_result.flags, transit_result.candidate, variable_candidate)
 
     min_ep = settings.search.effective_min_epochs(int(np.count_nonzero(frame_kept)))
 
@@ -806,7 +807,7 @@ def _run_search(args: argparse.Namespace) -> int:
 
     # --- transit candidates ---
     transit_rows = []
-    cand_idx = np.nonzero(final_transit_candidate)[0]
+    cand_idx = np.nonzero(transit_result.candidate)[0]
     for i in cand_idx:
         t_tile = int(tilemap.core_tile[i])
         pool = np.nonzero(
@@ -1378,6 +1379,8 @@ def _run_db_analyze(args: argparse.Namespace) -> int:
     print(
         f"objects={report.n_objects} ls_night={report.n_ls_night} "
         f"ls_combined={report.n_ls_combined} bls={report.n_bls} "
+        f"transit_shapes={report.n_transit_shapes} transit_matches={report.n_transit_matches} "
+        f"period_estimates={report.n_period_estimates} "
         f"coarsened={report.n_coarsened} elapsed={report.elapsed_s:.1f}s"
     )
     return 0

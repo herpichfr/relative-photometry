@@ -339,6 +339,24 @@ class DbSettings:
     #: 'ls_periodic', 'internight' are stored and queryable but excluded
     #: until their thresholds are calibrated.
     class_multinight_kinds: tuple[str, ...] = ("recurrent",)
+    #: Systematic floor on the transit-depth difference of a matching-transit
+    #: pair, as a fraction of the pair's mean depth.
+    match_depth_sys_frac: float = 0.05
+    #: Extra depth-difference floor (fraction of mean depth) added when the two
+    #: events were observed with different telescopes (dilution, pixel scale).
+    match_depth_sys_frac_cross_telescope: float = 0.15
+    #: Systematic floor on the T14 difference, as a fraction of the mean T14.
+    match_t14_sys_frac: float = 0.0
+    #: Systematic floor on the ingress-fraction (T12/T14) difference (absolute).
+    match_ingress_sys: float = 0.0
+    #: Smallest commensurate period (days) listed for a matching-transit pair
+    #: (same as ``MultiNightSettings.period_min_days``).
+    match_period_min_days: float = 0.2
+    #: Most commensurate periods stored per matching-transit pair.
+    match_max_commensurate: int = 50
+    #: Half-width, as a fraction of ``lit_period * harmonic``, of the window in
+    #: which a literature period is verified against the data.
+    lit_period_window_frac: float = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,7 +509,8 @@ class SearchSettings:
     cache_dir: str = "~/.cache/relphot/search"
     #: Catalogue variability-type substrings (case-insensitive, matched
     #: against each ``|``-separated token of the catalogue's own type
-    #: string) that disqualify a star from transit candidacy outright.
+    #: string) that list a star as a variable. Its transit events stay
+    #: candidates and only carry the informational ON_VARIABLE flag.
     #: A generic/weak automated classification (e.g. Gaia's own
     #: "SOLAR_LIKE" or "ROT") is deliberately absent -- low-amplitude
     #: rotational modulation does not preclude a real transiting planet,

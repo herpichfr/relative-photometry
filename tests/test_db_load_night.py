@@ -358,6 +358,221 @@ def test_load_night_classes_and_detections(test_conn, tmp_path) -> None:
     assert matches == [("Gaia DR3", "Gaia DR3 12345", "EA", 3.3)]
 
 
+def test_load_night_transit_on_known_variable_and_catalog_period_err(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    sm_path = root / "lc" / "night_lc_search_metrics.parquet"
+    sm = pd.read_parquet(sm_path)
+    # star1 is the known variable: give it a transit event flagged ON_VARIABLE too
+    sm.loc[1, ["transit_candidate", "transit_snr", "transit_depth"]] = [True, 9.0, 0.01]
+    sm.loc[1, "transit_tc_bjd_tdb"] = 2460000.52
+    sm.loc[1, "transit_duration_hours"] = 1.2
+    sm.loc[1, "transit_tier"] = 1
+    sm.loc[1, "transit_flags_str"] = "ON_VARIABLE"
+    sm["known_variable_period_err_days"] = np.where(sm["known_variable"], 0.05, np.nan)
+    sm.to_parquet(sm_path)
+
+    load_night(test_conn, root, settings=_SETTINGS)
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT o.class, o.is_exop, o.is_var, d.kind, d.flags, d.status "
+            "FROM relphot.object o JOIN relphot.detection d ON d.obj_id = o.obj_id "
+            "JOIN relphot.star_night sn ON sn.obj_id = o.obj_id AND sn.star_id = 1 "
+            "WHERE d.kind = 'transit'"
+        )
+        assert cur.fetchall() == [("EXOP+VAR", True, True, "transit", "ON_VARIABLE", "UNCONFIRMED")]
+        cur.execute("SELECT period, period_err FROM relphot.catalog_match")
+        assert cur.fetchall() == [(3.3, 0.05)]
+        cur.execute("SELECT period, period_source, period_err FROM relphot.object WHERE known")
+        assert cur.fetchall() == [(3.3, "catalog", 0.05)]
+
+
+def _edit_metrics(root: Path, edit) -> None:
+    sm_path = root / "lc" / "night_lc_search_metrics.parquet"
+    sm = pd.read_parquet(sm_path)
+    edit(sm)
+    sm.to_parquet(sm_path)
+
+
+def test_load_night_sets_duration_lower_limit_from_edge_and_partial(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+
+    def edit(sm: pd.DataFrame) -> None:
+        # star4 (already a candidate): PARTIAL among other flags; star2: EDGE; star1: clean
+        sm.loc[4, "transit_flags_str"] = "SHARED_EPOCH|PARTIAL"
+        for star, flags in ((2, "EDGE"), (1, "OK")):
+            sm.loc[star, "transit_candidate"] = True
+            sm.loc[star, "transit_snr"] = 9.0
+            sm.loc[star, "transit_depth"] = 0.01
+            sm.loc[star, "transit_tc_bjd_tdb"] = 2460000.5
+            sm.loc[star, "transit_duration_hours"] = 1.2
+            sm.loc[star, "transit_tier"] = 1
+            sm.loc[star, "transit_flags_str"] = flags
+
+    _edit_metrics(root, edit)
+    load_night(test_conn, root, settings=_SETTINGS)
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT sn.star_id, d.flags, d.duration_lower_limit, o.duration_h, "
+            "o.duration_lower_limit FROM relphot.detection d "
+            "JOIN relphot.star_night sn ON sn.obj_id = d.obj_id "
+            "JOIN relphot.object o ON o.obj_id = d.obj_id "
+            "WHERE d.kind = 'transit' ORDER BY sn.star_id"
+        )
+        rows = cur.fetchall()
+    assert rows == [
+        (1, "OK", False, 1.2, False),
+        (2, "EDGE", True, 1.2, True),
+        (4, "SHARED_EPOCH|PARTIAL", True, 1.5, True),
+    ]
+
+
+def _review(test_conn, status: str, notes: str) -> int:
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.detection SET status = %s, notes = %s WHERE kind = 'transit' "
+            "RETURNING obj_id",
+            (status, notes),
+        )
+        (obj_id,) = cur.fetchone()
+    test_conn.commit()
+    return obj_id
+
+
+def test_reload_keeps_detection_review_when_the_event_is_still_there(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    load_night(test_conn, root, settings=_SETTINGS)
+    _review(test_conn, "CONFIRMED", "planet b")
+
+    # the event moved by 0.02 d, within half its 1.5 h duration (0.031 d): same event
+    _edit_metrics(root, lambda sm: sm.__setitem__(
+        "transit_tc_bjd_tdb", sm["transit_tc_bjd_tdb"] + 0.02
+    ))
+    load_night(test_conn, root, settings=_SETTINGS)
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, notes, tc_bjd_tdb FROM relphot.detection WHERE kind = 'transit'"
+        )
+        status, notes, tc = cur.fetchone()
+        cur.execute("SELECT count(*) FROM relphot.detection_review_orphan")
+        assert cur.fetchone() == (0,)
+    assert (status, notes) == ("CONFIRMED", "planet b")
+    assert tc == pytest.approx(2460000.57)
+
+
+def test_reload_orphans_detection_review_that_no_longer_matches(
+    test_conn, tmp_path, caplog
+) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    obj_id = _review(test_conn, "REJECTED", "systematic")
+
+    # the event is now 0.2 d away: not the same event, so the verdict is not carried over
+    _edit_metrics(root, lambda sm: sm.__setitem__(
+        "transit_tc_bjd_tdb", sm["transit_tc_bjd_tdb"] + 0.2
+    ))
+    with caplog.at_level("WARNING", logger="relphot.db.load_night"):
+        load_night(test_conn, root, settings=_SETTINGS)
+
+    assert any("no detection matches the saved review" in r.message for r in caplog.records)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT status, notes FROM relphot.detection WHERE kind = 'transit'")
+        assert cur.fetchone() == ("UNCONFIRMED", None)
+        cur.execute(
+            "SELECT obj_id, night_id, kind, tc_bjd_tdb, status, notes "
+            "FROM relphot.detection_review_orphan"
+        )
+        assert cur.fetchall() == [
+            (obj_id, report.night_id, "transit", pytest.approx(2460000.55), "REJECTED",
+             "systematic")
+        ]
+
+
+def test_reload_restores_variable_detection_review_by_object_and_kind(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    _edit_metrics(root, lambda sm: sm.__setitem__(
+        "variability_candidate", np.array([False, False, True, False, False, False])
+    ))
+    load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.detection SET status = 'CONFIRMED', notes = 'RR Lyr' "
+            "WHERE kind = 'variable'"
+        )
+    test_conn.commit()
+
+    load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT kind, status, notes FROM relphot.detection ORDER BY kind")
+        rows = cur.fetchall()
+        cur.execute("SELECT count(*) FROM relphot.detection_review_orphan")
+        assert cur.fetchone() == (0,)
+    assert rows == [("transit", "UNCONFIRMED", None), ("variable", "CONFIRMED", "RR Lyr")]
+
+
+def test_reload_spares_orphan_objects_a_person_has_touched(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    load_night(test_conn, root, settings=_SETTINGS)
+    extras = {
+        "plain": "",
+        "manual_exop": ", exop_source = 'manual'",
+        "manual_var": ", var_source = 'manual'",
+        "manual_period": ", period = 3.0, period_source = 'manual'",
+        "has_notes": ", notes = 'look again'",
+        "confirmed": ", status = 'CONFIRMED'",
+    }
+    with test_conn.cursor() as cur:
+        for i, (name, extra) in enumerate(extras.items()):
+            cur.execute(
+                "INSERT INTO relphot.object (name, ra, dec) VALUES (%s, %s, 50.0) "
+                "RETURNING obj_id",
+                (name, 100.0 + i),
+            )
+            (obj_id,) = cur.fetchone()
+            if extra:
+                cur.execute(
+                    f"UPDATE relphot.object SET {extra[2:]} WHERE obj_id = %s", (obj_id,)
+                )
+    test_conn.commit()
+
+    load_night(test_conn, root, settings=_SETTINGS)  # a reload deletes star_night-less objects
+
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT name FROM relphot.object WHERE dec = 50.0 ORDER BY name")
+        kept = [r[0] for r in cur.fetchall()]
+    assert kept == ["confirmed", "has_notes", "manual_exop", "manual_period", "manual_var"]
+
+
+def test_load_night_reload_cascades_transit_rows(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT det_id, obj_id FROM relphot.detection WHERE kind = 'transit'")
+        det_id, obj_id = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.transit_shape (det_id, obj_id, tc, converged) "
+            "VALUES (%s, %s, 2460000.55, true)",
+            (det_id, obj_id),
+        )
+    test_conn.commit()
+
+    load_night(test_conn, root, settings=_SETTINGS)  # a reload replaces the detection
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM relphot.transit_shape")
+        assert cur.fetchone() == (0,)
+        cur.execute("SELECT count(*) FROM relphot.detection WHERE kind = 'transit'")
+        assert cur.fetchone() == (1,)
+
+
 def test_load_night_reload_is_idempotent(test_conn, tmp_path) -> None:
     root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
     _write_night1(root)

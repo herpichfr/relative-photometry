@@ -78,6 +78,8 @@ function collectFilters() {
     if (v) params.set(key, v);
   }
   const selectFields = [
+    ["filter-is-exop", "is_exop"],
+    ["filter-is-var", "is_var"],
     ["filter-known", "known"],
     ["filter-status", "status"],
     ["filter-has-periodogram", "has_periodogram"],
@@ -93,6 +95,7 @@ function collectFilters() {
     ["filter-period-min", "period_min"], ["filter-period-max", "period_max"],
     ["filter-snr-min", "snr_min"], ["filter-depth-min", "depth_min"],
     ["filter-tier-max", "tier_max"], ["filter-n-nights-min", "n_nights_min"],
+    ["filter-min-p-match", "min_p_match"],
   ];
   for (const [id, key] of numberFields) {
     const v = $(id).value;
@@ -119,9 +122,11 @@ function resetFilters() {
 // ---------------------------------------------------------------------
 
 const RESULT_COLUMNS = [
-  "obj_id", "name", "ra", "dec", "class", "known", "source_db", "known_name",
-  "known_type", "period", "period_source", "known_period", "mean_mag", "n_nights",
-  "best_snr", "depth", "duration_h", "amplitude", "status", "first_night", "last_night",
+  "obj_id", "name", "ra", "dec", "class", "is_exop", "is_var", "known", "source_db",
+  "known_name", "known_type", "period", "period_err", "period_source", "known_period",
+  "mean_mag", "n_nights", "best_snr", "depth", "duration_h", "duration_lower_limit",
+  "amplitude", "status", "first_night", "last_night", "n_transit_events", "max_p_match", "period_delta",
+  "period_delta_err", "period_verify_status", "period_verify_note",
 ];
 
 function renderResultsHeader() {
@@ -162,7 +167,8 @@ function renderResultsBody(rows) {
     tr.appendChild(tdLoad);
     for (const col of RESULT_COLUMNS) {
       const td = document.createElement("td");
-      const v = row[col];
+      // a duration is a lower limit ("≥ x.xx h") for an incomplete transit
+      const v = col === "duration_h" ? row.duration_display : row[col];
       td.textContent = v === null || v === undefined ? "" : String(v);
       tr.appendChild(td);
     }
@@ -279,7 +285,12 @@ function renderSqlResult(data) {
 
 const META_FIELDS = [
   ["name", "Name"], ["ra_sexagesimal", "RA"], ["dec_sexagesimal", "Dec"],
-  ["ra", "RA (deg)"], ["dec", "Dec (deg)"], ["class", "CLASS"], ["period", "PERIOD (d)"],
+  ["ra", "RA (deg)"], ["dec", "Dec (deg)"], ["class", "CLASS"],
+  ["is_exop", "exoplanet host"], ["exop_source", "exoplanet flag source"],
+  ["is_var", "variable"], ["var_source", "variable flag source"],
+  ["period", "PERIOD (d)"], ["period_err", "PERIOD error (d)"],
+  ["period_n_nights", "PERIOD from n nights"],
+  ["duration_display", "transit duration"],
   ["period_source", "period source"], ["known", "KNOWN"], ["source_db", "SOURCE_DB"],
   ["known_name", "known name"], ["known_type", "known type"], ["known_period", "known period (d)"],
   ["status", "status"], ["gaia_id", "Gaia ID"], ["mean_mag", "mean mag"],
@@ -328,7 +339,7 @@ function renderDetections(rows) {
     const source = r.night_id !== null && r.night_id !== undefined
       ? `${r.night_label || ""} (${r.telescope || ""})`
       : (r.mn_run_stem || "");
-    const values = [r.kind, source, r.snr, r.depth, r.duration_h, r.tier, r.period, r.fap];
+    const values = [r.kind, source, r.snr, r.depth, r.duration_display, r.tier, r.period, r.fap];
     for (const v of values) {
       const td = document.createElement("td");
       td.textContent = v === null || v === undefined ? "" : String(v);
@@ -336,6 +347,162 @@ function renderDetections(rows) {
     }
     tbody.appendChild(tr);
   }
+}
+
+function fmtValue(v, digits) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "";
+  return typeof v === "number" && digits !== undefined ? v.toPrecision(digits) : String(v);
+}
+
+function fmtPm(v, err, digits) {
+  if (v === null || v === undefined) return "";
+  const base = fmtValue(v, digits);
+  return err === null || err === undefined ? base : `${base} ± ${fmtValue(err, 2)}`;
+}
+
+function renderTransitEvents(events) {
+  const tbody = qs("#detail-transit-events tbody");
+  tbody.innerHTML = "";
+  for (const ev of events || []) {
+    const tr = document.createElement("tr");
+    const tc = ev.tc !== null && ev.tc !== undefined ? ev.tc : ev.det_tc;
+    const fit = ev.tc !== null && ev.tc !== undefined
+      ? `${ev.converged ? "converged" : "not converged"} (${ev.input || ""}, chi2r ${fmtValue(ev.chi2_red, 3)})`
+      : "no fit";
+    const cells = [
+      `${ev.night_label || ""} (${ev.telescope || ""})`,
+      tc === null || tc === undefined ? "" : (tc - 2460000).toFixed(5),
+      fmtPm(ev.depth !== null && ev.depth !== undefined ? ev.depth : ev.det_depth, ev.depth_err, 4),
+      // an incomplete transit's duration is only a minimum: "≥ x.xx h", never a measurement
+      ev.duration_lower_limit
+        ? ev.duration_display
+        : fmtPm(ev.t14_h !== null && ev.t14_h !== undefined ? ev.t14_h : ev.det_duration_h, ev.t14_err, 3) + " h",
+      fmtPm(ev.ingress_frac, ev.ingress_err, 3),
+      fmtValue(ev.tier),
+      ev.flags || "",
+      fit,
+    ];
+    for (const text of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (ev.incomplete_reason) td.title = `incomplete: ${ev.incomplete_reason}`;
+      tr.appendChild(td);
+    }
+    const tdStatus = document.createElement("td");
+    const sel = document.createElement("select");
+    for (const s of ["UNCONFIRMED", "CONFIRMED", "REJECTED"]) {
+      const opt = document.createElement("option");
+      opt.value = s;
+      opt.textContent = s;
+      sel.appendChild(opt);
+    }
+    sel.value = ev.status || "UNCONFIRMED";
+    sel.addEventListener("change", () => patchDetection(ev.det_id, { status: sel.value }, ev));
+    tdStatus.appendChild(sel);
+    tr.appendChild(tdStatus);
+    const tdView = document.createElement("td");
+    const btn = document.createElement("button");
+    btn.textContent = "Plot";
+    btn.addEventListener("click", () => loadNightLc(ev.night_id));
+    tdView.appendChild(btn);
+    tr.appendChild(tdView);
+    tbody.appendChild(tr);
+  }
+}
+
+async function patchDetection(detId, body, ev) {
+  const resp = await fetch(`/api/detection/${detId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    $("edit-status-msg").textContent = data.detail || "detection update failed";
+    return;
+  }
+  if (ev) {
+    ev.status = data.status;
+    ev.notes = data.notes;
+  }
+  $("edit-status-msg").textContent = `event ${detId}: ${data.status}`;
+}
+
+function renderTransitMatches(matches) {
+  const tbody = qs("#detail-transit-matches tbody");
+  tbody.innerHTML = "";
+  for (const m of matches || []) {
+    const tr = document.createElement("tr");
+    const periods = (m.commensurate_periods || []).slice(0, 5).map((p) => p.toFixed(4));
+    const more = (m.commensurate_periods || []).length > 5 ? " ..." : "";
+    const cells = [
+      `${m.night_a} / ${m.night_b}${m.same_telescope ? "" : " (different telescopes)"}`,
+      m.t14_a_display || "",
+      m.t14_b_display || "",
+      fmtValue(m.dt_days, 6),
+      fmtValue(m.depth_z, 3),
+      fmtValue(m.t14_z, 3),
+      fmtValue(m.ingress_z, 3),
+      m.p_match === null || m.p_match === undefined ? "" : m.p_match.toPrecision(3),
+      periods.join(", ") + more,
+    ];
+    for (const text of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+}
+
+function renderPeriodEstimates(rows) {
+  const tbody = qs("#detail-period-estimates tbody");
+  tbody.innerHTML = "";
+  for (const r of rows || []) {
+    const tr = document.createElement("tr");
+    const cells = [
+      r.computed_at ? String(r.computed_at).replace("T", " ").slice(0, 19) : "",
+      fmtValue(r.n_nights),
+      r.last_night || "",
+      fmtValue(r.baseline_days, 4),
+      fmtPm(r.period, r.period_err, 7),
+      fmtValue(r.harmonic),
+      fmtPm(r.lit_period, r.lit_period_err, 7),
+      fmtPm(r.delta, r.delta_err, 3),
+      fmtValue(r.delta_z, 3),
+      r.verify_status || "",
+    ];
+    for (const text of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (r.verify_note) td.title = r.verify_note;
+      tr.appendChild(td);
+    }
+    const tdNote = document.createElement("td");
+    tdNote.textContent = r.verify_note || "";
+    tr.appendChild(tdNote);
+    tbody.appendChild(tr);
+  }
+  const withDelta = (rows || []).filter((r) => r.delta !== null && r.delta !== undefined);
+  if (withDelta.length === 0) {
+    Plotly.purge("plot-period-verification");
+    return;
+  }
+  const trace = {
+    x: withDelta.map((r) => r.n_nights),
+    y: withDelta.map((r) => r.delta),
+    error_y: {
+      type: "data", visible: true,
+      array: withDelta.map((r) => (r.delta_err === null || r.delta_err === undefined ? 0 : r.delta_err)),
+    },
+    text: withDelta.map((r) => `last night ${r.last_night}, harmonic ${r.harmonic}, ${r.verify_status || ""}`),
+    type: "scatter", mode: "markers", marker: { size: 8 },
+  };
+  Plotly.newPlot("plot-period-verification", [trace], {
+    xaxis: { title: "number of nights", dtick: 1 },
+    yaxis: { title: "P_obs / harmonic - P_lit (d)", zeroline: true },
+    margin: { t: 20 },
+  }, { responsive: true });
 }
 
 function renderNightButtons(obj, nights) {
@@ -386,8 +553,8 @@ function populatePeriodogramSelectors(periodograms) {
 function findBestPeriodogram(periodograms, objClass) {
   if (!periodograms || periodograms.length === 0) return null;
 
-  // Preference 1: scope='combined' AND method='BLS' if class is 'EXOP'
-  if (objClass === 'EXOP') {
+  // Preference 1: scope='combined' AND method='BLS' if the object is a planet host
+  if (objClass && objClass.startsWith('EXOP')) {
     const entry = periodograms.find((p) => p.scope === 'combined' && p.method === 'BLS');
     if (entry) return entry;
   }
@@ -417,7 +584,10 @@ function updatePhasePeriodNote(noteText) {
 }
 
 function prefillEditBox(obj) {
-  $("edit-class-select").value = obj.class || "";
+  $("edit-exop-check").checked = !!obj.is_exop;
+  $("edit-var-check").checked = !!obj.is_var;
+  $("edit-flag-source").textContent =
+    `exoplanet flag: ${obj.exop_source || "auto"}; variable flag: ${obj.var_source || "auto"}`;
   $("edit-status-select").value = obj.status || "";
   $("edit-notes-textarea").value = obj.notes || "";
   $("edit-period-input").value = obj.period === null || obj.period === undefined ? "" : obj.period;
@@ -459,6 +629,9 @@ async function loadObject(objId) {
   renderMeta(data.object);
   renderCatalogMatches(data.catalog_matches);
   renderDetections(data.detections);
+  renderTransitEvents(data.transit_events);
+  renderTransitMatches(data.transit_matches);
+  renderPeriodEstimates(data.period_estimates);
   renderNightButtons(data.object, data.nights);
   populatePeriodogramSelectors(data.periodograms);
   prefillEditBox(data.object);
@@ -498,7 +671,47 @@ async function loadNightLc(nightId) {
     name: lc.night_label || `night ${nightId}`,
   };
   const shapes = [];
-  const transit = bestTransitForNight(nightId);
+  const traces = [trace];
+  const annotations = [];
+  const nightEvents = (state.currentObject.transit_events || []).filter(
+    (ev) => ev.night_id === nightId && ev.tc !== null && ev.tc !== undefined
+  );
+  // a full trapezoid needs the ingress fraction, which an event with an unobserved ingress or
+  // egress does not have; its (lower-limit) duration is only marked at the fitted tc
+  const fitted = nightEvents.filter(
+    (ev) => ev.depth !== null && ev.t14_h !== null && ev.ingress_frac !== null
+  );
+  for (const ev of nightEvents.filter((e) => !fitted.includes(e))) {
+    shapes.push({
+      type: "line", x0: ev.tc - 2460000, x1: ev.tc - 2460000, y0: 0, y1: 1, yref: "paper",
+      line: { color: "rgb(200,30,30)", dash: "dot" },
+    });
+    annotations.push({
+      x: ev.tc - 2460000, y: 1, yref: "paper", showarrow: false, yanchor: "bottom",
+      text: `T14 ${ev.duration_display || ""}${ev.incomplete_reason ? " (incomplete)" : ""}`,
+    });
+  }
+  const finiteFlux = lc.flux.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  const baseline = finiteFlux.length ? finiteFlux[Math.floor(finiteFlux.length / 2)] : 1;
+  for (const ev of fitted) {
+    const t14 = ev.t14_h / 24.0;
+    const tau = Math.max(ev.ingress_frac * t14, 1e-3 * t14);
+    const xs = [];
+    const ys = [];
+    for (let k = 0; k <= 240; k++) {
+      const t = ev.tc + (k / 240 - 0.5) * 3.0 * t14;
+      const s = Math.min(1, Math.max(0, (t14 / 2 - Math.abs(t - ev.tc)) / tau));
+      xs.push(t - 2460000);
+      ys.push(baseline * (1 - ev.depth * s));
+    }
+    traces.push({
+      x: xs, y: ys, type: "scatter", mode: "lines", line: { color: "rgb(200,30,30)" },
+      name: `trapezoid fit (${ev.converged ? "converged" : "not converged"})`,
+      text: xs.map(() => `T14 ${ev.duration_display || ""}${ev.incomplete_reason ? " (incomplete: " + ev.incomplete_reason + ")" : ""}`),
+      hoverinfo: "x+y+text",
+    });
+  }
+  const transit = nightEvents.length ? null : bestTransitForNight(nightId);
   if (transit) {
     const tc = transit.tc_bjd_tdb - 2460000;
     const halfDur = (transit.duration_h || 0) / 24.0 / 2.0;
@@ -508,11 +721,16 @@ async function loadNightLc(nightId) {
       type: "rect", x0: tc - halfDur, x1: tc + halfDur, y0: 1 - depth, y1: yTop,
       line: { color: "rgba(200,30,30,0.6)" }, fillcolor: "rgba(200,30,30,0.08)",
     });
+    annotations.push({
+      x: tc, y: 1, yref: "paper", showarrow: false, yanchor: "bottom",
+      text: `T14 ${transit.duration_display || ""}`,
+    });
   }
-  Plotly.newPlot("plot-lightcurve", [trace], {
+  Plotly.newPlot("plot-lightcurve", traces, {
     xaxis: { title: "BJD_TDB - 2460000" },
     yaxis: { title: "relative flux" },
     shapes,
+    annotations,
     margin: { t: 20 },
   }, { responsive: true });
 }
@@ -663,8 +881,12 @@ async function loadPeriodogram() {
 async function saveEdit() {
   const objId = state.currentObject.object.obj_id;
   const body = {};
-  const classVal = $("edit-class-select").value;
-  if (classVal) body.class = classVal;
+  // a flag is only sent (and so pinned as manual) when the person changed its checkbox
+  const obj = state.currentObject.object;
+  const exopChecked = $("edit-exop-check").checked;
+  const varChecked = $("edit-var-check").checked;
+  if (exopChecked !== !!obj.is_exop) body.is_exop = exopChecked;
+  if (varChecked !== !!obj.is_var) body.is_var = varChecked;
   const statusVal = $("edit-status-select").value;
   if (statusVal) body.status = statusVal;
   body.notes = $("edit-notes-textarea").value;
@@ -673,8 +895,12 @@ async function saveEdit() {
   await patchObject(objId, body);
 }
 
-async function resetClassAuto() {
-  await patchObject(state.currentObject.object.obj_id, { class_source: "auto" });
+async function resetExopAuto() {
+  await patchObject(state.currentObject.object.obj_id, { exop_source: "auto" });
+}
+
+async function resetVarAuto() {
+  await patchObject(state.currentObject.object.obj_id, { var_source: "auto" });
 }
 
 async function resetPeriodAuto() {
@@ -740,7 +966,8 @@ function init() {
   });
   $("phase-period-input").addEventListener("change", plotPhase);
   $("btn-save-edit").addEventListener("click", saveEdit);
-  $("btn-reset-class-auto").addEventListener("click", resetClassAuto);
+  $("btn-reset-exop-auto").addEventListener("click", resetExopAuto);
+  $("btn-reset-var-auto").addEventListener("click", resetVarAuto);
   $("btn-reset-period-auto").addEventListener("click", resetPeriodAuto);
 
   renderResultsHeader();
