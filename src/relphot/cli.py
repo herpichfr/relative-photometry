@@ -1415,6 +1415,8 @@ def _run_db_analyze(args: argparse.Namespace) -> int:
         f"ls_combined={report.n_ls_combined} bls={report.n_bls} "
         f"transit_shapes={report.n_transit_shapes} transit_matches={report.n_transit_matches} "
         f"period_estimates={report.n_period_estimates} "
+        f"coincidence_rejected={report.n_coincidence_rejected} "
+        f"coincidence_nights={report.n_coincidence_nights} "
         f"coarsened={report.n_coarsened} elapsed={report.elapsed_s:.1f}s"
     )
     return 0

@@ -147,8 +147,8 @@ def test_migration_004_from_v3_maps_class_to_flags(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [4, 5, 6, 7, 8]
-    assert current_version(test_conn) == 8
+    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9]
+    assert current_version(test_conn) == 9
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -282,7 +282,7 @@ def test_migration_005_verify_status_backfill_and_check(test_conn) -> None:
             )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [5, 6, 7, 8]
+    assert init_schema(test_conn) == [5, 6, 7, 8, 9]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -305,7 +305,7 @@ def test_migration_007_night_zero_point_defaults_existing_nights_to_assumed(test
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [7, 8]
+    assert init_schema(test_conn) == [7, 8, 9]
 
     with test_conn.cursor() as cur:
         cur.execute("SELECT zp, zp_source FROM relphot.night")
@@ -332,7 +332,7 @@ def test_migration_008_night_zero_point_source_accepts_measured(test_conn) -> No
         cur.execute("UPDATE relphot.night SET zp_source = 'measured'")
     test_conn.rollback()
 
-    assert init_schema(test_conn) == [8]
+    assert init_schema(test_conn) == [8, 9]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -351,6 +351,98 @@ def test_migration_008_night_zero_point_source_accepts_measured(test_conn) -> No
     with pytest.raises(psycopg.errors.CheckViolation), test_conn.cursor() as cur:
         cur.execute("UPDATE relphot.night SET zp_source = 'bogus'")
     test_conn.rollback()
+
+
+def test_migration_009_coincidence_columns_and_table_from_v8(test_conn) -> None:
+    _apply_up_to(test_conn, 8)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+            "VALUES ('T80S', '2025-01-01', 'n', '/tmp/n') RETURNING night_id"
+        )
+        (night_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.object (name, ra, dec) VALUES ('o', 1, 1) RETURNING obj_id"
+        )
+        (obj_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind) VALUES (%s, %s, 'transit') "
+            "RETURNING det_id",
+            (obj_id, night_id),
+        )
+        (det_id,) = cur.fetchone()
+    test_conn.commit()
+
+    assert init_schema(test_conn) == [9]
+    assert init_schema(test_conn) == []
+
+    with test_conn.cursor() as cur:
+        # an existing detection has no automatic verdict; the person's status is its own column
+        cur.execute(
+            "SELECT status, auto_status, auto_reason FROM relphot.detection WHERE det_id = %s",
+            (det_id,),
+        )
+        assert cur.fetchone() == ("UNCONFIRMED", None, None)
+        cur.execute(
+            "UPDATE relphot.detection SET auto_status = 'REJECTED', auto_reason = 'why' "
+            "WHERE det_id = %s",
+            (det_id,),
+        )
+        cur.execute(
+            "INSERT INTO relphot.transit_coincidence (det_id, night_id, n_similar, n_expected, "
+            "p_chance, similar_det_ids, rejected) VALUES (%s, %s, 3, 0.5, 1e-9, %s, true)",
+            (det_id, night_id, [det_id + 1, det_id + 2]),
+        )
+        cur.execute(
+            "SELECT n_similar, n_expected, p_chance, similar_det_ids, rejected, "
+            "computed_at IS NOT NULL FROM relphot.transit_coincidence WHERE det_id = %s",
+            (det_id,),
+        )
+        assert cur.fetchone() == (3, 0.5, 1e-9, [det_id + 1, det_id + 2], True, True)
+        cur.execute(
+            "SELECT relname FROM pg_class WHERE relname = 'transit_coincidence_night_idx'"
+        )
+        assert cur.fetchone() == ("transit_coincidence_night_idx",)
+        for role in ("relphot_ro", "relphot_web"):
+            cur.execute(
+                "SELECT has_table_privilege(%s, 'relphot.transit_coincidence', 'SELECT'), "
+                "has_table_privilege(%s, 'relphot.transit_coincidence', 'INSERT')",
+                (role, role),
+            )
+            assert cur.fetchone() == (True, False)
+    test_conn.commit()
+
+    bad = (
+        (
+            "UPDATE relphot.detection SET auto_status = 'CONFIRMED'", (),
+            psycopg.errors.CheckViolation,
+        ),
+        (
+            "INSERT INTO relphot.transit_coincidence (det_id, night_id, rejected) "
+            "VALUES (999999, %s, false)",
+            (night_id,), psycopg.errors.ForeignKeyViolation,
+        ),
+        (
+            "INSERT INTO relphot.transit_coincidence (det_id, night_id) VALUES (%s, %s)",
+            (det_id + 100, night_id), psycopg.errors.NotNullViolation,
+        ),
+        (
+            "INSERT INTO relphot.transit_coincidence (det_id, night_id, rejected) "
+            "VALUES (%s, %s, false)",
+            (det_id, night_id), psycopg.errors.UniqueViolation,
+        ),
+    )
+    for sql, params, error in bad:
+        with pytest.raises(error), test_conn.cursor() as cur:
+            cur.execute(sql, params)
+        test_conn.rollback()
+
+    # the rows go with their detection
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.detection WHERE det_id = %s", (det_id,))
+        cur.execute("SELECT count(*) FROM relphot.transit_coincidence")
+        assert cur.fetchone() == (0,)
+    test_conn.commit()
 
 
 def test_migration_006_guided_reprocessing_schema_from_v5(test_conn) -> None:
@@ -380,8 +472,8 @@ def test_migration_006_guided_reprocessing_schema_from_v5(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8]
-    assert current_version(test_conn) == 8
+    assert init_schema(test_conn) == [6, 7, 8, 9]
+    assert current_version(test_conn) == 9
 
     with test_conn.cursor() as cur:
         # existing rows: searches' detections, no inflation information, no new estimate info
@@ -475,7 +567,7 @@ def test_migration_006_user_night_review_from_v5_backfills_object_level_flags(te
                 )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8]
+    assert init_schema(test_conn) == [6, 7, 8, 9]
 
     with test_conn.cursor() as cur:
         cur.execute(

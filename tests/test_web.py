@@ -651,6 +651,109 @@ def test_object_detail_has_transit_events_matches_and_period_estimates(client) -
     assert plain["period_estimates"] == []
 
 
+def _add_lookalikes(test_conn, ids: dict, n: int = 25) -> list[int]:
+    """``n`` other objects' transit events on night 1 and the automatic verdict on ``det_a``."""
+    det_ids = []
+    with test_conn.cursor() as cur:
+        for k in range(n):
+            cur.execute(
+                "INSERT INTO relphot.object (name, ra, dec) VALUES (%s, 1.0, 1.0) "
+                "RETURNING obj_id",
+                (f"RP SIM{k:02d}",),
+            )
+            (obj_id,) = cur.fetchone()
+            cur.execute(
+                "INSERT INTO relphot.detection (obj_id, night_id, kind, snr, depth, tc_bjd_tdb, "
+                "duration_h, tier) VALUES (%s, %s, 'transit', 9.0, 0.011, %s, 2.1, 1) "
+                "RETURNING det_id",
+                (obj_id, ids["night1"], 2460310.52 + 0.0001 * k),
+            )
+            (det_id,) = cur.fetchone()
+            cur.execute(
+                "INSERT INTO relphot.transit_shape (det_id, obj_id, tc, tc_err, depth, "
+                "depth_err, t14_h, t14_err, converged, computed_at) "
+                "VALUES (%s, %s, %s, 0.0005, 0.011, 0.001, 2.1, 0.1, true, now())",
+                (det_id, obj_id, 2460310.52 + 0.0001 * k),
+            )
+            det_ids.append(det_id)
+        cur.execute(
+            "UPDATE relphot.detection SET auto_status = 'REJECTED', auto_reason = %s "
+            "WHERE det_id = %s",
+            (f"too many similar events: {n} other events on this night", ids["det_a"]),
+        )
+        cur.execute(
+            "INSERT INTO relphot.transit_coincidence (det_id, night_id, n_similar, n_expected, "
+            "p_chance, similar_det_ids, rejected) VALUES (%s, %s, %s, 3.5, 1e-9, %s, true)",
+            (ids["det_a"], ids["night1"], n, det_ids),
+        )
+    test_conn.commit()
+    return det_ids
+
+
+def test_object_detail_carries_the_automatic_rejection_and_the_similar_events(
+    client, test_conn
+) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids)
+    data = test_client.get(f"/api/object/{ids['obj_both']}").json()
+
+    ev_a, ev_b = data["transit_events"]
+    assert ev_a["det_id"] == ids["det_a"]
+    assert ev_a["status"] == "UNCONFIRMED"  # the person's verdict is untouched
+    assert ev_a["auto_status"] == "REJECTED"
+    assert ev_a["auto_reason"].startswith("too many similar events: 25 other events")
+    assert ev_a["effective_status"] == "REJECTED (auto)"
+    assert (ev_a["n_similar"], ev_a["n_expected"]) == (25, pytest.approx(3.5))
+    assert ev_a["p_chance"] == pytest.approx(1e-9)
+    assert "similar_det_ids" not in ev_a
+    # the list is capped (20 of 25), nearest first, each with the object to link to
+    listed = ev_a["similar_events"]
+    assert [e["det_id"] for e in listed] == similar[:20]
+    first = listed[0]
+    assert first["obj_name"] == "RP SIM00"
+    assert first["obj_id"] > 0
+    assert first["tc"] == pytest.approx(2460310.52)
+    assert first["depth"] == pytest.approx(0.011)
+    assert first["t14_h"] == pytest.approx(2.1)
+    assert first["duration_display"] == "2.10 h"
+    # an event with no verdict of the check reads as before
+    assert ev_b["auto_status"] is None
+    assert ev_b["effective_status"] == "UNCONFIRMED"
+    assert (ev_b["n_similar"], ev_b["n_expected"], ev_b["p_chance"]) == (None, None, None)
+    assert ev_b["similar_events"] == []
+    # the detections table carries it too
+    det = next(d for d in data["detections"] if d["det_id"] == ids["det_a"])
+    assert (det["auto_status"], det["effective_status"]) == ("REJECTED", "REJECTED (auto)")
+    assert det["auto_reason"] == ev_a["auto_reason"]
+    # night 1 has no automatic exoplanet evidence left and awaits nothing
+    night1 = next(n for n in data["nights"] if n["night_id"] == ids["night1"])
+    assert (night1["auto_exop"], night1["exop_open"], night1["pending"]) == (False, False, False)
+
+    # the per-night review endpoint reads the same state
+    resp = test_client.put(
+        f"/api/object/{ids['obj_both']}/night/{ids['night1']}/review", json={"note": "look"}
+    )
+    assert resp.json()["night"]["auto_exop"] is False
+
+    # a person's CONFIRMED overrides the automatic rejection; a REJECTED is theirs
+    def event_a() -> dict:
+        events = test_client.get(f"/api/object/{ids['obj_both']}").json()["transit_events"]
+        return events[0]
+
+    test_client.patch(f"/api/detection/{ids['det_a']}", json={"status": "CONFIRMED"})
+    ev = event_a()
+    assert (ev["status"], ev["auto_status"], ev["effective_status"]) == (
+        "CONFIRMED", "REJECTED", "CONFIRMED"
+    )
+    obj = test_client.get(f"/api/object/{ids['obj_both']}").json()
+    assert obj["object"]["is_exop"] is True
+    assert next(n for n in obj["nights"] if n["night_id"] == ids["night1"])["auto_exop"] is True
+    test_client.patch(f"/api/detection/{ids['det_a']}", json={"status": "REJECTED"})
+    assert event_a()["effective_status"] == "REJECTED"
+    test_client.patch(f"/api/detection/{ids['det_a']}", json={"status": "UNCONFIRMED"})
+    assert event_a()["effective_status"] == "REJECTED (auto)"
+
+
 def _review_rows(test_conn, obj_id: int) -> list[tuple]:
     with test_conn.cursor() as cur:
         cur.execute(

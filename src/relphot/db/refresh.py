@@ -20,7 +20,10 @@ manual guard: a row whose ``period_source`` is ``'manual'`` (set by the web when
 person enters a period by hand) keeps its period untouched. ``object.status`` is
 never set here. A detection a person created by reprocessing (``detection.origin
 = 'user'``) never sets a flag and never enters the best-transit summary: those
-come from the search's own detections only (``n_detections`` still counts them all).
+come from the search's own detections only (``n_detections`` still counts them all). A search
+transit that is auto-rejected (``detection.auto_status = 'REJECTED'``, too many similar events
+on its night, see :mod:`relphot.db.coincidence`) is likewise no evidence and not the best
+transit, unless a person CONFIRMED it.
 
 ``n_detections``, ``best_snr``, ``depth``, ``duration_h``, and ``amplitude``
 keep counting every detection regardless of origin. ``duration_h`` comes from
@@ -82,6 +85,7 @@ best_transit AS (
            d.duration_lower_limit
     FROM relphot.detection d JOIN target t ON t.obj_id = d.obj_id
     WHERE d.kind = 'transit' AND d.snr IS NOT NULL AND d.origin = 'search'
+          AND (d.auto_status IS DISTINCT FROM 'REJECTED' OR d.status = 'CONFIRMED')
     ORDER BY d.obj_id, d.snr DESC
 ),
 var_amp AS (

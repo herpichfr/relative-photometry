@@ -74,6 +74,19 @@ def _fmt_duration(hours: float | None, lower_limit: bool | None) -> str | None:
     return f"\u2265 {hours:.2f} h" if lower_limit else f"{hours:.2f} h"
 
 
+def _effective_status(status: str | None, auto_status: str | None) -> str:
+    """A detection's status as it counts: a person's CONFIRMED / REJECTED stands, else
+    ``'REJECTED (auto)'`` when the cross-candidate check rejected it, else UNCONFIRMED."""
+    status = status or "UNCONFIRMED"
+    if status == "UNCONFIRMED" and auto_status == "REJECTED":
+        return "REJECTED (auto)"
+    return status
+
+
+#: Most look-alike events listed with a transit event (its ``n_similar`` is the full count).
+_MAX_SIMILAR_SHOWN = 20
+
+
 def _select_columns(
     conn: psycopg.Connection, table: str, base: list[str], optional: list[str]
 ) -> list[str]:
@@ -517,7 +530,8 @@ def object_detail(obj_id: int):
                 "SELECT d.det_id, d.kind, d.snr, d.depth, d.tc_bjd_tdb, d.duration_h, d.tier, "
                 "d.flags, d.amplitude, d.excess, d.period, d.fap, d.extra, d.night_id, "
                 "n.label AS night_label, n.telescope, d.mn_run_id, mr.stem AS mn_run_stem, "
-                "d.status, d.notes, d.duration_lower_limit, d.origin "
+                "d.status, d.notes, d.duration_lower_limit, d.origin, "
+                "d.auto_status, d.auto_reason "
                 "FROM relphot.detection d "
                 "LEFT JOIN relphot.night n ON n.night_id = d.night_id "
                 "LEFT JOIN relphot.mn_run mr ON mr.mn_run_id = d.mn_run_id "
@@ -529,6 +543,7 @@ def object_detail(obj_id: int):
                 det["duration_display"] = _fmt_duration(
                     det["duration_h"], det["duration_lower_limit"]
                 )
+                det["effective_status"] = _effective_status(det["status"], det["auto_status"])
 
             cur.execute(
                 "SELECT sn.night_id, n.label, n.telescope, n.night_date, sn.n_epochs, sn.rms, "
@@ -574,6 +589,8 @@ def object_detail(obj_id: int):
                 "n.night_date, d.tc_bjd_tdb AS det_tc, d.depth AS det_depth, "
                 "d.duration_h AS det_duration_h, d.snr, d.tier, d.flags, d.status, d.notes, "
                 "d.duration_lower_limit AS det_duration_lower_limit, d.origin, "
+                "d.auto_status, d.auto_reason, "
+                "tcx.n_similar, tcx.n_expected, tcx.p_chance, tcx.similar_det_ids, "
                 "ts.tc, ts.tc_err, ts.depth, ts.depth_err, ts.t14_h, ts.t14_err, "
                 "ts.t14_lower_limit, ts.incomplete_reason, "
                 "ts.ingress_frac, ts.ingress_err, ts.chi2_red, ts.n_points, ts.input, "
@@ -581,6 +598,7 @@ def object_detail(obj_id: int):
                 "FROM relphot.detection d "
                 "JOIN relphot.night n ON n.night_id = d.night_id "
                 "LEFT JOIN relphot.transit_shape ts ON ts.det_id = d.det_id "
+                "LEFT JOIN relphot.transit_coincidence tcx ON tcx.det_id = d.det_id "
                 "WHERE d.obj_id = %s AND d.kind = 'transit' "
                 "ORDER BY COALESCE(ts.tc, d.tc_bjd_tdb), d.det_id",
                 (obj_id,),
@@ -593,6 +611,35 @@ def object_detail(obj_id: int):
                 hours = ev["t14_h"] if ev["t14_h"] is not None else ev["det_duration_h"]
                 ev["duration_lower_limit"] = lower
                 ev["duration_display"] = _fmt_duration(hours, lower)
+                ev["effective_status"] = _effective_status(ev["status"], ev["auto_status"])
+
+            # the look-alikes of each event (other objects' events of the same night): the
+            # nearest in time, capped; n_similar is the full count
+            similar_ids = {
+                ev["det_id"]: (ev.pop("similar_det_ids") or [])[:_MAX_SIMILAR_SHOWN]
+                for ev in transit_events
+            }
+            wanted = sorted({j for ids in similar_ids.values() for j in ids})
+            similar_info: dict[int, dict] = {}
+            if wanted:
+                cur.execute(
+                    "SELECT d.det_id, d.obj_id, o.name AS obj_name, "
+                    "COALESCE(ts.tc, d.tc_bjd_tdb) AS tc, COALESCE(ts.depth, d.depth) AS depth, "
+                    "COALESCE(ts.t14_h, d.duration_h) AS t14_h, "
+                    "(COALESCE(ts.t14_lower_limit, false) OR d.duration_lower_limit) "
+                    "AS t14_lower_limit "
+                    "FROM relphot.detection d JOIN relphot.object o ON o.obj_id = d.obj_id "
+                    "LEFT JOIN relphot.transit_shape ts ON ts.det_id = d.det_id "
+                    "WHERE d.det_id = ANY(%s)",
+                    (wanted,),
+                )
+                for sim in _rows_to_dicts(cur, cur.fetchall()):
+                    sim["duration_display"] = _fmt_duration(sim["t14_h"], sim["t14_lower_limit"])
+                    similar_info[sim["det_id"]] = sim
+            for ev in transit_events:
+                ev["similar_events"] = [
+                    similar_info[j] for j in similar_ids[ev["det_id"]] if j in similar_info
+                ]
 
             cur.execute(
                 "SELECT m.det_a, m.det_b, na.label AS night_a, nb.label AS night_b, "
@@ -1280,11 +1327,14 @@ def put_night_review(obj_id: int, night_id: int, body: NightReviewBody):
 
         # Compute night_state for this night
         cur.execute(
-            "SELECT d.kind, d.status, d.origin FROM relphot.detection d "
+            "SELECT d.kind, d.status, d.origin, d.auto_status FROM relphot.detection d "
             "WHERE d.obj_id = %s AND d.night_id = %s",
             (obj_id, night_id),
         )
-        night_dets = [{"kind": k, "status": s, "origin": o} for k, s, o in cur.fetchall()]
+        night_dets = [
+            {"kind": k, "status": s, "origin": o, "auto_status": a}
+            for k, s, o, a in cur.fetchall()
+        ]
         ns = night_state(night_dets, exop_v, var_v)
 
         refresh_flags(conn, [obj_id], class_multinight_kinds=DbSettings().class_multinight_kinds)

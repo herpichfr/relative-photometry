@@ -236,3 +236,49 @@ def test_db_zero_point_must_be_a_finite_number(tmp_path, body) -> None:
     cfg.write_text(f"[db]\n{body}\n")
     with pytest.raises(ConfigError):
         load_settings(cfg)
+
+
+def test_db_coincidence_defaults_and_toml_override(tmp_path) -> None:
+    """The cross-candidate check's thresholds, overridable from [db] and round-trippable."""
+    d = Settings().db
+    assert (d.coincidence_tc_frac, d.coincidence_tc_nsigma) == (0.1, 2.0)
+    assert (d.coincidence_t14_ratio, d.coincidence_depth_ratio) == (1.5, 2.0)
+    assert (d.coincidence_min_similar, d.coincidence_max_p) == (3, 1e-3)
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text(
+        "[db]\ncoincidence_tc_frac = 0.2\ncoincidence_tc_nsigma = 3\ncoincidence_t14_ratio = 2\n"
+        "coincidence_depth_ratio = 1.5\ncoincidence_min_similar = 5\ncoincidence_max_p = 1e-4\n"
+    )
+    s = load_settings(cfg)
+    assert (s.db.coincidence_tc_frac, s.db.coincidence_tc_nsigma) == (0.2, 3)
+    assert (s.db.coincidence_t14_ratio, s.db.coincidence_depth_ratio) == (2, 1.5)
+    assert (s.db.coincidence_min_similar, s.db.coincidence_max_p) == (5, 1e-4)
+    assert settings_from_dict(settings_to_dict(s)).db == s.db
+    assert s.db.max_expected_noise == Settings().db.max_expected_noise  # the rest is untouched
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "coincidence_t14_ratio = 1",
+        "coincidence_t14_ratio = 0.5",
+        "coincidence_depth_ratio = 1.0",
+        "coincidence_depth_ratio = nan",
+        "coincidence_depth_ratio = true",
+        "coincidence_tc_frac = 0",
+        "coincidence_tc_frac = 1.5",
+        "coincidence_tc_nsigma = -1",
+        "coincidence_tc_nsigma = inf",
+        "coincidence_max_p = 0",
+        "coincidence_max_p = 2",
+        'coincidence_max_p = "1e-3"',
+        "coincidence_min_similar = 0",
+        "coincidence_min_similar = 2.5",
+        "coincidence_min_similar = true",
+    ],
+)
+def test_db_coincidence_settings_are_validated(tmp_path, body) -> None:
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text(f"[db]\n{body}\n")
+    with pytest.raises(ConfigError):
+        load_settings(cfg)

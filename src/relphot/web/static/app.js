@@ -437,7 +437,11 @@ function renderDetections(rows) {
 }
 
 // A REJECTED event is no evidence; a CONFIRMED one is evidence that no longer awaits review.
+// The select is the person's verdict; an event the cross-candidate check rejected automatically
+// (too many similar events on its night) is shown as "REJECTED (auto)" with the reason, and only
+// a person's CONFIRMED overrides that.
 function detectionStatusSelect(det) {
+  const wrap = document.createElement("div");
   const sel = document.createElement("select");
   for (const s of ["UNCONFIRMED", "CONFIRMED", "REJECTED"]) {
     const opt = document.createElement("option");
@@ -447,7 +451,58 @@ function detectionStatusSelect(det) {
   }
   sel.value = det.status || "UNCONFIRMED";
   sel.addEventListener("change", () => patchDetection(det.det_id, { status: sel.value }, det));
-  return sel;
+  wrap.appendChild(sel);
+  if (det.auto_status === "REJECTED") {
+    const eff = document.createElement("div");
+    eff.className = "auto-reject";
+    eff.textContent = det.effective_status === "REJECTED (auto)"
+      ? "REJECTED (auto)"
+      : `auto-rejected; the verdict ${det.status} stands`;
+    wrap.appendChild(eff);
+    if (det.auto_reason) {
+      const why = document.createElement("div");
+      why.className = "auto-reject-reason";
+      why.textContent = det.auto_reason;
+      wrap.appendChild(why);
+    }
+  }
+  return wrap;
+}
+
+// The events of other objects on the same night that made an event look like a systematic:
+// links to their objects (the nearest in time; the list is capped, n_similar is the total).
+function similarEventsDetails(ev) {
+  if (!ev.similar_events || ev.similar_events.length === 0) return null;
+  const details = document.createElement("details");
+  details.className = "similar-events";
+  const total = ev.n_similar === null || ev.n_similar === undefined
+    ? ev.similar_events.length : ev.n_similar;
+  const summary = document.createElement("summary");
+  summary.textContent = `${total} similar event${total === 1 ? "" : "s"}`
+    + (ev.similar_events.length < total ? ` (nearest ${ev.similar_events.length} listed)` : "");
+  const expected = ev.n_expected === null || ev.n_expected === undefined
+    ? "" : `expected ${fmtValue(ev.n_expected, 3)} by chance, p = ${fmtValue(ev.p_chance, 2)}`;
+  summary.title = expected;
+  details.appendChild(summary);
+  const list = document.createElement("div");
+  for (const s of ev.similar_events) {
+    const a = document.createElement("a");
+    a.href = "#";
+    const dt = ev.tc !== null && ev.tc !== undefined && s.tc !== null && s.tc !== undefined
+      ? ` dt ${((s.tc - ev.tc) * 1440).toFixed(1)} min` : "";
+    a.textContent = s.obj_name || `obj ${s.obj_id}`;
+    a.title = `depth ${fmtValue(s.depth, 3)}, T14 ${s.duration_display || ""}${dt}`;
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      loadObject(s.obj_id);
+    });
+    list.appendChild(a);
+    list.appendChild(document.createTextNode(
+      ` (depth ${fmtValue(s.depth, 3)}, T14 ${s.duration_display || ""}${dt})`));
+    list.appendChild(document.createElement("br"));
+  }
+  details.appendChild(list);
+  return details;
 }
 
 function fmtValue(v, digits) {
@@ -491,6 +546,8 @@ function renderTransitEvents(events) {
     }
     const tdStatus = document.createElement("td");
     tdStatus.appendChild(detectionStatusSelect(ev));
+    const similar = similarEventsDetails(ev);
+    if (similar) tdStatus.appendChild(similar);
     tr.appendChild(tdStatus);
     const tdView = document.createElement("td");
     const btn = document.createElement("button");

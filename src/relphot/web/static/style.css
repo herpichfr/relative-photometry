@@ -204,6 +204,24 @@ tbody tr:nth-child(even) {
     font-weight: bold;
 }
 
+/* an event the cross-candidate check rejected automatically (a person's status still applies) */
+.auto-reject {
+    color: #b00020;
+    font-size: 0.85em;
+    margin-top: 0.2rem;
+}
+
+.auto-reject-reason {
+    color: #666;
+    font-size: 0.85em;
+    max-width: 22rem;
+}
+
+details.similar-events summary {
+    cursor: pointer;
+    font-size: 0.85em;
+}
+
 .rerun-entry label, #rerun-toggle {
     display: inline-flex;
     gap: 0.3rem;

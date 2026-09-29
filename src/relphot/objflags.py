@@ -49,6 +49,7 @@ night_auto AS (
     FROM relphot.detection d JOIN target t ON t.obj_id = d.obj_id
     WHERE d.night_id IS NOT NULL AND d.origin = 'search'
           AND COALESCE(d.status, 'UNCONFIRMED') <> 'REJECTED'
+          AND (d.auto_status IS DISTINCT FROM 'REJECTED' OR d.status = 'CONFIRMED')
     GROUP BY d.obj_id, d.night_id
 ),
 night_rev AS (
@@ -163,7 +164,10 @@ def refresh_flags(
     Literature (known planets/variables) and gated multi-night detections add; a
     per-night verdict overrides only that night's automatic evidence and never
     removes a literature match. A night's search detections with status REJECTED
-    are ignored (one event's evidence only). ``exop_source`` / ``var_source`` are
+    are ignored (one event's evidence only), and so are those with ``auto_status =
+    'REJECTED'`` (too many similar events on the night, :mod:`relphot.db.coincidence`)
+    unless a person CONFIRMED them: neither evidence nor open for review.
+    ``exop_source`` / ``var_source`` are
     ``'manual'`` iff the object has a verdict of that kind on some night. Every
     target object is updated (an object with no evidence gets false / ``'UNC'``).
 
@@ -207,7 +211,8 @@ def night_state(
     single night.
 
     ``detections`` is a list of dicts with keys: kind (str), status (str or None),
-    origin (str).
+    origin (str), and optionally auto_status (str or None: ``'REJECTED'`` is the automatic
+    "too many similar events" verdict of :mod:`relphot.db.coincidence`).
 
     Returns a dict with keys:
     - auto_exop, auto_var: whether automatic evidence is present
@@ -215,10 +220,16 @@ def night_state(
     - exop_effective, var_effective: the effective flag value (verdict overrides auto)
     - pending: whether this night awaits review
     """
-    # Only the search's own, not rejected, events are automatic evidence.
+    # Only the search's own events that are not rejected -- by a person, or automatically
+    # unless a person CONFIRMED them -- are automatic evidence.
     search_dets = [
         d for d in detections
-        if d.get("origin") == "search" and (d.get("status") or "UNCONFIRMED") != "REJECTED"
+        if d.get("origin") == "search"
+        and (d.get("status") or "UNCONFIRMED") != "REJECTED"
+        and not (
+            d.get("auto_status") == "REJECTED"
+            and (d.get("status") or "UNCONFIRMED") != "CONFIRMED"
+        )
     ]
 
     exop_ev = any(d["kind"] in NIGHT_EXOP_KINDS for d in search_dets)

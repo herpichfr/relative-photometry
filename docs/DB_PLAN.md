@@ -24,7 +24,8 @@ Status: agreed with the user 2026-09-28. This file is the spec for `relphot db` 
   set on. `is_exop` = known planet match (catalog 'NASA Exoplanet Archive' or 'TOI') OR a multi-night
   'bls' detection in `db.class_multinight_kinds` OR at least one night that is "on" for EXOP. A night is
   on for EXOP when its verdict is CONFIRMED, or the verdict is NULL and the night has a search
-  'transit'/'bls' detection whose status is not REJECTED (a REJECTED detection removes only that event).
+  'transit'/'bls' detection whose status is not REJECTED (a REJECTED detection removes only that event) and
+  that is not auto-rejected (see "Coincident events" below; a person's CONFIRMED overrides that).
   `is_var` likewise: known variable match (any other catalog) OR a multi-night
   'internight'/'ls_periodic'/'recurrent' detection in `db.class_multinight_kinds` (default: only
   'recurrent' -- 'bls'/'ls_periodic'/'internight' thresholds are uncalibrated and dominated by night-step
@@ -43,7 +44,8 @@ Status: agreed with the user 2026-09-28. This file is the spec for `relphot db` 
 - The per-night search no longer drops a transit event because the star is also variable (or a known
   variable of a disqualifying type): the event stays a candidate and carries the informational
   `ON_VARIABLE` flag (it never changes the tier). TOO_DEEP events still route to variables.
-- `object.status` and `detection.status` are only ever set by a person. A reload of a night keeps
+- `object.status` and `detection.status` are only ever set by a person (the automatic cross-candidate verdict
+  has its own column, `detection.auto_status`). A reload of a night keeps
   them: saved `status`/`notes` of the night's detections are re-attached to the new detection of the
   same object and kind (a transit only if its tc is within half its duration; any other kind by object
   and kind); what cannot be matched is logged and kept in `detection_review_orphan`. Objects a person
@@ -144,7 +146,9 @@ default true). On T80S 20251104-06 the cut keeps ~97 % of stars.
   status text check in ('UNCONFIRMED','CONFIRMED','REJECTED') default 'UNCONFIRMED', notes text,
   duration_lower_limit bool not null default false /* EDGE/PARTIAL at load; analyze resets it to (flags OR shape verdict) */,
   origin text not null default 'search' check in ('search','user') /* 'user': a reprocess request's event,
-  never deleted by a night reload, never sets is_exop */)`;
+  never deleted by a night reload, never sets is_exop */,
+  auto_status text check in ('REJECTED') /* schema v9: NULL = no automatic verdict; set only by
+  `analyze`'s cross-candidate check, never by a person */, auto_reason text)`;
   exactly one of night_id / mn_run_id set.
 - `catalog_match(obj_id fk, catalog text, name text, type text, period float8, period_err float8 /* NULL if the
   catalogue gives none */, sep_arcsec real, reference text, pk (obj_id, catalog, name))`.
@@ -154,6 +158,10 @@ default true). On T80S 20251104-06 the cut keeps ~97 % of stars.
   input text /* 'tied' | 'night' */, converged bool, computed_at)` -- trapezoid fit to one per-night transit.
   For an incomplete event `t14_h` is the observed in-transit span (a lower limit), `t14_err` is NULL and
   `ingress_frac`/`ingress_err` are NULL unless both ingress and egress were observed.
+- `transit_coincidence(det_id pk fk detection on delete cascade, night_id fk night on delete cascade, n_similar int,
+  n_expected real, p_chance float8, similar_det_ids bigint[] /* nearest in time first */, rejected bool not null,
+  computed_at)` (schema v9) -- the numbers behind `detection.auto_status`; one row per per-night search transit
+  event with a converged shape; rewritten for a whole night by every `analyze` that touches it.
 - `user_night_review(obj_id fk, night_id fk, exop_verdict text check in ('CONFIRMED','REJECTED'),
   var_verdict text check in ('CONFIRMED','REJECTED'), note text, updated_at, pk (obj_id, night_id))`
   -- per-night user verdicts on exoplanet/variable classification; NULL verdict = auto (overridable per night).
@@ -221,6 +229,8 @@ default true). On T80S 20251104-06 the cut keeps ~97 % of stars.
     lower limit L: z = max(0, L - T)/sigma_T against a measured T (no penalty if T >= L); with two
     lower limits there is no duration term (dropped from dof); the ingress term is dropped when either
     event has no ingress fraction;
+  - coincident events (after every chunk is committed): the cross-candidate check below, on every night
+    that has a transit shape of a target object -> `transit_coincidence`, `detection.auto_status`;
   - period estimate / verification, for every variable or object with a literature variable period: combined
     LS (tied magnitudes when a tie covers the nights, else per-night-normalised flux), global peak;
     with a literature period the LS peak is instead taken in the windows lit_period x h x (1 +/-
@@ -257,7 +267,8 @@ default true). On T80S 20251104-06 the cut keeps ~97 % of stars.
   `n_transit_events`, `max_p_match`, `n_review_pending`, `n_nights_reviewed` and, for literature variables,
   the latest `period_delta` +/- `period_delta_err` (CSV export included).
 - Detail adds a "Transit events" table (night, tc, depth, T14, ingress fraction with errors, tier, flags, and a
-  status selector per event, `PATCH /api/detection/{det_id}`), a "Matching transits" table (pair, dt, z-scores,
+  status selector per event, `PATCH /api/detection/{det_id}`; an auto-rejected event shows "REJECTED (auto)" with
+  its reason and a collapsible list of its first 20 look-alikes as links to their objects), a "Matching transits" table (pair, dt, z-scores,
   p(match), first commensurate periods) with a note that events are never merged automatically, the trapezoid
   fit drawn over the night's light curve, and a "Period verification" table plus a plot of delta against the
   number of nights.
@@ -282,6 +293,36 @@ default true). On T80S 20251104-06 the cut keeps ~97 % of stars.
   planets/variables) always counts and cannot be removed by a verdict. Verdicts are re-evaluated by
   `refresh_flags`, and `class` / `class_source` are re-derived. The advanced SQL box reads the new
   tables (`relphot_ro`).
+
+## Coincident events (schema v9)
+
+One planet cannot transit two stars at once. A per-night transit event whose trapezoid fit has many look-alikes on
+the SAME night -- other objects' events with the same centre time and a similar T14 and depth -- is a systematic
+(on the live data these coincide with seeing excursions and spread uniformly over the detector). It stays a
+detection but `relphot db analyze` marks it `auto_status = 'REJECTED'` with `auto_reason` ("too many similar events:
+57 other events on this night within +-6 min with similar depth and T14 (expected 21.3 by chance, p=3e-9)").
+`detection.status` remains the person's verdict and is never set automatically.
+
+- Judged and counted: the converged `transit_shape` rows of `kind = 'transit'`, `origin = 'search'` detections of
+  the night (user-origin events are neither). For events i != j: window `max(coincidence_tc_frac x min(T14),
+  coincidence_tc_nsigma x hypot(tc_err), cadence)` (cadence = median spacing of the night's frames; NaN tc_err = 0);
+  T14 similar when `|ln(T14_i/T14_j)| < ln(coincidence_t14_ratio)` (a lower-limit T14 is also similar to any
+  duration up to that ratio shorter); depth similar when `|ln(|d_i|/|d_j|)| < ln(coincidence_depth_ratio)`.
+  n_i counts the shape-similar j within the window.
+- Chance baseline: for a centre time uniform over `[lo, hi]` (first/last frame, widened to hold every event) the
+  probability of landing within the window of tc_i is pw_ij (truncated at the span's edges); with M_i shape-similar
+  events and pbar_i the mean pw_ij, `n_expected = M_i x pbar_i` and `p_chance = P(Binomial(M_i, pbar_i) >= n_i)`.
+- Rejected iff `n_i >= coincidence_min_similar` and `p_chance < coincidence_max_p`. Defaults (`[db]`): tc_frac 0.1,
+  tc_nsigma 2, t14_ratio 1.5, depth_ratio 2, min_similar 3, max_p 1e-3. On the four T80S nights loaded so far it
+  rejects 26/119, 258/423, 66/126 and 6/79 events; with tc randomised over the night it rejects < 0.1 events per night.
+- Effect on classification (`objflags`, `refresh`): a search detection with `auto_status = 'REJECTED'` whose status
+  is UNCONFIRMED (or NULL) is treated like a REJECTED one -- not automatic EXOP evidence, not open for review, not the
+  object's best transit. A person's CONFIRMED overrides it; a person's REJECTED stays rejected; per-night verdicts in
+  `user_night_review` override as before. `analyze` re-judges the WHOLE night from the stored shapes (not only the
+  target objects), so the verdict of an event can change when another object of its night is re-analysed, and
+  refreshes the objects whose verdict changed. A night reload deletes the search detections, and with them their
+  verdict: run `relphot db analyze` again afterwards.
+- After migration 009 run `relphot db analyze --all` once to fill the verdicts of the nights already loaded.
 
 ## Rerunning after schema v6 (order)
 

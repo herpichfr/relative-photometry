@@ -23,6 +23,12 @@ For each object needing analysis, :func:`analyze` deletes its existing
   every pair of converged fits of one object, a "matching transits"
   probability from depth and shape (``relphot.transit_match``). Events are
   never merged and no status is changed;
+- once every chunk is committed, the cross-candidate check of
+  :mod:`relphot.db.coincidence` on every night that has a transit shape of a target object:
+  the whole night is re-judged from the stored shapes (not only the target objects'), events
+  with too many look-alikes on the night get ``detection.auto_status = 'REJECTED'`` (the
+  person's ``status`` is never touched) and the objects whose automatic verdict changed are
+  refreshed;
 - for a variable (``is_var``) or an object with a literature variable period,
   a combined Lomb-Scargle period refined by a 2-harmonic Fourier fit with one
   offset per night (``relphot.period_estimate``, one row per set of nights,
@@ -67,6 +73,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from relphot.config import DbSettings, Settings
+from relphot.db.coincidence import update_coincidence
 from relphot.db.refresh import refresh_objects
 
 logger = logging.getLogger(__name__)
@@ -91,6 +98,10 @@ class AnalyzeReport:
     n_transit_shapes: int = 0
     n_transit_matches: int = 0
     n_period_estimates: int = 0
+    #: events auto-rejected by the cross-candidate check (whole nights, not only target objects)
+    n_coincidence_rejected: int = 0
+    #: nights the cross-candidate check re-judged
+    n_coincidence_nights: int = 0
 
 
 @dataclass(slots=True)
@@ -1468,6 +1479,27 @@ def _compute_object(task: _ObjTask) -> _ObjResult:
     )
 
 
+def _coincidence_night_ids(conn: psycopg.Connection, obj_ids: list[int]) -> list[int]:
+    """Nights holding a per-night transit detection of ``obj_ids`` that has a transit shape (or
+    a stale coincidence row): the nights whose cross-candidate check must be redone."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT d.night_id FROM relphot.detection d
+            WHERE d.obj_id = ANY(%(obj_ids)s) AND d.kind = 'transit'
+              AND d.night_id IS NOT NULL
+              AND (
+                  EXISTS (SELECT 1 FROM relphot.transit_shape ts WHERE ts.det_id = d.det_id)
+                  OR EXISTS (SELECT 1 FROM relphot.transit_coincidence tc
+                             WHERE tc.det_id = d.det_id)
+              )
+            ORDER BY d.night_id
+            """,
+            {"obj_ids": obj_ids},
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
 def analyze(
     conn: psycopg.Connection,
     *,
@@ -1487,7 +1519,9 @@ def analyze(
     number of :class:`~concurrent.futures.ProcessPoolExecutor` worker
     processes (default: ``os.cpu_count()``); ``1`` runs everything in this
     process. Work is committed one chunk of ``chunk_size`` objects at a
-    time, so an interrupted run keeps every chunk already committed.
+    time, so an interrupted run keeps every chunk already committed. Afterwards the
+    cross-candidate check (:mod:`relphot.db.coincidence`) re-judges every night with a transit
+    shape of a target object, in one further transaction.
     """
     t0 = time.monotonic()
     settings = settings if settings is not None else Settings()
@@ -1606,8 +1640,28 @@ def analyze(
         if executor is not None:
             executor.shutdown(wait=True)
 
+    n_coincidence_rejected = n_coincidence_nights = 0
+    try:
+        night_ids = _coincidence_night_ids(conn, target_ids)
+        if night_ids:
+            coincidence_report = update_coincidence(conn, night_ids, db_settings)
+            n_coincidence_rejected = coincidence_report.n_rejected
+            n_coincidence_nights = coincidence_report.n_nights
+            if coincidence_report.changed_obj_ids:
+                refresh_objects(
+                    conn, coincidence_report.changed_obj_ids,
+                    bls_min_snr=db_settings.bls_min_snr,
+                    ls_fap_threshold=db_settings.ls_fap_threshold,
+                    class_multinight_kinds=db_settings.class_multinight_kinds,
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
     return AnalyzeReport(
         n_objects=len(target_ids), n_ls_night=n_ls_night, n_ls_combined=n_ls_combined,
         n_bls=n_bls, n_coarsened=n_coarsened, elapsed_s=time.monotonic() - t0,
         n_transit_shapes=n_shapes, n_transit_matches=n_matches, n_period_estimates=n_estimates,
+        n_coincidence_rejected=n_coincidence_rejected, n_coincidence_nights=n_coincidence_nights,
     )

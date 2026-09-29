@@ -384,6 +384,24 @@ class DbSettings:
     #: 90 s exposure in the R band, matched to G at the star's best aperture with no aperture
     #: correction. A ``telescope_zp`` in a settings file replaces this table as a whole.
     telescope_zp: dict[str, float] = field(default_factory=lambda: {"T80S": 27.85})
+    #: Cross-candidate check of one night's transit events (``relphot db analyze``): time window
+    #: of a pair of events, as a fraction of the shorter T14 (the window is the largest of this,
+    #: ``coincidence_tc_nsigma`` combined centre-time errors and one cadence of the night).
+    coincidence_tc_frac: float = 0.1
+    #: Time window of a pair of events, in combined 1-sigma centre-time errors.
+    coincidence_tc_nsigma: float = 2.0
+    #: Two events have a similar T14 when their durations differ by less than this factor (a
+    #: duration that is only a lower limit is similar to any duration up to this factor shorter).
+    coincidence_t14_ratio: float = 1.5
+    #: Two events have a similar depth when their depths differ by less than this factor.
+    coincidence_depth_ratio: float = 2.0
+    #: An event is auto-rejected only if at least this many other events of its night coincide
+    #: with it (same centre time within the window, similar T14 and depth) ...
+    coincidence_min_similar: int = 3
+    #: ... and the binomial probability of that many coincidences by chance (events spread
+    #: uniformly over the night) is below this.
+    coincidence_max_p: float = 1e-3
+
     def __post_init__(self) -> None:
         if not isinstance(self.telescope_zp, dict) or not all(
             isinstance(k, str) for k in self.telescope_zp
@@ -399,6 +417,34 @@ class DbSettings:
             if not math.isfinite(value):
                 msg = f"db.{name} must be a finite number, got {value!r}"
                 raise ConfigError(msg)
+        for name in ("coincidence_t14_ratio", "coincidence_depth_ratio"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool) or not isinstance(value, int | float)
+                or not (math.isfinite(value) and value > 1)
+            ):
+                msg = f"db.{name} must be a number > 1, got {value!r}"
+                raise ConfigError(msg)
+        for name in (
+            "coincidence_tc_frac", "coincidence_tc_nsigma", "coincidence_max_p",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool) or not isinstance(value, int | float)
+                or not (math.isfinite(value) and value > 0)
+            ):
+                msg = f"db.{name} must be a positive number, got {value!r}"
+                raise ConfigError(msg)
+        if self.coincidence_max_p > 1:
+            msg = f"db.coincidence_max_p must be in (0, 1], got {self.coincidence_max_p!r}"
+            raise ConfigError(msg)
+        if self.coincidence_tc_frac > 1:
+            msg = f"db.coincidence_tc_frac must be in (0, 1], got {self.coincidence_tc_frac!r}"
+            raise ConfigError(msg)
+        value = self.coincidence_min_similar
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            msg = f"db.coincidence_min_similar must be an integer >= 1, got {value!r}"
+            raise ConfigError(msg)
 
 
 @dataclass(frozen=True, slots=True)
