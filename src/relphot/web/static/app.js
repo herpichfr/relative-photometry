@@ -19,6 +19,11 @@ const state = {
   reprocessPending: false,
   phase: null, // last /api/object/{id}/phase response
   reprocessTimer: null, // pending poll of the reprocess queue
+  rerunWatch: new Map(), // req_id -> request, for each request last seen queued or running
+  rerunPollTimer: null, // next poll of the all-objects pending RERUN list
+  rerunPolling: false, // a poll of that list is in flight
+  rerunKey: null, // ids of the pending requests at the last poll (null before the first)
+  lcView: null, // plotted light curve {kind, nightId, lc}, re-plotted when the y unit changes
 };
 
 function $(id) {
@@ -85,6 +90,7 @@ function collectFilters() {
     ["filter-is-var", "is_var"],
     ["filter-needs-review", "needs_review"],
     ["filter-user-reviewed", "user_reviewed"],
+    ["filter-rerun-pending", "rerun_pending"],
     ["filter-known", "known"],
     ["filter-status", "status"],
     ["filter-has-periodogram", "has_periodogram"],
@@ -129,10 +135,12 @@ function resetFilters() {
 const RESULT_COLUMNS = [
   "obj_id", "name", "ra", "dec", "class", "is_exop", "is_var", "known", "source_db",
   "known_name", "known_type", "period", "period_err", "period_source", "known_period",
-  "mean_mag", "n_nights", "best_snr", "depth", "duration_h", "duration_lower_limit",
+  "mean_mag", "mean_mag_app", "mag_zp_source", "n_nights", "best_snr", "depth", "duration_h",
+  "duration_lower_limit",
   "amplitude", "status", "first_night", "last_night", "n_review_pending", "n_nights_reviewed",
   "n_transit_events", "max_p_match", "period_delta",
   "period_delta_err", "period_verify_status", "period_verify_note",
+  "n_rerun_pending", "last_rerun_status", "last_rerun_finished_at",
 ];
 
 function renderResultsHeader() {
@@ -160,16 +168,55 @@ function renderResultsHeader() {
   }
 }
 
+// whether objId is the object loaded in the detail panel
+function isCurrentObject(objId) {
+  return !!state.currentObject && state.currentObject.object.obj_id === objId;
+}
+
+// highlight the loaded object's row (renderResultsBody does it again on every re-render)
+function highlightCurrentRow() {
+  for (const tr of qsa("#results-table tbody tr")) {
+    tr.classList.toggle("current-object", isCurrentObject(parseInt(tr.dataset.objId, 10)));
+  }
+}
+
+// RERUN marker of a results row: the pending count, else the outcome of its newest request
+function rerunRowBadge(row) {
+  let text = "";
+  let title = "";
+  let cls = "";
+  if (row.n_rerun_pending > 0) {
+    cls = "pending";
+    text = `RERUN ${row.n_rerun_pending}`;
+    title = `${row.n_rerun_pending} RERUN request(s) queued or running`;
+  } else if (row.last_rerun_status === "done" || row.last_rerun_status === "failed") {
+    cls = row.last_rerun_status;
+    text = `rerun ${row.last_rerun_status}`;
+    title = `newest RERUN ${row.last_rerun_status}`
+      + (row.last_rerun_finished_at ? " " + String(row.last_rerun_finished_at).replace("T", " ").slice(0, 19) : "");
+  }
+  if (!text) return null;
+  const span = document.createElement("span");
+  span.className = `rerun-badge ${cls}`;
+  span.textContent = text;
+  span.title = title;
+  return span;
+}
+
 function renderResultsBody(rows) {
   const tbody = qs("#results-table tbody");
   tbody.innerHTML = "";
   for (const row of rows) {
     const tr = document.createElement("tr");
+    tr.dataset.objId = String(row.obj_id);
+    if (isCurrentObject(row.obj_id)) tr.classList.add("current-object");
     const tdLoad = document.createElement("td");
     const btn = document.createElement("button");
     btn.textContent = "Load";
     btn.addEventListener("click", () => loadObject(row.obj_id));
     tdLoad.appendChild(btn);
+    const rerun = rerunRowBadge(row);
+    if (rerun) tdLoad.appendChild(rerun);
     tr.appendChild(tdLoad);
     for (const col of RESULT_COLUMNS) {
       const td = document.createElement("td");
@@ -299,15 +346,34 @@ const META_FIELDS = [
   ["duration_display", "transit duration"],
   ["period_source", "period source"], ["known", "KNOWN"], ["source_db", "SOURCE_DB"],
   ["known_name", "known name"], ["known_type", "known type"], ["known_period", "known period (d)"],
-  ["status", "status"], ["gaia_id", "Gaia ID"], ["mean_mag", "mean mag"],
+  ["status", "status"], ["gaia_id", "Gaia ID"], ["mean_mag_display", "mean mag (apparent)"],
+  ["mean_mag", "mean mag (instrumental)"],
   ["n_nights", "n nights"], ["n_review_pending", "nights awaiting review"],
   ["n_nights_reviewed", "nights reviewed"], ["notes", "notes"],
 ];
+
+// "16.32 (Gaia ZP)" or "≈ 17.10 (ZP=20 assumed)": the apparent mean magnitude (the
+// instrumental one plus the night zero points) and which zero point it rests on
+function appMagText(obj) {
+  if (obj.mean_mag_app === null || obj.mean_mag_app === undefined) return "";
+  const m = Number(obj.mean_mag_app).toFixed(2);
+  if (obj.mag_zp_source === "gaia") return `${m} (Gaia ZP)`;
+  if (obj.mag_zp_source === "mixed") return `≈ ${m} (mixed: Gaia ZP and ZP=20 assumed)`;
+  return `≈ ${m} (ZP=20 assumed)`;
+}
+
+// the zero point of a light-curve axis
+function zpText(source, zp) {
+  if (source === "gaia") return "Gaia ZP" + (zp === null || zp === undefined ? "" : " " + Number(zp).toFixed(2));
+  if (source === "mixed") return "mixed ZPs";
+  return "ZP=20 assumed";
+}
 
 function renderMeta(obj) {
   const table = $("detail-meta");
   table.innerHTML = "";
   const display = Object.assign({}, obj, {
+    mean_mag_display: appMagText(obj),
     ra_sexagesimal: raToHms(obj.ra),
     dec_sexagesimal: decToDms(obj.dec),
   });
@@ -761,6 +827,12 @@ function prefillEditBox(obj) {
   $("edit-status-msg").textContent = "";
 }
 
+// obj_id (and name) in the "Object detail" header; the RERUN badge waits for the requests
+function renderDetailHeader(obj) {
+  $("detail-obj-id").textContent = `obj_id ${obj.obj_id}` + (obj.name ? ` (${obj.name})` : "");
+  $("rerun-badge").hidden = true;
+}
+
 async function loadObject(objId) {
   const resp = await fetch(`/api/object/${objId}`);
   if (!resp.ok) {
@@ -772,6 +844,8 @@ async function loadObject(objId) {
   state.currentNightId = null;
 
   $("detail-panel").hidden = false;
+  renderDetailHeader(data.object);
+  highlightCurrentRow();
   renderMeta(data.object);
   renderCatalogMatches(data.catalog_matches);
   renderDetections(data.detections);
@@ -784,6 +858,7 @@ async function loadObject(objId) {
   prefillEditBox(data.object);
   Plotly.purge("plot-lightcurve");
   Plotly.purge("plot-phase");
+  state.lcView = null;
   state.phase = null;
   // the phase diagram is for a variable or any object that has a period (PERIOD, or a guided one)
   const hasGuided = (data.period_estimates || []).some(
@@ -807,6 +882,19 @@ function bestTransitForNight(nightId) {
   );
 }
 
+// Light-curve y unit: apparent magnitude (mean magnitude + zero point + delta mag, brighter
+// up) or relative flux. The plotted payload is kept so a change of unit needs no request.
+function lcUnit() {
+  return $("lc-unit-select").value;
+}
+
+function replotLightcurve() {
+  const v = state.lcView;
+  if (!v) return;
+  if (v.kind === "night") plotNightLc(v.nightId, v.lc);
+  else plotCombinedLc(v.lc);
+}
+
 async function loadNightLc(nightId) {
   state.currentNightId = nightId;
   const objId = state.currentObject.object.obj_id;
@@ -816,11 +904,25 @@ async function loadNightLc(nightId) {
     return;
   }
   const lc = await resp.json();
+  state.lcView = { kind: "night", nightId, lc };
+  plotNightLc(nightId, lc);
+}
+
+function plotNightLc(nightId, lc) {
   const x = lc.bjd_tdb.map((t) => t - 2460000);
+  const finiteFlux = lc.flux.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  const baseline = finiteFlux.length ? finiteFlux[Math.floor(finiteFlux.length / 2)] : 1;
+  // magnitudes: the night's apparent mean magnitude + delta mag = -2.5 log10(flux / median)
+  const useMag = lcUnit() === "mag" && lc.app_mag !== null && lc.app_mag !== undefined;
+  const yOf = (f) => (useMag ? lc.app_mag - 2.5 * Math.log10(f / baseline) : f);
   const trace = {
-    x, y: lc.flux, type: "scatter", mode: "markers",
-    error_y: { type: "data", array: lc.flux_err, visible: true },
-    text: lc.frame_index.map((fi, i) => `frame ${fi}<br>${lc.file_name[i] || ""}<br>airmass ${lc.airmass[i]}`),
+    x, y: lc.flux.map(yOf), type: "scatter", mode: "markers",
+    error_y: {
+      type: "data", visible: true,
+      array: useMag ? lc.flux.map((f, i) => 1.0857 * lc.flux_err[i] / f) : lc.flux_err,
+    },
+    text: lc.frame_index.map((fi, i) => `frame ${fi}<br>${lc.file_name[i] || ""}<br>airmass ${lc.airmass[i]}`
+      + `<br>flux ${(lc.flux[i] / baseline).toFixed(4)} (${(-2.5 * Math.log10(lc.flux[i] / baseline)).toFixed(4)} mag)`),
     hoverinfo: "x+y+text",
     marker: { size: 5 },
     name: lc.night_label || `night ${nightId}`,
@@ -847,8 +949,6 @@ async function loadNightLc(nightId) {
       text: `T14 ${ev.duration_display || ""}${ev.incomplete_reason ? " (incomplete)" : ""}`,
     });
   }
-  const finiteFlux = lc.flux.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
-  const baseline = finiteFlux.length ? finiteFlux[Math.floor(finiteFlux.length / 2)] : 1;
   for (const ev of fitted) {
     const t14 = ev.t14_h / 24.0;
     const tau = Math.max(ev.ingress_frac * t14, 1e-3 * t14);
@@ -858,7 +958,7 @@ async function loadNightLc(nightId) {
       const t = ev.tc + (k / 240 - 0.5) * 3.0 * t14;
       const s = Math.min(1, Math.max(0, (t14 / 2 - Math.abs(t - ev.tc)) / tau));
       xs.push(t - 2460000);
-      ys.push(baseline * (1 - ev.depth * s));
+      ys.push(yOf(baseline * (1 - ev.depth * s)));
     }
     traces.push({
       x: xs, y: ys, type: "scatter", mode: "lines", line: { color: "rgb(200,30,30)" },
@@ -874,7 +974,7 @@ async function loadNightLc(nightId) {
     const depth = transit.depth || 0;
     const yTop = Math.max(...lc.flux.filter((v) => Number.isFinite(v)));
     shapes.push({
-      type: "rect", x0: tc - halfDur, x1: tc + halfDur, y0: 1 - depth, y1: yTop,
+      type: "rect", x0: tc - halfDur, x1: tc + halfDur, y0: yOf(1 - depth), y1: yOf(yTop),
       line: { color: "rgba(200,30,30,0.6)" }, fillcolor: "rgba(200,30,30,0.08)",
     });
     annotations.push({
@@ -883,13 +983,17 @@ async function loadNightLc(nightId) {
     });
   }
   Plotly.newPlot("plot-lightcurve", traces, {
-    xaxis: { title: "BJD_TDB - 2460000" },
-    yaxis: { title: "relative flux" },
+    xaxis: { title: { text: "BJD_TDB - 2460000" } },
+    yaxis: useMag
+      ? { title: { text: `apparent mag (${zpText(lc.zp_source, lc.zp)})` }, autorange: "reversed" }
+      : { title: { text: "relative flux" } },
     shapes,
     annotations,
     margin: { t: 20 },
+    dragmode: lightcurveDragmode(),
+    selectdirection: "h",
   }, { responsive: true });
-  attachLightcurveClick();
+  attachLightcurveEvents();
 }
 
 async function loadCombinedLc() {
@@ -900,14 +1004,41 @@ async function loadCombinedLc() {
     return;
   }
   const lc = await resp.json();
+  state.lcView = { kind: "combined", lc };
+  plotCombinedLc(lc);
+}
+
+// The combined curve: tied, `value` is the tie-calibrated magnitude (+ the anchor night's zero
+// point = apparent); untied, it is flux over the night's median, given the night's apparent
+// mean magnitude (`app_mag`) as its level.
+function plotCombinedLc(lc) {
+  const tied = lc.mode === "tied-mag";
+  const useMag = lcUnit() === "mag" && (!tied || (lc.zp !== null && lc.zp !== undefined));
+  const sortedValues = lc.value.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  const mref = sortedValues.length ? sortedValues[Math.floor(sortedValues.length / 2)] : 0;
+  let yOf;
+  let errOf;
+  if (tied && useMag) {
+    yOf = (i) => lc.value[i] + lc.zp;
+    errOf = (i) => lc.value_err[i];
+  } else if (tied) {
+    yOf = (i) => Math.pow(10, -0.4 * (lc.value[i] - mref));
+    errOf = (i) => yOf(i) * lc.value_err[i] / 1.0857;
+  } else if (useMag) {
+    yOf = (i) => (lc.app_mag[i] === null ? NaN : lc.app_mag[i] - 2.5 * Math.log10(lc.value[i]));
+    errOf = (i) => 1.0857 * lc.value_err[i] / lc.value[i];
+  } else {
+    yOf = (i) => lc.value[i];
+    errOf = (i) => lc.value_err[i];
+  }
   const byNight = new Map();
   for (let i = 0; i < lc.bjd_tdb.length; i++) {
     const key = lc.night_id[i];
     if (!byNight.has(key)) byNight.set(key, { x: [], y: [], err: [], text: [], label: lc.night_label[i], night_id: key });
     const bucket = byNight.get(key);
     bucket.x.push(lc.bjd_tdb[i] - 2460000);
-    bucket.y.push(lc.value[i]);
-    bucket.err.push(lc.value_err[i]);
+    bucket.y.push(yOf(i));
+    bucket.err.push(errOf(i));
     bucket.text.push(lc.file_name[i] || "");
   }
   const traces = Array.from(byNight.values()).map((bucket) => ({
@@ -917,26 +1048,33 @@ async function loadCombinedLc() {
     marker: { size: 5 }, name: bucket.label, meta: { night_id: bucket.night_id },
   }));
   const layout = {
-    xaxis: { title: "BJD_TDB - 2460000" },
+    xaxis: { title: { text: "BJD_TDB - 2460000" } },
     yaxis: {
-      title: lc.mode === "tied-mag" ? "tied magnitude" : "relative flux (per-night normalised)",
-      autorange: lc.mode === "tied-mag" ? "reversed" : true,
+      title: {
+        text: !useMag
+          ? (tied ? "relative flux (from tie-calibrated magnitudes)" : "relative flux (per-night normalised)")
+          : `apparent mag (${tied ? zpText(lc.zp_source, lc.zp) + ", tied" : "night means, " + zpText(lc.zp_source, null)})`,
+      },
+      autorange: useMag ? "reversed" : true,
     },
-    margin: { t: 20 },
-    title: lc.mode === "tied-mag"
-      ? "combined (tie-calibrated magnitudes)"
-      : "combined (per-night normalised flux -- nights are NOT tied)",
+    margin: { t: 40 },
+    dragmode: lightcurveDragmode(),
+    selectdirection: "h",
+    title: {
+      text: lc.mode === "tied-mag"
+        ? "combined (tie-calibrated magnitudes)"
+        : "combined (per-night normalised flux -- nights are NOT tied)",
+    },
   };
   Plotly.newPlot("plot-lightcurve", traces, layout, { responsive: true });
-  attachLightcurveClick();
+  attachLightcurveEvents();
 }
 
-// a click on the light curve fills in the transit centre of the rerun entry you last edited
-function fillRerunFromClick(ev) {
-  if (!ev.points || ev.points.length === 0) return;
+// The rerun entry a click or drag on the light curve fills: the one you last edited.
+function rerunTargetEntry() {
   if (!$("rerun-check").checked) {
     $("rp-msg").textContent = "tick RERUN first";
-    return;
+    return null;
   }
   // Target .rerun-entry.active or the last entry
   let target = qs(".rerun-entry.active");
@@ -944,6 +1082,25 @@ function fillRerunFromClick(ev) {
     const entries = qsa(".rerun-entry");
     target = entries[entries.length - 1];
   }
+  return target || null;
+}
+
+// Find and select the night option of an entry if it offers it.
+function selectRerunNight(target, nightId) {
+  if (!nightId) return false;
+  const nightSelect = qs(".rr-night", target);
+  const options = qsa("option", nightSelect);
+  const opt = options.find(o => o.value === String(nightId));
+  if (!opt) return false;
+  nightSelect.value = nightId;
+  syncRerunEntry(target);
+  return true;
+}
+
+// a click on the light curve fills in the transit centre of the rerun entry you last edited
+function fillRerunFromClick(ev) {
+  if (!ev.points || ev.points.length === 0) return;
+  const target = rerunTargetEntry();
   if (!target) return;
 
   qs(".rr-exop", target).checked = true;
@@ -954,24 +1111,100 @@ function fillRerunFromClick(ev) {
   // Get night from meta or currentNightId
   const nightFromData = ev.points[0].data.meta && ev.points[0].data.meta.night_id;
   const nightId = nightFromData !== undefined ? nightFromData : state.currentNightId;
-
-  // Find and select the night option if it exists
-  if (nightId) {
-    const nightSelect = qs(".rr-night", target);
-    const options = qsa("option", nightSelect);
-    const opt = options.find(o => o.value === String(nightId));
-    if (opt) {
-      nightSelect.value = nightId;
-      syncRerunEntry(target);
-    }
-  }
+  selectRerunNight(target, nightId);
 }
 
-function attachLightcurveClick() {
+// While RERUN is ticked a drag on the light curve selects an x span (the mode bar's zoom
+// button gets zooming back); otherwise the plot keeps dragging to zoom.
+function lightcurveDragmode() {
+  return $("rerun-check").checked ? "select" : "zoom";
+}
+
+function setLightcurveDragmode() {
+  const gd = $("plot-lightcurve");
+  if (gd.data) Plotly.relayout(gd, { dragmode: lightcurveDragmode() });
+}
+
+// x span [x0, x1] of a plotly_selected event: the dragged box (also over a gap with no
+// points), else, for a lasso, the extent of the selected points; null if there is none.
+function selectedSpan(ev) {
+  let xs = ev && ev.range && ev.range.x;
+  if (!xs && ev && ev.points && ev.points.length > 1) {
+    const px = ev.points.map((p) => p.x);
+    xs = [Math.min(...px), Math.max(...px)];
+  }
+  return xs && xs[1] > xs[0] ? [xs[0], xs[1]] : null;
+}
+
+// The night with the most points in [x0, x1] (each trace carries its night in meta), else
+// the night being plotted.
+function nightInSpan(gd, x0, x1) {
+  const counts = new Map();
+  for (const tr of gd.data || []) {
+    const nid = tr.meta && tr.meta.night_id;
+    if (nid === undefined || nid === null) continue;
+    let n = 0;
+    for (const x of tr.x) {
+      if (x >= x0 && x <= x1) n++;
+    }
+    if (n > 0) counts.set(nid, (counts.get(nid) || 0) + n);
+  }
+  let best = null;
+  for (const [nid, n] of counts) {
+    if (best === null || n > counts.get(best)) best = nid;
+  }
+  return best !== null ? best : state.currentNightId;
+}
+
+// A drag on the light curve fills the rerun entry you last edited. EXOP (also when both are
+// ticked): the transit centre (midpoint of the span) and the width of the suspected eclipse
+// (span, in hours). VAR only: the period guess (span, in days: drag from one peak to the
+// next). The entry's night becomes the night with data in the span.
+function fillRerunFromDrag(ev) {
+  const gd = $("plot-lightcurve");
+  const span = selectedSpan(ev);
+  if (!span) return;
+  // drop the selection box and the dimming of unselected points
+  Plotly.relayout(gd, { selections: [] }).then(() => Plotly.restyle(gd, { selectedpoints: [null] }));
+  const target = rerunTargetEntry();
+  if (!target) return;
+
+  const [x0, x1] = span;
+  const forPeriod = qs(".rr-var", target).checked && !qs(".rr-exop", target).checked;
+  const title = qs(".rr-title", target).textContent;
+  let text;
+  let outside = false;
+  if (forPeriod) {
+    const period = x1 - x0;
+    qs(".rr-period", target).value = period.toFixed(6);
+    text = `${title}: period ${period.toFixed(6)} d`;
+  } else {
+    qs(".rr-exop", target).checked = true;
+    syncRerunEntry(target);
+    const widthH = (x1 - x0) * 24.0;
+    qs(".rr-tc", target).value = (0.5 * (x0 + x1) + 2460000).toFixed(5);
+    qs(".rr-width", target).value = widthH.toFixed(3);
+    outside = widthH < 0.1 || widthH > 12;
+    text = `${title}: transit centre ${qs(".rr-tc", target).value}, width ${widthH.toFixed(3)} h`
+      + (outside ? " (outside the allowed 0.1 to 12 h)" : "");
+  }
+  const nightSelect = qs(".rr-night", target);
+  if (selectRerunNight(target, nightInSpan(gd, x0, x1)) && nightSelect.selectedOptions.length) {
+    text += `, night ${nightSelect.selectedOptions[0].textContent}`;
+  }
+  $("rp-msg").className = outside ? "warn" : "";
+  $("rp-msg").textContent = text;
+}
+
+function attachLightcurveEvents() {
   const gd = $("plot-lightcurve");
   if (!gd.on) return;
-  if (gd.removeAllListeners) gd.removeAllListeners("plotly_click");
+  if (gd.removeAllListeners) {
+    gd.removeAllListeners("plotly_click");
+    gd.removeAllListeners("plotly_selected");
+  }
   gd.on("plotly_click", fillRerunFromClick);
+  gd.on("plotly_selected", fillRerunFromDrag);
 }
 
 // ---------------------------------------------------------------------
@@ -1000,9 +1233,20 @@ function phaseCoverageOf(ts, period) {
   return { coverage: bins.size / 20, cycles: (Math.max(...ts) - t0) / period };
 }
 
+// zero point that turns the phase diagram's tied magnitudes into apparent ones (0: untied flux)
+function phaseZp(ph) {
+  return ph.tied && ph.zp !== null && ph.zp !== undefined ? ph.zp : 0;
+}
+
 // One scatter trace per night (points coloured by night, with error bars); with `wide`, the
 // points of the first and last quarter cycle are repeated one cycle away (-0.25 to 1.25).
+// untied phase diagram in magnitudes too: each night's apparent mean magnitude - 2.5 log10(flux)
+function phaseUsesMag(ph) {
+  return !ph.tied && lcUnit() === "mag" && (ph.app_mag || []).some((v) => v !== null);
+}
+
 function phaseTraces(ph, t0, wide) {
+  const useMag = phaseUsesMag(ph);
   const byNight = new Map();
   for (let i = 0; i < ph.bjd_tdb.length; i++) {
     const key = ph.night_label[i];
@@ -1012,8 +1256,10 @@ function phaseTraces(ph, t0, wide) {
     const shifts = wide ? [x, ...(x >= 0.75 ? [x - 1] : []), ...(x < 0.25 ? [x + 1] : [])] : [x];
     for (const xs of shifts) {
       b.x.push(xs);
-      b.y.push(ph.value[i]);
-      b.err.push(ph.value_err[i]);
+      b.y.push(useMag
+        ? (ph.app_mag[i] === null ? NaN : ph.app_mag[i] - 2.5 * Math.log10(ph.value[i]))
+        : ph.value[i] + phaseZp(ph));
+      b.err.push(useMag ? 1.0857 * ph.value_err[i] / ph.value[i] : ph.value_err[i]);
       b.text.push(`${key}<br>${ph.file_name[i] || ""}`);
     }
   }
@@ -1034,6 +1280,9 @@ function plotPhase() {
   const useFit = $("phase-epoch-select").value === "fit" && ph.model;
   const t0 = useFit ? ph.model.t_zero : ph.t_first;
   const traces = phaseTraces(ph, t0, wide);
+  const useMag = phaseUsesMag(ph);
+  const known = (ph.app_mag || []).filter((v) => v !== null);
+  const meanApp = known.length ? known.reduce((a, b) => a + b, 0) / known.length : 0;
   if (ph.model && $("phase-model-check").checked) {
     const xs = [];
     const ys = [];
@@ -1041,7 +1290,8 @@ function plotPhase() {
     const hi = wide ? 1.25 : 1.0;
     for (let x = lo; x <= hi + 1e-9; x += 0.005) {
       xs.push(x);
-      ys.push(modelValue(ph.model, t0 + x * ph.period));
+      const m = modelValue(ph.model, t0 + x * ph.period);
+      ys.push(useMag ? meanApp - 2.5 * Math.log10(m) : m + phaseZp(ph));
     }
     traces.push({
       x: xs, y: ys, type: "scatter", mode: "lines", name: "Fourier model (2 harmonics)",
@@ -1049,12 +1299,17 @@ function plotPhase() {
     });
   }
   Plotly.newPlot("plot-phase", traces, {
-    xaxis: { title: `phase (P = ${ph.period} d)`, range: wide ? [-0.25, 1.25] : [0, 1] },
+    xaxis: { title: { text: `phase (P = ${ph.period} d)` }, range: wide ? [-0.25, 1.25] : [0, 1] },
     yaxis: {
-      title: ph.tied ? "tied magnitude" : "relative flux (per-night normalised, untied)",
-      autorange: ph.tied ? "reversed" : true,
+      title: {
+        text: ph.tied
+          ? (phaseZp(ph) ? `apparent mag (${zpText(ph.zp_source, ph.zp)}, tied)` : "tied magnitude")
+          : (useMag ? `apparent mag (night means, ${zpText(ph.zp_source, null)}, untied)`
+            : "relative flux (per-night normalised, untied)"),
+      },
+      autorange: ph.tied || useMag ? "reversed" : true,
     },
-    title: ph.label,
+    title: { text: ph.label },
     margin: { t: 40 },
   }, { responsive: true });
 }
@@ -1293,6 +1548,7 @@ function onRerunToggle() {
   if (checked && $("rerun-entries").children.length === 0) {
     addRerunEntry();
   }
+  setLightcurveDragmode();
 }
 
 function addRerunEntry(after) {
@@ -1491,6 +1747,36 @@ function renderReprocess(data) {
   }
   $("rp-queue").textContent =
     `queue: ${data.queue.queued} queued, ${data.queue.running} running (all objects)`;
+  renderRerunBadge(data.requests);
+}
+
+// Status badge in the detail header: RERUN pending, else how the newest request ended.
+function renderRerunBadge(requests) {
+  const badge = $("rerun-badge");
+  const running = requests.filter((r) => r.status === "running").length;
+  const queued = requests.filter((r) => r.status === "queued").length;
+  const newest = requests[0];
+  let text = "";
+  let cls = "";
+  let title = "";
+  if (running + queued > 0) {
+    cls = "pending";
+    text = `RERUN ${running ? "running..." : "queued"} (${running + queued} pending)`;
+    title = "see the request history below";
+  } else if (newest && newest.status === "failed") {
+    cls = "failed";
+    const error = newest.error || "failed";
+    text = `RERUN failed: ${error.length > 80 ? error.slice(0, 80) + "..." : error}`;
+    title = error;
+  } else if (newest && newest.status === "done") {
+    cls = "done";
+    text = "RERUN done — see results below";
+    title = "finished " + String(newest.finished_at).replace("T", " ").slice(0, 19);
+  }
+  badge.hidden = !text;
+  badge.className = `rerun-badge ${cls}`;
+  badge.textContent = text;
+  badge.title = title;
 }
 
 // Load this object's requests; keep polling every 3 s while one is queued or running.
@@ -1572,6 +1858,110 @@ async function submitReprocess() {
 
   state.reprocessPending = true;
   loadReprocess();
+  pollPendingReruns();
+}
+
+// ---------------------------------------------------------------------
+// Pending RERUNs of all objects (header indicator, finish notices)
+// ---------------------------------------------------------------------
+
+const RERUN_POLL_MS = 10000;
+
+// A non-blocking notice that a request finished, with a link to open the object.
+function showRerunNotice(r) {
+  const box = $("rerun-notices");
+  const div = document.createElement("div");
+  div.className = `rerun-notice ${r.status}`;
+  const msg = document.createElement("span");
+  msg.textContent = `RERUN for obj ${r.obj_id}${r.obj_name ? " (" + r.obj_name + ")" : ""} finished: ${r.status}`
+    + (r.status === "failed" && r.error ? ` (${r.error.slice(0, 120)})` : "");
+  const open = document.createElement("button");
+  open.textContent = "Open";
+  open.addEventListener("click", () => {
+    div.remove();
+    loadObject(r.obj_id);
+  });
+  const close = document.createElement("button");
+  close.textContent = "×";
+  close.title = "dismiss";
+  close.addEventListener("click", () => div.remove());
+  div.append(msg, open, close);
+  box.appendChild(div);
+  while (box.children.length > 5) box.firstChild.remove();
+}
+
+// "N RERUNs pending" button in the header; its list names the objects (click to load one)
+function renderPendingReruns(requests, queue) {
+  const total = queue.queued + queue.running;
+  $("rerun-global").hidden = total === 0;
+  $("btn-rerun-list").textContent = `${total} RERUN${total === 1 ? "" : "s"} pending`
+    + (queue.running ? ` (${queue.running} running)` : "");
+  const list = $("rerun-list");
+  list.innerHTML = "";
+  if (total === 0) list.hidden = true;
+  const byObj = new Map();
+  for (const r of requests) {
+    if (!byObj.has(r.obj_id)) byObj.set(r.obj_id, { name: r.obj_name, n: 0, running: 0 });
+    const o = byObj.get(r.obj_id);
+    o.n += 1;
+    if (r.status === "running") o.running += 1;
+  }
+  for (const [objId, o] of byObj) {
+    const a = document.createElement("a");
+    a.href = "#";
+    a.textContent = `obj ${objId}${o.name ? " (" + o.name + ")" : ""}: ${o.n} pending`
+      + (o.running ? ", running" : "");
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      list.hidden = true;
+      loadObject(objId);
+    });
+    list.appendChild(a);
+  }
+}
+
+// Ask which requests (all objects) are queued or running, and how the ones seen pending
+// before ended. Polls every 10 s while any is pending and stops at 0; a search or a
+// submitted RERUN starts it again. Read-only: nothing is ever queued from here.
+async function pollPendingReruns() {
+  if (state.rerunPolling) return;
+  state.rerunPolling = true;
+  if (state.rerunPollTimer) {
+    clearTimeout(state.rerunPollTimer);
+    state.rerunPollTimer = null;
+  }
+  let data = null;
+  try {
+    const params = new URLSearchParams({ status: "queued,running" });
+    for (const id of state.rerunWatch.keys()) params.append("watch", String(id));
+    const resp = await fetch("/api/reprocess?" + params.toString());
+    if (resp.ok) data = await resp.json();
+  } catch (err) {
+    data = null; // server briefly unreachable: try again below
+  }
+  state.rerunPolling = false;
+  if (data) {
+    const pendingIds = new Set(data.requests.map((r) => r.req_id));
+    let finished = false;
+    for (const r of data.watched) {
+      if (r.status !== "done" && r.status !== "failed") continue;
+      finished = true;
+      showRerunNotice(r);
+      if (isCurrentObject(r.obj_id)) loadReprocess();
+    }
+    // watch what is pending now: whatever leaves the list is reported by the next poll
+    state.rerunWatch = new Map(data.requests.map((r) => [r.req_id, r]));
+    renderPendingReruns(data.requests, data.queue);
+    // the results table's RERUN markers follow any change of the pending set
+    const key = Array.from(pendingIds).sort((a, b) => a - b).join(",");
+    if (finished || (state.rerunKey !== null && key !== state.rerunKey)) doSearch();
+    state.rerunKey = key;
+    if (data.queue.queued + data.queue.running > 0) {
+      state.rerunPollTimer = setTimeout(pollPendingReruns, RERUN_POLL_MS);
+    }
+  } else if (state.rerunWatch.size > 0) {
+    state.rerunPollTimer = setTimeout(pollPendingReruns, RERUN_POLL_MS);
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -1583,6 +1973,7 @@ function init() {
     ev.preventDefault();
     state.offset = 0;
     doSearch();
+    pollPendingReruns();
   });
   $("btn-reset").addEventListener("click", resetFilters);
   $("btn-export-csv").addEventListener("click", exportCsv);
@@ -1620,7 +2011,14 @@ function init() {
   for (const id of ["phase-epoch-select", "phase-range-check", "phase-model-check"]) {
     $(id).addEventListener("change", plotPhase);
   }
+  $("lc-unit-select").addEventListener("change", () => {
+    replotLightcurve();
+    plotPhase();
+  });
   $("rerun-check").addEventListener("change", onRerunToggle);
+  $("btn-rerun-list").addEventListener("click", () => {
+    $("rerun-list").hidden = !$("rerun-list").hidden;
+  });
   $("btn-rp-submit").addEventListener("click", submitReprocess);
   $("btn-save-edit").addEventListener("click", saveEdit);
   $("btn-reset-exop-auto").addEventListener("click", resetExopAuto);
@@ -1629,6 +2027,7 @@ function init() {
 
   renderResultsHeader();
   doSearch();
+  pollPendingReruns();
 }
 
 document.addEventListener("DOMContentLoaded", init);

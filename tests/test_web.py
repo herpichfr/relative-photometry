@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+from importlib import resources
 
 import psycopg
 import pytest
@@ -1538,6 +1539,161 @@ def test_nothing_is_queued_by_edits_or_reads(client, test_conn) -> None:
     assert count == 0
 
 
+def _queue_three_requests(test_client, test_conn, ids) -> tuple[int, int, int]:
+    """obj_var: one done (older) and one running; obj_var2: one queued. Returns their req_ids."""
+    done = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess",
+        json={"entries": [_var_entry(ids["night1"], 1.1)]},
+    ).json()["requests"][0]["req_id"]
+    running = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess",
+        json={"entries": [_var_entry(ids["night1"], 1.3)]},
+    ).json()["requests"][0]["req_id"]
+    queued = test_client.post(
+        f"/api/object/{ids['obj_var2']}/reprocess",
+        json={"entries": [_var_entry(ids["night1"], 0.5)]},
+    ).json()["requests"][0]["req_id"]
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.reprocess_request SET status = 'done', finished_at = now(), "
+            "result = '{\"found\": true}' WHERE req_id = %s",
+            (done,),
+        )
+        cur.execute(
+            "UPDATE relphot.reprocess_request SET status = 'running', started_at = now() "
+            "WHERE req_id = %s",
+            (running,),
+        )
+    test_conn.commit()
+    return done, running, queued
+
+
+def test_search_reports_pending_and_last_rerun(client, test_conn) -> None:
+    test_client, ids = client
+    _queue_three_requests(test_client, test_conn, ids)
+
+    rows = test_client.get("/api/search", params={"limit": 100}).json()["rows"]
+    by_id = {r["obj_id"]: r for r in rows}
+    var = by_id[ids["obj_var"]]
+    assert var["n_rerun_pending"] == 1  # the done one does not count
+    assert var["last_rerun_status"] == "running"  # newest request of the object
+    assert var["last_rerun_finished_at"] is None
+    assert by_id[ids["obj_var2"]]["n_rerun_pending"] == 1
+    assert by_id[ids["obj_var2"]]["last_rerun_status"] == "queued"
+    for key in ("obj_unc", "obj_exop"):  # never re-run
+        row = by_id[ids[key]]
+        assert row["n_rerun_pending"] == 0
+        assert row["last_rerun_status"] is None and row["last_rerun_finished_at"] is None
+
+    # the newest request of obj_var finishes: nothing pending, the outcome is reported
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.reprocess_request SET status = 'failed', finished_at = now(), "
+            "error = 'boom' WHERE obj_id = %s AND status = 'running'",
+            (ids["obj_var"],),
+        )
+    test_conn.commit()
+    rows = test_client.get("/api/search", params={"limit": 100}).json()["rows"]
+    var = {r["obj_id"]: r for r in rows}[ids["obj_var"]]
+    assert var["n_rerun_pending"] == 0
+    assert var["last_rerun_status"] == "failed" and var["last_rerun_finished_at"] is not None
+
+
+def test_search_rerun_pending_filter_sort_and_csv(client, test_conn) -> None:
+    test_client, ids = client
+    _queue_three_requests(test_client, test_conn, ids)
+
+    pending = test_client.get("/api/search", params={"rerun_pending": "true"}).json()
+    assert {r["obj_id"] for r in pending["rows"]} == {ids["obj_var"], ids["obj_var2"]}
+    assert pending["total"] == 2
+    idle = test_client.get("/api/search", params={"rerun_pending": "false"}).json()
+    assert ids["obj_var"] not in {r["obj_id"] for r in idle["rows"]}
+    assert idle["total"] + pending["total"] == test_client.get("/api/search").json()["total"]
+
+    ordered = test_client.get(
+        "/api/search", params={"sort": "n_rerun_pending", "order": "desc", "limit": 2}
+    ).json()["rows"]
+    assert {r["obj_id"] for r in ordered} == {ids["obj_var"], ids["obj_var2"]}
+
+    csv_resp = test_client.get("/api/search.csv", params={"rerun_pending": "true"})
+    assert csv_resp.status_code == 200
+    header = csv_resp.text.splitlines()[0].split(",")
+    for col in ("n_rerun_pending", "last_rerun_status", "last_rerun_finished_at"):
+        assert col in header
+    assert len(csv_resp.text.splitlines()) == 3
+
+
+def test_list_reprocess_lists_pending_and_reports_watched_ones(client, test_conn) -> None:
+    test_client, ids = client
+    assert test_client.get("/api/reprocess").json() == {
+        "requests": [], "watched": [], "queue": {"queued": 0, "running": 0},
+    }
+    done, running, queued = _queue_three_requests(test_client, test_conn, ids)
+
+    data = test_client.get("/api/reprocess").json()
+    assert [r["req_id"] for r in data["requests"]] == [queued, running]  # newest first
+    assert data["watched"] == []
+    assert data["queue"] == {"queued": 1, "running": 1}
+    by_id = {r["req_id"]: r for r in data["requests"]}
+    assert by_id[queued]["obj_id"] == ids["obj_var2"] and by_id[queued]["obj_name"] == "RP VAR02"
+    assert by_id[queued]["status"] == "queued" and by_id[queued]["requests_ahead"] == 1
+    assert by_id[running]["obj_id"] == ids["obj_var"] and by_id[running]["status"] == "running"
+    assert by_id[running]["night_label"] == "20250101"
+
+    # a request the page had seen pending comes back whatever its status
+    data = test_client.get("/api/reprocess", params={"watch": [done, running, 999999]}).json()
+    assert [r["req_id"] for r in data["watched"]] == [running, done]  # the unknown id is absent
+    watched = {r["req_id"]: r for r in data["watched"]}
+    assert watched[done]["status"] == "done" and watched[done]["finished_at"] is not None
+    assert watched[done]["obj_name"] == "RP VAR01"
+    assert [r["req_id"] for r in data["requests"]] == [queued, running]
+
+    # other statuses can be listed too
+    data = test_client.get("/api/reprocess", params={"status": "done,failed"}).json()
+    assert [r["req_id"] for r in data["requests"]] == [done]
+    assert data["queue"] == {"queued": 1, "running": 1}
+    data = test_client.get("/api/reprocess", params={"limit": 1}).json()
+    assert [r["req_id"] for r in data["requests"]] == [queued]
+
+
+def test_list_reprocess_validates_its_input(client) -> None:
+    test_client, _ids = client
+    for status in ("bogus", "queued,bogus", ""):
+        assert test_client.get("/api/reprocess", params={"status": status}).status_code == 400
+    assert test_client.get("/api/reprocess", params={"limit": 0}).status_code == 422
+    assert test_client.get("/api/reprocess", params={"watch": "x"}).status_code == 422
+    assert test_client.get("/api/reprocess", params={"watch": list(range(101))}).status_code == 422
+    assert test_client.get("/api/reprocess", params={"watch": list(range(100))}).status_code == 200
+
+
+def test_rerun_status_endpoints_never_queue(client, test_conn) -> None:
+    test_client, ids = client
+    for params in ({}, {"rerun_pending": "true"}, {"rerun_pending": "false"},
+                   {"sort": "last_rerun_status"}):
+        assert test_client.get("/api/search", params=params).status_code == 200
+    assert test_client.get("/api/search.csv", params={"rerun_pending": "true"}).status_code == 200
+    assert test_client.get("/api/reprocess").status_code == 200
+    assert test_client.get("/api/reprocess", params={"watch": [1, 2, 3]}).status_code == 200
+    assert test_client.get(f"/api/object/{ids['obj_var']}/reprocess").status_code == 200
+    test_conn.rollback()
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM relphot.reprocess_request")
+        assert cur.fetchone()[0] == 0
+
+
+def test_front_end_element_ids_exist() -> None:
+    """Every id app.js looks up (``$("id")``) is in index.html (or its rerun template)."""
+    static = resources.files("relphot.web") / "static"
+    html = (static / "index.html").read_text()
+    js = (static / "app.js").read_text()
+    html_ids = set(re.findall(r'\bid="([\w-]+)"', html))
+    used = set(re.findall(r'\$\("([\w-]+)"\)', js))
+    assert used - html_ids == set()
+    for new_id in ("detail-obj-id", "rerun-badge", "rerun-global", "btn-rerun-list",
+                   "rerun-list", "rerun-notices", "filter-rerun-pending", "rerun-heading"):
+        assert new_id in html_ids
+
+
 def _insert_guided_estimate(test_conn, obj_id: int, **kw) -> int:
     values = {
         "method": "LS-guided", "input": "tied", "night_ids": [1, 2], "n_nights": 2,
@@ -1554,6 +1710,112 @@ def _insert_guided_estimate(test_conn, obj_id: int, **kw) -> int:
         est_id = cur.fetchone()[0]
     test_conn.commit()
     return est_id
+
+
+def _set_night_zp(test_conn, night_id: int, zp: float, source: str) -> None:
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.night SET zp = %s, zp_source = %s WHERE night_id = %s",
+            (zp, source, night_id),
+        )
+    test_conn.commit()
+
+
+def _mean_star_mag(test_conn, obj_id: int) -> tuple[float, float]:
+    """(mean of star_night.mag over all nights, mag of the first night) of one object."""
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT avg(mag), (array_agg(mag ORDER BY night_id))[1] FROM relphot.star_night "
+            "WHERE obj_id = %s",
+            (obj_id,),
+        )
+        return cur.fetchone()
+
+
+def test_apparent_mean_mag_assumes_a_20_mag_zero_point_by_default(client, test_conn) -> None:
+    test_client, ids = client
+    mean_mag, _first = _mean_star_mag(test_conn, ids["obj_var"])
+    assert mean_mag is not None
+    row = {r["obj_id"]: r for r in test_client.get("/api/search").json()["rows"]}[ids["obj_var"]]
+    assert row["mean_mag_app"] == pytest.approx(mean_mag + 20.0, abs=1e-4)
+    assert row["mag_zp_source"] == "assumed"
+    assert row["mean_mag"] == 14.0  # the instrumental column is untouched
+    detail = test_client.get(f"/api/object/{ids['obj_var']}").json()
+    assert detail["object"]["mean_mag_app"] == pytest.approx(mean_mag + 20.0, abs=1e-4)
+    assert detail["object"]["mag_zp_source"] == "assumed"
+    assert detail["object"]["mean_mag"] == 14.0
+    assert {(n["zp"], n["zp_source"]) for n in detail["nights"]} == {(20.0, "assumed")}
+    assert all(n["mag_app"] == pytest.approx(n["mag"] + 20.0) for n in detail["nights"])
+    assert "mean_mag_app" in test_client.get("/api/search.csv").text.splitlines()[0].split(",")
+
+
+def test_apparent_mean_mag_uses_the_gaia_zero_point_of_calibrated_nights(client, test_conn) -> None:
+    test_client, ids = client
+    _set_night_zp(test_conn, ids["night1"], 24.5, "gaia")
+
+    def row_of(key: str) -> dict:
+        rows = test_client.get("/api/search").json()["rows"]
+        return {r["obj_id"]: r for r in rows}[ids[key]]
+
+    # obj_var has both nights: one calibrated, one assumed -> mixed, mean of both
+    mean_mag, _ = _mean_star_mag(test_conn, ids["obj_var"])
+    var = row_of("obj_var")
+    assert var["mag_zp_source"] == "mixed"
+    assert var["mean_mag_app"] == pytest.approx(mean_mag + 0.5 * (24.5 + 20.0), abs=1e-4)
+    # obj_unc has night 1 only: purely Gaia
+    unc_mag, _ = _mean_star_mag(test_conn, ids["obj_unc"])
+    unc = row_of("obj_unc")
+    assert unc["mag_zp_source"] == "gaia"
+    assert unc["mean_mag_app"] == pytest.approx(unc_mag + 24.5, abs=1e-4)
+    # sorting on the derived column works
+    ordered = test_client.get("/api/search", params={"sort": "mean_mag_app"}).json()["rows"]
+    values = [r["mean_mag_app"] for r in ordered if r["mean_mag_app"] is not None]
+    assert values == sorted(values)
+
+
+def test_lc_payloads_carry_the_zero_point_for_magnitudes(client, test_conn) -> None:
+    test_client, ids = client
+    _set_night_zp(test_conn, ids["night1"], 24.5, "gaia")
+    _mean, first_mag = _mean_star_mag(test_conn, ids["obj_var"])
+
+    lc = test_client.get(
+        f"/api/object/{ids['obj_var']}/lc", params={"night_id": ids["night1"]}
+    ).json()
+    assert lc["zp"] == 24.5 and lc["zp_source"] == "gaia"
+    assert lc["app_mag"] == pytest.approx(first_mag + 24.5, abs=1e-3)
+    lc2 = test_client.get(
+        f"/api/object/{ids['obj_var']}/lc", params={"night_id": ids["night2"]}
+    ).json()
+    assert lc2["zp"] == 20.0 and lc2["zp_source"] == "assumed"
+
+    # tied: the anchor night (20250101, calibrated) sets the zero point of the tied magnitudes
+    tied = test_client.get(f"/api/object/{ids['obj_var']}/lc/combined").json()
+    assert tied["mode"] == "tied-mag"
+    assert tied["zp"] == 24.5 and tied["zp_source"] == "gaia"
+    assert len(tied["app_mag"]) == len(tied["value"])
+    phase = test_client.get(f"/api/object/{ids['obj_var']}/phase").json()
+    assert phase["zp"] == 24.5 and phase["zp_source"] == "gaia"
+
+    # untied: every point carries its night's apparent mean magnitude, sources summed up
+    untied = test_client.get(f"/api/object/{ids['obj_var2']}/lc/combined").json()
+    assert untied["mode"] == "night-normalised"
+    assert untied["zp"] is None and untied["zp_source"] == "mixed"
+    by_night = {}
+    for nid, app in zip(untied["night_id"], untied["app_mag"], strict=True):
+        by_night.setdefault(nid, set()).add(app)
+    assert {n: len(v) for n, v in by_night.items()} == {ids["night1"]: 1, ids["night2"]: 1}
+    assert all(v is not None for s in by_night.values() for v in s)
+    phase = test_client.get(f"/api/object/{ids['obj_var2']}/phase").json()
+    assert phase["zp"] is None and phase["zp_source"] == "mixed"
+    assert phase["app_mag"] == untied["app_mag"]  # the untied phase diagram can draw magnitudes
+
+
+def test_front_end_names_the_apparent_magnitude_and_its_zero_point() -> None:
+    static = resources.files("relphot.web") / "static"
+    js = (static / "app.js").read_text()
+    html = (static / "index.html").read_text()
+    for name in ("mean_mag_app", "mag_zp_source", "zpText", "lc-unit-select"):
+        assert name in js or name in html
 
 
 def test_adopt_period_sets_a_manual_period_with_its_error(client, test_conn) -> None:

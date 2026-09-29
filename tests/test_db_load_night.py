@@ -292,6 +292,45 @@ def test_load_night_counts_and_noise_cut(test_conn, tmp_path) -> None:
     }
 
 
+def _set_frame_zps(root: Path, zps: list) -> None:
+    """Give each frame of a written night a Gaia zero point (``None`` = not calibrated)."""
+    with np.load(root / "night.npz", allow_pickle=False) as data:
+        frame_meta = json.loads(str(data["frame_meta_json"]))
+        config_json = str(data["config_json"])
+    for m, zp in zip(frame_meta, zps, strict=True):
+        m["zp"] = zp
+    np.savez(root / "night.npz", frame_meta_json=json.dumps(frame_meta), config_json=config_json)
+
+
+def _night_zp(conn, night_id: int) -> tuple:
+    with conn.cursor() as cur:
+        cur.execute("SELECT zp, zp_source FROM relphot.night WHERE night_id = %s", (night_id,))
+        return cur.fetchone()
+
+
+def test_load_night_zero_point_is_assumed_without_a_calibration(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    assert _night_zp(test_conn, report.night_id) == (20.0, "assumed")
+
+
+def test_load_night_zero_point_is_the_median_of_the_calibrated_kept_frames(
+    test_conn, tmp_path
+) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    # frame 4 is not kept (its 24.9 must not count); 3 of the 4 kept frames are calibrated
+    _set_frame_zps(root, [24.1, 24.3, 24.2, None, 24.9])
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    assert _night_zp(test_conn, report.night_id) == (pytest.approx(24.2), "gaia")
+
+    # a reload re-reads the frames: too few calibrated (1 of 4 kept) -> assumed again
+    _set_frame_zps(root, [24.1, None, None, None, 24.9])
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    assert _night_zp(test_conn, report.night_id) == (20.0, "assumed")
+
+
 def test_load_night_frames(test_conn, tmp_path) -> None:
     root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
     _write_night1(root)

@@ -15,6 +15,10 @@ body {
 .app-header {
     padding: 1rem 0;
     border-bottom: 1px solid #ddd;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
 }
 
 .app-header h1 {
@@ -250,4 +254,121 @@ tbody tr.needs-review:hover {
 #detail-night-reviews input[type="text"] {
     width: 16rem;
     max-width: 100%;
+}
+
+/* the object loaded in the detail panel */
+tbody tr.current-object {
+    background: #dbe9fb;
+}
+
+tbody tr.current-object:hover {
+    background: #cfe1f8;
+}
+
+tbody tr.current-object td:first-child {
+    border-left: 3px solid #2b6cb0;
+}
+
+.obj-id {
+    font-weight: normal;
+    font-size: 0.9em;
+    color: #555;
+}
+
+/* RERUN status: queued/running, done, failed (results table, detail header, top bar) */
+.rerun-badge {
+    display: inline-block;
+    max-width: 32rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
+    padding: 0.1rem 0.5rem;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: bold;
+    text-decoration: none;
+}
+
+td .rerun-badge {
+    margin-left: 0.4rem;
+}
+
+.rerun-badge.pending {
+    background: #fff4d6;
+    color: #7a5200;
+    border-color: #e0b84d;
+}
+
+.rerun-badge.done {
+    background: #e3f4e6;
+    color: #1b6b2c;
+    border-color: #8ccf9b;
+}
+
+.rerun-badge.failed {
+    background: #fde7ea;
+    color: #b00020;
+    border-color: #e59aa5;
+}
+
+button.rerun-badge.pending:hover {
+    background: #ffecb3;
+}
+
+#rerun-global {
+    position: relative;
+}
+
+#rerun-list {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 900;
+    min-width: 16rem;
+    padding: 0.4rem 0.6rem;
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+#rerun-list a {
+    display: block;
+    padding: 0.15rem 0;
+    color: #2b6cb0;
+    white-space: nowrap;
+}
+
+/* non-blocking "RERUN finished" notices */
+#rerun-notices {
+    position: fixed;
+    top: 0.75rem;
+    right: 0.75rem;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-width: 28rem;
+}
+
+.rerun-notice {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.5rem 0.75rem;
+    background: white;
+    border: 1px solid #ddd;
+    border-left: 4px solid #2b6cb0;
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.rerun-notice.done {
+    border-left-color: #1b6b2c;
+}
+
+.rerun-notice.failed {
+    border-left-color: #b00020;
 }

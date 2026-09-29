@@ -94,9 +94,38 @@ _SEARCH_COLUMNS = [
     "mean_mag", "n_nights", "best_snr", "depth", "duration_h", "duration_lower_limit",
     "amplitude", "status", "first_night", "last_night", "n_review_pending", "n_nights_reviewed",
 ]
+
+
+def _app_mag_sql(obj_ref: str) -> tuple[str, str]:
+    """Correlated subqueries for an object's apparent mean magnitude and where it comes from.
+
+    relphot's instrumental magnitude plus the night's zero point (``night.zp``: the Gaia
+    calibration of the frame headers where they carry one, else the assumed 20 mag), averaged
+    over the object's nights like ``object.mean_mag``. The source is ``'gaia'``,
+    ``'assumed'`` or ``'mixed'`` (nights of both kinds). ``obj_ref`` is ``o.obj_id`` or a
+    ``%s`` placeholder.
+    """
+    body = (
+        "FROM relphot.star_night zs JOIN relphot.night zn ON zn.night_id = zs.night_id "
+        f"WHERE zs.obj_id = {obj_ref} AND zs.mag IS NOT NULL)"
+    )
+    mean = f"(SELECT avg(zs.mag + zn.zp) {body}"
+    source = (
+        "(SELECT CASE WHEN bool_and(zn.zp_source = 'gaia') THEN 'gaia' "
+        "WHEN bool_or(zn.zp_source = 'gaia') THEN 'mixed' "
+        f"WHEN count(*) > 0 THEN 'assumed' END {body}"
+    )
+    return mean, source
+
+
+_MEAN_MAG_APP_SQL, _MAG_ZP_SOURCE_SQL = _app_mag_sql("o.obj_id")
+
 #: Result columns computed per object: transit-event count, best "matching transits"
-#: probability, and the latest period verification (delta = P_obs/harmonic - P_lit, with
-#: the status and note saying whether/why it could be verified).
+#: probability, the latest period verification (delta = P_obs/harmonic - P_lit, with
+#: the status and note saying whether/why it could be verified), the apparent mean magnitude
+#: and its zero-point source, and the RERUN requests (how many are still queued/running, and
+#: the status/finish time of the newest one; correlated subqueries on
+#: ``reprocess_request_obj_idx (obj_id, requested_at)``).
 _SEARCH_DERIVED_SQL = {
     "n_transit_events": (
         "(SELECT count(*) FROM relphot.detection d "
@@ -109,6 +138,20 @@ _SEARCH_DERIVED_SQL = {
     "period_delta_err": "pv.delta_err",
     "period_verify_status": "pv.verify_status",
     "period_verify_note": "pv.verify_note",
+    "mean_mag_app": _MEAN_MAG_APP_SQL,
+    "mag_zp_source": _MAG_ZP_SOURCE_SQL,
+    "n_rerun_pending": (
+        "(SELECT count(*) FROM relphot.reprocess_request rr "
+        "WHERE rr.obj_id = o.obj_id AND rr.status IN ('queued', 'running'))"
+    ),
+    "last_rerun_status": (
+        "(SELECT rr.status FROM relphot.reprocess_request rr WHERE rr.obj_id = o.obj_id "
+        "ORDER BY rr.requested_at DESC, rr.req_id DESC LIMIT 1)"
+    ),
+    "last_rerun_finished_at": (
+        "(SELECT rr.finished_at FROM relphot.reprocess_request rr WHERE rr.obj_id = o.obj_id "
+        "ORDER BY rr.requested_at DESC, rr.req_id DESC LIMIT 1)"
+    ),
 }
 _SEARCH_JOINS = (
     " LEFT JOIN LATERAL (SELECT pe.delta, pe.delta_err, pe.verify_status, pe.verify_note "
@@ -141,6 +184,9 @@ def _search_filters(
     status: str | None = Query(default=None),
     needs_review: bool | None = Query(default=None),
     user_reviewed: bool | None = Query(default=None),
+    rerun_pending: bool | None = Query(
+        default=None, description="objects with a RERUN request still queued or running"
+    ),
     telescope: str | None = Query(default=None),
     name: str | None = Query(default=None),
     gaia_id: str | None = Query(default=None),
@@ -165,6 +211,7 @@ def _search_filters(
         "class_": class_, "is_exop": is_exop, "is_var": is_var, "min_p_match": min_p_match,
         "known": known, "source_db": source_db, "status": status,
         "needs_review": needs_review, "user_reviewed": user_reviewed,
+        "rerun_pending": rerun_pending,
         "telescope": telescope, "name": name, "gaia_id": gaia_id, "ra": ra, "dec": dec,
         "radius": radius, "mag_min": mag_min, "mag_max": mag_max, "period_min": period_min,
         "period_max": period_max, "snr_min": snr_min, "depth_min": depth_min,
@@ -215,6 +262,12 @@ def _build_where(f: dict) -> tuple[str, dict[str, object]]:
             clauses.append("o.n_nights_reviewed > 0")
         else:
             clauses.append("o.n_nights_reviewed = 0")
+    if f["rerun_pending"] is not None:
+        pending = (
+            "EXISTS (SELECT 1 FROM relphot.reprocess_request rr WHERE rr.obj_id = o.obj_id "
+            "AND rr.status IN ('queued', 'running'))"
+        )
+        clauses.append(pending if f["rerun_pending"] else f"NOT {pending}")
     if f["telescope"]:
         clauses.append(
             "EXISTS (SELECT 1 FROM relphot.star_night sn "
@@ -439,6 +492,9 @@ def object_detail(obj_id: int):
             obj["duration_display"] = _fmt_duration(
                 obj["duration_h"], obj["duration_lower_limit"]
             )
+            mean_app_sql, zp_source_sql = _app_mag_sql("%s")
+            cur.execute(f"SELECT {mean_app_sql}, {zp_source_sql}", (obj_id, obj_id))
+            obj["mean_mag_app"], obj["mag_zp_source"] = cur.fetchone()
 
             cur.execute(
                 "SELECT catalog, name, type, period, period_err, sep_arcsec, reference "
@@ -471,6 +527,7 @@ def object_detail(obj_id: int):
             cur.execute(
                 "SELECT sn.night_id, n.label, n.telescope, n.night_date, sn.n_epochs, sn.rms, "
                 "sn.expected_noise, sn.mag, sn.best_aperture, sn.err_scale, sn.blended, "
+                "n.zp, n.zp_source, sn.mag + n.zp AS mag_app, "
                 "(lc.obj_id IS NOT NULL) AS has_lc, "
                 "r.exop_verdict AS review_exop, r.var_verdict AS review_var, "
                 "r.note AS review_note, r.updated_at AS review_updated_at "
@@ -615,9 +672,13 @@ def object_lc(obj_id: int, night_id: int):
             raise HTTPException(status_code=404, detail="no light curve for this object/night")
         frame_index, bjd_tdb, flux, flux_err, flux_raw = row
 
-        cur.execute("SELECT label FROM relphot.night WHERE night_id = %s", (night_id,))
-        night_row = cur.fetchone()
-        night_label = night_row[0] if night_row else None
+        cur.execute(
+            "SELECT n.label, n.zp, n.zp_source, sn.mag + n.zp FROM relphot.night n "
+            "LEFT JOIN relphot.star_night sn ON sn.night_id = n.night_id AND sn.obj_id = %s "
+            "WHERE n.night_id = %s",
+            (obj_id, night_id),
+        )
+        night_label, zp, zp_source, app_mag = cur.fetchone() or (None, None, None, None)
 
         cur.execute(
             "SELECT frame_index, file_name, airmass FROM relphot.frame "
@@ -639,6 +700,9 @@ def object_lc(obj_id: int, night_id: int):
             "file_name": file_name,
             "airmass": airmass,
             "night_label": night_label,
+            "zp": zp,
+            "zp_source": zp_source,
+            "app_mag": None if app_mag is None else round(app_mag, 4),
         }
     )
 
@@ -650,7 +714,10 @@ def _combined_lc(cur, obj_id: int) -> dict:
     night's flux is put on that night's tied magnitude; nights the run does not tie are left
     out), else ``'night-normalised'`` (each night divided by its own median: the nights are
     NOT tied). ``value_err`` is the photometric error alone, ``tie_err`` (``None`` untied) the
-    night's tie error. Raises a 404 for an unknown object.
+    night's tie error. ``app_mag`` is each point's night's apparent mean magnitude (``None`` if
+    unknown); tied, ``zp`` (``zp_source``) is the zero point that turns the tied magnitudes
+    into apparent ones (the anchor night's: the tie puts every night on its scale), untied
+    ``zp_source`` sums up the nights' zero points. Raises a 404 for an unknown object.
     """
     cur.execute("SELECT 1 FROM relphot.object WHERE obj_id = %s", (obj_id,))
     if cur.fetchone() is None:
@@ -683,9 +750,22 @@ def _combined_lc(cur, obj_id: int) -> dict:
         )
         tie_rows = [(r[0], None, None) for r in cur.fetchall()]
 
+    zp = zp_source = None
+    if mode == "tied-mag":
+        cur.execute(
+            "SELECT n.zp, n.zp_source FROM relphot.tie t "
+            "JOIN relphot.night n ON n.night_id = t.night_id "
+            "JOIN relphot.mn_run mr ON mr.mn_run_id = t.mn_run_id "
+            "WHERE t.mn_run_id = %s AND t.obj_id = %s "
+            "ORDER BY (n.label = mr.anchor) DESC, n.night_date LIMIT 1",
+            (mn_run_id, obj_id),
+        )
+        zp, zp_source = cur.fetchone()
+    sources: set[str] = set()
     out: dict = {
         "mode": mode, "bjd_tdb": [], "value": [], "value_err": [], "tie_err": [],
-        "night_id": [], "night_label": [], "file_name": [],
+        "night_id": [], "night_label": [], "file_name": [], "app_mag": [],
+        "zp": zp, "zp_source": zp_source,
     }
     for night_id, tie_mag, tie_mag_err in tie_rows:
         if mode == "tied-mag" and tie_mag is None:
@@ -700,8 +780,14 @@ def _combined_lc(cur, obj_id: int) -> dict:
             continue
         frame_index, night_bjd, night_flux, night_flux_err = lc_row
 
-        cur.execute("SELECT label FROM relphot.night WHERE night_id = %s", (night_id,))
-        (night_label,) = cur.fetchone()
+        cur.execute(
+            "SELECT n.label, n.zp_source, sn.mag + n.zp FROM relphot.night n "
+            "LEFT JOIN relphot.star_night sn ON sn.night_id = n.night_id AND sn.obj_id = %s "
+            "WHERE n.night_id = %s",
+            (obj_id, night_id),
+        )
+        night_label, night_zp_source, night_app_mag = cur.fetchone()
+        sources.add(night_zp_source)
 
         cur.execute(
             "SELECT frame_index, file_name FROM relphot.frame "
@@ -729,6 +815,9 @@ def _combined_lc(cur, obj_id: int) -> dict:
         out["night_id"].extend([night_id] * n)
         out["night_label"].extend([night_label] * n)
         out["file_name"].extend(fname_map.get(i) for i in frame_index)
+        out["app_mag"].extend([None if night_app_mag is None else round(night_app_mag, 4)] * n)
+    if mode != "tied-mag" and sources:
+        out["zp_source"] = sources.pop() if len(sources) == 1 else "mixed"
     return out
 
 
@@ -841,6 +930,7 @@ def object_phase(obj_id: int, period: float | None = Query(default=None, gt=0)):
     return _json({
         "mode": data["mode"], "tied": tied,
         "label": "tie-calibrated magnitudes" if tied else "untied: per-night normalised flux",
+        "zp": data["zp"], "zp_source": data["zp_source"], "app_mag": data["app_mag"],
         "bjd_tdb": data["bjd_tdb"], "value": data["value"], "value_err": value_err.tolist(),
         "night_id": data["night_id"], "night_label": data["night_label"],
         "file_name": data["file_name"],
@@ -1456,12 +1546,63 @@ def get_reprocess(obj_id: int):
             (obj_id,),
         )
         requests = _rows_to_dicts(cur, cur.fetchall())
-        cur.execute(
-            "SELECT status, count(*) FROM relphot.reprocess_request "
-            "WHERE status IN ('queued', 'running') GROUP BY status"
-        )
-        queue = {"queued": 0, "running": 0, **dict(cur.fetchall())}
+        queue = _queue_depth(cur)
     return _json({"requests": requests, "queue": queue})
+
+
+def _queue_depth(cur) -> dict[str, int]:
+    """Number of queued and running reprocess requests of all objects."""
+    cur.execute(
+        "SELECT status, count(*) FROM relphot.reprocess_request "
+        "WHERE status IN ('queued', 'running') GROUP BY status"
+    )
+    return {"queued": 0, "running": 0, **dict(cur.fetchall())}
+
+
+_REPROCESS_STATUSES = {"queued", "running", "done", "failed"}
+_MAX_WATCH = 100
+
+
+@app.get("/api/reprocess")
+def list_reprocess(
+    status: str = Query(
+        default="queued,running", description="comma-separated request statuses to list"
+    ),
+    watch: list[int] | None = Query(  # noqa: B008
+        default=None, max_length=_MAX_WATCH,
+        description="req_ids to report whatever their status (how the page sees one finish)",
+    ),
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    """Reprocess requests of all objects, newest first: those with one of ``status``
+    (default: still queued or running), the ``watch``-ed ones whatever their status, and
+    the global queue depth.
+
+    The page polls this while it knows of pending requests; a request it had seen pending
+    that comes back ``done``/``failed`` under ``watched`` is a finished RERUN (``finished_at``
+    is the worker transaction's start, so a timestamp cannot tell). Read-only.
+    """
+    wanted = sorted({s for s in status.split(",") if s})
+    invalid = sorted(set(wanted) - _REPROCESS_STATUSES)
+    if invalid or not wanted:
+        raise HTTPException(status_code=400, detail=f"invalid status: {invalid or status!r}")
+    select = (
+        f"SELECT r.obj_id, o.name AS obj_name, {_REPROCESS_COLUMNS} "
+        "FROM relphot.reprocess_request r JOIN relphot.object o ON o.obj_id = r.obj_id "
+        "LEFT JOIN relphot.night n ON n.night_id = r.night_id "
+    )
+    newest_first = "ORDER BY r.requested_at DESC, r.req_id DESC"
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"{select}WHERE r.status = ANY(%s) {newest_first} LIMIT %s", (wanted, limit)
+        )
+        requests = _rows_to_dicts(cur, cur.fetchall())
+        watched: list[dict] = []
+        if watch:
+            cur.execute(f"{select}WHERE r.req_id = ANY(%s) {newest_first}", (list(watch),))
+            watched = _rows_to_dicts(cur, cur.fetchall())
+        queue = _queue_depth(cur)
+    return _json({"requests": requests, "watched": watched, "queue": queue})
 
 
 class AdoptPeriodBody(BaseModel):

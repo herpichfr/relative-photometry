@@ -127,6 +127,7 @@ def load_night(path: Path | str) -> tuple[MatchedNight, Settings]:
             naxis1=d.get("naxis1", 0),
             naxis2=d.get("naxis2", 0),
             telescope=d.get("telescope", ""),
+            zp=d.get("zp"),
         )
         for d in frame_meta_raw
     ]

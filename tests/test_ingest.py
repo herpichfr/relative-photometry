@@ -6,10 +6,12 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
+from relphot import ingest
 from relphot.config import Settings
 from relphot.exceptions import IngestError
 from relphot.ingest import (
     _compute_times,
+    _gaia_zero_point,
     _site_from_header,
     read_catalog,
     read_catalogs,
@@ -177,6 +179,27 @@ def test_latitude_longitud_take_precedence_over_sitelat_sitelong() -> None:
     np.testing.assert_allclose(site.height.to("m").value, 1850.0, atol=1e-3)
 
 
+def test_gaia_zero_point_needs_a_valid_calibrated_zpabs() -> None:
+    header = fits.Header()
+    assert _gaia_zero_point(header) is None  # a frame without any calibration
+    header["ZPABS"] = 24.31
+    assert _gaia_zero_point(header) is None  # no ZPABSCAL
+    header["ZPABSCAL"] = False  # RMS above the limit: ZPABS is there but not trusted
+    assert _gaia_zero_point(header) is None
+    header["ZPABSCAL"] = True
+    assert _gaia_zero_point(header) == pytest.approx(24.31)
+    header["ZPABS"] = "NONE"  # what robo43 writes when no zero point was fitted
+    assert _gaia_zero_point(header) is None
+    header["ZPABS"] = "nan"  # FITS cannot hold a NaN number, but a string can spell one
+    assert _gaia_zero_point(header) is None
+
+
+def test_read_catalogs_carry_no_zero_point_from_uncalibrated_frames(fits_files, csv_files) -> None:
+    settings = Settings()
+    assert read_fits_catalog(fits_files[0], settings).meta.zp is None
+    assert read_csv_catalog(csv_files[0], settings).meta.zp is None
+
+
 def test_read_fits_catalog_sets_naxis_and_telescope(fits_files) -> None:
     """read_fits_catalog reads NAXIS1/NAXIS2/TELESCOP from header."""
     settings = Settings()
@@ -197,3 +220,13 @@ def test_read_csv_catalog_sets_naxis_and_telescope(csv_files) -> None:
     assert isinstance(fc.meta.naxis1, int)
     assert isinstance(fc.meta.naxis2, int)
     assert isinstance(fc.meta.telescope, str)
+
+
+def test_finite_position_rows_drops_nan_rows(caplog) -> None:
+    ra = np.array([10.0, np.nan, 12.0])
+    dec = np.array([-70.0, np.nan, np.inf])
+    with caplog.at_level("WARNING"):
+        keep = ingest._finite_position_rows(ra, dec, "cat.fits")
+    assert keep.tolist() == [True, False, False]
+    assert "dropping 2 catalogue row(s)" in caplog.text
+    assert ingest._finite_position_rows(ra[:1], dec[:1], "cat.fits") is None

@@ -79,6 +79,9 @@ class FrameMeta:
     naxis2: int = 0
     #: Telescope name (TELESCOP header), empty string if unknown.
     telescope: str = ""
+    #: Gaia-calibrated absolute zero point of the frame (``ZPABS``, mag; ``m = zp -
+    #: 2.5 log10(counts per exposure)``), ``None`` unless the header marks it valid.
+    zp: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         """This metadata as a plain, JSON-serialisable dict (drops ``wcs``)."""
@@ -97,6 +100,7 @@ class FrameMeta:
             "naxis1": self.naxis1,
             "naxis2": self.naxis2,
             "telescope": self.telescope,
+            "zp": self.zp,
         }
 
 
@@ -201,6 +205,22 @@ def _site_from_header(header: fits.Header, settings: Settings) -> EarthLocation 
     return EarthLocation.from_geodetic(lon=lon, lat=lat, height=elev)
 
 
+def _gaia_zero_point(header: fits.Header) -> float | None:
+    """The frame's Gaia-calibrated zero point (robo43 ``ZPABS``, mag), or ``None``.
+
+    Valid only when ``ZPABSCAL`` is true and ``ZPABS`` is a finite number (robo43 writes
+    ``"NONE"`` when the fit failed). ``m = ZPABS - 2.5 log10(counts per exposure)``, the
+    convention of the ``flux`` relphot reads, so relphot's magnitude plus ``ZPABS`` is apparent.
+    """
+    if header.get("ZPABSCAL") is not True:
+        return None
+    try:
+        zp = float(header.get("ZPABS"))
+    except (TypeError, ValueError):
+        return None
+    return zp if np.isfinite(zp) else None
+
+
 def _naxis(header: fits.Header, wcs: WCS | None) -> tuple[float, float] | None:
     """Frame size (NAXIS1, NAXIS2) from the header, or from ``wcs.pixel_shape``."""
     n1 = header.get("NAXIS1")
@@ -287,6 +307,25 @@ def _scalar_columns(table: Table, columns: ColumnMap, source: str) -> _ScalarCol
     return ra, dec, x, y, flags, snr, fwhm, background
 
 
+def _finite_position_rows(
+    ra: np.ndarray, dec: np.ndarray, source: str
+) -> np.ndarray | None:
+    """Row mask of catalogue entries with a finite RA and Dec, or ``None`` if all are finite.
+
+    robo43 can write a row that is NaN throughout (e.g. FLAGS 32); it has no position to match
+    on and would break the cross-match tree, so it is dropped here with a warning.
+    """
+    keep = np.isfinite(ra) & np.isfinite(dec)
+    if keep.all():
+        return None
+    logger.warning(
+        "%s: dropping %d catalogue row(s) with a non-finite RA/Dec",
+        source,
+        int((~keep).sum()),
+    )
+    return keep
+
+
 def read_fits_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
     """Read the robo43 MEF ``*_proc.fits`` catalogue.
 
@@ -313,6 +352,11 @@ def read_fits_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
     flux = _as_vector(np.asarray(table[columns.flux], dtype=np.float32))
     fluxerr = _as_vector(np.asarray(table[columns.fluxerr], dtype=np.float32))
     ra, dec, x, y, flags, snr, fwhm, background = _scalar_columns(table, columns, str(path))
+    keep = _finite_position_rows(ra, dec, str(path))
+    if keep is not None:
+        ra, dec, x, y, flags, snr, fwhm, background, flux, fluxerr = (
+            a[keep] for a in (ra, dec, x, y, flags, snr, fwhm, background, flux, fluxerr)
+        )
 
     try:
         wcs = WCS(header, relax=True)
@@ -339,6 +383,7 @@ def read_fits_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
         naxis1=naxis1,
         naxis2=naxis2,
         telescope=telescope,
+        zp=_gaia_zero_point(header),
     )
     return FrameCatalog(
         meta=meta, ra=ra, dec=dec, x=x, y=y, flux=flux, fluxerr=fluxerr,
@@ -384,6 +429,11 @@ def read_csv_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
     flux = np.column_stack([np.asarray(table[c], dtype=np.float32) for c in flux_cols])
     fluxerr = np.column_stack([np.asarray(table[c], dtype=np.float32) for c in fluxerr_cols])
     ra, dec, x, y, flags, snr, fwhm, background = _scalar_columns(table, columns, str(path))
+    keep = _finite_position_rows(ra, dec, str(path))
+    if keep is not None:
+        ra, dec, x, y, flags, snr, fwhm, background, flux, fluxerr = (
+            a[keep] for a in (ra, dec, x, y, flags, snr, fwhm, background, flux, fluxerr)
+        )
 
     companion = _companion_fits(path)
     if companion is None:
@@ -428,6 +478,7 @@ def read_csv_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
         naxis1=naxis1,
         naxis2=naxis2,
         telescope=telescope,
+        zp=_gaia_zero_point(header),
     )
     return FrameCatalog(
         meta=meta, ra=ra, dec=dec, x=x, y=y, flux=flux, fluxerr=fluxerr,

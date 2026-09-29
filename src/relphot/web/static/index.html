@@ -10,7 +10,13 @@
 <body>
 <header class="app-header">
   <h1>relphot results database</h1>
+  <div id="rerun-global" hidden>
+    <button type="button" id="btn-rerun-list" class="rerun-badge pending"
+            title="RERUN requests of all objects still queued or running; click for the list"></button>
+    <div id="rerun-list" hidden></div>
+  </div>
 </header>
+<div id="rerun-notices"></div>
 
 <main>
   <section id="search-panel" class="panel">
@@ -56,6 +62,18 @@
           <label>Reviewed by you
             <select id="filter-user-reviewed" name="user_reviewed"
                     title="objects with at least one night carrying a verdict, a note or a decided event">
+              <option value="">any</option>
+              <option value="true">yes</option>
+              <option value="false">no</option>
+            </select>
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>RERUN</legend>
+          <label>Pending
+            <select id="filter-rerun-pending" name="rerun_pending"
+                    title="objects with a RERUN request still queued or running">
               <option value="">any</option>
               <option value="true">yes</option>
               <option value="false">no</option>
@@ -208,7 +226,8 @@
   </section>
 
   <section id="detail-panel" class="panel" hidden>
-    <h2>Object detail</h2>
+    <h2>Object detail <span id="detail-obj-id" class="obj-id"></span>
+      <a id="rerun-badge" class="rerun-badge" href="#rerun-heading" hidden></a></h2>
 
     <div class="detail-grid">
       <div>
@@ -325,6 +344,15 @@
 
     <h3>Light curves</h3>
     <div id="night-buttons" class="button-row"></div>
+    <div class="button-row">
+      <label>Y axis
+        <select id="lc-unit-select"
+                title="apparent magnitude = the night's mean magnitude + its zero point (Gaia calibration where the frames have one, else 20 mag assumed) + the curve's change in magnitude">
+          <option value="mag" selected>apparent magnitude</option>
+          <option value="flux">relative flux</option>
+        </select>
+      </label>
+    </div>
     <div id="plot-lightcurve" class="plot"></div>
 
     <div id="phase-section">
@@ -353,13 +381,17 @@
       <div id="plot-phase" class="plot"></div>
     </div>
 
-    <h3>Re-run (on demand)</h3>
+    <h3 id="rerun-heading">Re-run (on demand)</h3>
     <div class="note">Nothing is re-run unless you tick RERUN, fill an entry and press the run button.
       Per night tick EXOP (transit centre + width: trapezoid fit, adds a user event; search events are
       never touched) and/or VAR (period guess: adds an LS-guided estimate; PERIOD changes only if you
       adopt it). "All nights rerun" uses every night of the object; unticked, the period search uses
       only the chosen night. Clicking the light curve fills the transit centre of the entry you last
-      edited. The worker (<code>relphot db reprocess --watch</code>) works the queue off.</div>
+      edited. While RERUN is ticked, dragging horizontally on the light curve selects a span instead
+      of zooming (the mode bar's zoom button brings zooming back): for an EXOP entry it fills the
+      transit centre (the midpoint) and the width in hours, for a VAR-only entry the period guess
+      (the span in days -- drag from one peak to the next), and it switches the entry to the night
+      with data in the span. The worker (<code>relphot db reprocess --watch</code>) works the queue off.</div>
     <label id="rerun-toggle"><input type="checkbox" id="rerun-check"> RERUN</label>
     <div id="rerun-panel" hidden>
       <div id="rerun-entries"></div>

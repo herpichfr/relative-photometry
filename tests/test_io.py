@@ -340,6 +340,37 @@ def test_save_load_night_preserves_naxis_and_telescope(tmp_path) -> None:
         assert m_loaded.telescope == m_orig.telescope
 
 
+def test_save_load_night_preserves_the_zero_point_and_old_files_lack_it(tmp_path) -> None:
+    """The frames' Gaia zero point survives night.npz; a file without one loads as None."""
+    import json
+    from dataclasses import replace
+
+    from tests.conftest import make_synthetic_night
+
+    night, _, _ = make_synthetic_night(n_stars=50, n_frames=3)
+    with_zp = replace(
+        night,
+        frame_meta=[replace(m, zp=24.0 + 0.1 * i) for i, m in enumerate(night.frame_meta)],
+    )
+    save_night(with_zp, Settings(), tmp_path / "zp.npz")
+    loaded, _ = load_night(tmp_path / "zp.npz")
+    assert [round(m.zp, 6) for m in loaded.frame_meta] == [24.0, 24.1, 24.2]
+
+    save_night(night, Settings(), tmp_path / "nozp.npz")
+    loaded, _ = load_night(tmp_path / "nozp.npz")
+    assert [m.zp for m in loaded.frame_meta] == [None] * 3
+    # an older file has no "zp" key in its frame metadata at all
+    with np.load(tmp_path / "nozp.npz", allow_pickle=False) as data:
+        arrays = {k: data[k] for k in data.files}
+    meta = json.loads(str(arrays["frame_meta_json"]))
+    for d in meta:
+        del d["zp"]
+    arrays["frame_meta_json"] = np.array(json.dumps(meta))
+    np.savez(tmp_path / "old.npz", **arrays)
+    loaded, _ = load_night(tmp_path / "old.npz")
+    assert [m.zp for m in loaded.frame_meta] == [None] * 3
+
+
 def test_load_night_handles_missing_naxis_and_telescope(tmp_path) -> None:
     """load_night handles old night.npz lacking naxis1/naxis2/telescope."""
     from tests.conftest import make_synthetic_night
