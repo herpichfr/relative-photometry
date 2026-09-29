@@ -192,7 +192,8 @@ default true). On T80S 20251104-06 the cut keeps ~97 % of stars.
   note text, status text check in ('queued','running','done','failed') default 'queued', requested_at, started_at,
   finished_at, error text, result jsonb)` -- a variable request needs period_guess > 0, a transit one tc_guess
   and width_guess_h > 0 (table checks); an insert sends `NOTIFY relphot_reprocess`.
-- `mn_run(mn_run_id serial pk, stem text unique, labels text[], anchor text, settings jsonb, loaded_at)`;
+- `mn_run(mn_run_id serial pk, stem text unique, labels text[], anchor text, settings jsonb, loaded_at,
+  loose_night_ids integer[] not null default '{}' /* schema v10: the run's loose nights */)`;
   `tie(mn_run_id, obj_id, night_id, mag real, mag_err real, pk (mn_run_id, obj_id, night_id))` — the
   night's mean calibrated magnitude from the multi-night tie (`mlc_night_mean_mag`).
 - `periodogram(obj_id fk, scope text /* 'night:<night_id>' or 'combined' */, method text check in ('LS','BLS'),
@@ -293,6 +294,20 @@ default true). On T80S 20251104-06 the cut keeps ~97 % of stars.
   planets/variables) always counts and cannot be removed by a verdict. Verdicts are re-evaluated by
   `refresh_flags`, and `class` / `class_source` are re-derived. The advanced SQL box reads the new
   tables (`relphot_ro`).
+
+## Loose nights of a multi-night run (schema v10)
+
+A night that would distort the zero-point tie of the others (a cloudy one) is tied *loosely*:
+`relphot multinight ... --loose LABEL` (setting `multinight.loose_nights`) ties the other, core, nights exactly as
+without it and fits the loose night only to their fixed frame with a low-order surface and its own measured
+calibration floor. The run is loaded as one `mn_run` holding all the nights (the core nights' `tie` rows are
+identical to a run without the loose night, so it can replace that run: drop the old one with
+`drop_mn_run.py`); `mn_run.loose_night_ids` lists the loose `night_id`s. A loose night takes part in the variability
+work (inter-night chi2, whose candidates need support from the core nights alone: setting
+`multinight.loose_internight_support_p`, Lomb-Scargle, per-night verdict recurrence) but never in the transit work:
+no `bls` detection, per-night transit event in the period-compatibility search, or `transit_match` pair uses it.
+`db analyze` reads the flag from the run that ties the object (most nights covered, then latest loaded); such a run
+counts as tying an object even when a loose night of the object has no `tie` row (the tied series omits it).
 
 ## Coincident events (schema v9)
 

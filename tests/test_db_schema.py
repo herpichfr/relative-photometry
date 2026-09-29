@@ -147,8 +147,8 @@ def test_migration_004_from_v3_maps_class_to_flags(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9]
-    assert current_version(test_conn) == 9
+    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9, 10]
+    assert current_version(test_conn) == 10
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -282,7 +282,7 @@ def test_migration_005_verify_status_backfill_and_check(test_conn) -> None:
             )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [5, 6, 7, 8, 9]
+    assert init_schema(test_conn) == [5, 6, 7, 8, 9, 10]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -305,7 +305,7 @@ def test_migration_007_night_zero_point_defaults_existing_nights_to_assumed(test
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [7, 8, 9]
+    assert init_schema(test_conn) == [7, 8, 9, 10]
 
     with test_conn.cursor() as cur:
         cur.execute("SELECT zp, zp_source FROM relphot.night")
@@ -332,7 +332,7 @@ def test_migration_008_night_zero_point_source_accepts_measured(test_conn) -> No
         cur.execute("UPDATE relphot.night SET zp_source = 'measured'")
     test_conn.rollback()
 
-    assert init_schema(test_conn) == [8, 9]
+    assert init_schema(test_conn) == [8, 9, 10]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -373,7 +373,7 @@ def test_migration_009_coincidence_columns_and_table_from_v8(test_conn) -> None:
         (det_id,) = cur.fetchone()
     test_conn.commit()
 
-    assert init_schema(test_conn) == [9]
+    assert init_schema(test_conn) == [9, 10]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -472,8 +472,8 @@ def test_migration_006_guided_reprocessing_schema_from_v5(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9]
-    assert current_version(test_conn) == 9
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10]
+    assert current_version(test_conn) == 10
 
     with test_conn.cursor() as cur:
         # existing rows: searches' detections, no inflation information, no new estimate info
@@ -567,7 +567,7 @@ def test_migration_006_user_night_review_from_v5_backfills_object_level_flags(te
                 )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9]
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -786,3 +786,36 @@ def test_reprocess_request_without_night_id_is_valid_all_nights(test_conn) -> No
         )
         row = cur.fetchone()
     assert row == (obj_id, "variable", 1.0, None)
+
+
+def test_migration_010_loose_night_ids_from_v9(test_conn) -> None:
+    _apply_up_to(test_conn, 9)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.mn_run (stem, labels, anchor) VALUES ('old', %s, 'a')",
+            (["a", "b"],),
+        )
+    test_conn.commit()
+    assert init_schema(test_conn) == [10]
+    assert init_schema(test_conn) == []
+
+    with test_conn.cursor() as cur:
+        # a run loaded before the version has no loose night; the column can never be NULL
+        cur.execute("SELECT loose_night_ids FROM relphot.mn_run WHERE stem = 'old'")
+        assert cur.fetchone() == ([],)
+        cur.execute(
+            "INSERT INTO relphot.mn_run (stem, loose_night_ids) VALUES ('new', %s) "
+            "RETURNING loose_night_ids",
+            ([7, 9],),
+        )
+        assert cur.fetchone() == ([7, 9],)
+        for role in ("relphot_ro", "relphot_web"):
+            cur.execute(
+                "SELECT has_column_privilege(%s, 'relphot.mn_run', 'loose_night_ids', 'SELECT')",
+                (role,),
+            )
+            assert cur.fetchone() == (True,)
+    test_conn.commit()
+    with pytest.raises(psycopg.errors.NotNullViolation), test_conn.cursor() as cur:
+        cur.execute("INSERT INTO relphot.mn_run (stem, loose_night_ids) VALUES ('bad', NULL)")
+    test_conn.rollback()

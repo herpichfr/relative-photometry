@@ -174,6 +174,9 @@ def load_multinight(
     the anchor night's object, else the lowest object id); the count of
     globals with such a disagreement is reported, and the run's
     disagreeing nights get no ``tie`` row for that star.
+
+    The run's loose nights (``tie.loose``, see :func:`relphot.multinight.tie_loose_nights`)
+    are stored as ``mn_run.loose_night_ids``.
     """
     t0 = time.monotonic()
     settings = settings if settings is not None else Settings()
@@ -199,16 +202,22 @@ def load_multinight(
             # --- mn_run upsert (reuses mn_run_id on a reload) ---
             cur.execute(
                 """
-                INSERT INTO relphot.mn_run (stem, labels, anchor, settings, loaded_at)
-                VALUES (%s, %s, %s, %s, now())
+                INSERT INTO relphot.mn_run
+                    (stem, labels, anchor, settings, loose_night_ids, loaded_at)
+                VALUES (%s, %s, %s, %s, %s, now())
                 ON CONFLICT (stem) DO UPDATE SET
                     labels = EXCLUDED.labels,
                     anchor = EXCLUDED.anchor,
                     settings = EXCLUDED.settings,
+                    loose_night_ids = EXCLUDED.loose_night_ids,
                     loaded_at = EXCLUDED.loaded_at
                 RETURNING mn_run_id
                 """,
-                (resolved_stem, labels, anchor_label, Jsonb(settings_to_dict(mn_settings))),
+                (
+                    resolved_stem, labels, anchor_label, Jsonb(settings_to_dict(mn_settings)),
+                    [int(nid) for nid, is_loose in zip(night_ids, tie.loose, strict=True)
+                     if is_loose],
+                ),
             )
             (mn_run_id,) = cur.fetchone()
 

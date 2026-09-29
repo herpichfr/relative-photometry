@@ -46,6 +46,12 @@ For each object needing analysis, :func:`analyze` deletes its existing
   The same code makes the user-guided ``'LS-guided'`` estimates of
   :mod:`relphot.db.reprocess`.
 
+A night the multi-night run that ties an object ties only loosely (``mn_run.loose_night_ids``;
+see :func:`relphot.multinight.tie_loose_nights`) takes part in the variability work (per-night
+and combined LS, period estimates) but not in the transit work: it is left out of the BLS input
+and of the matching-transit pairs, and a night of the object missing from that run's tie rows
+is tolerated when it is loose (the tied series then simply omits it).
+
 Every periodogram's frequency grid is uniform (``f_k = fmin + k*df``,
 cycles/day); a grid that would exceed ``max_periodogram_points`` has its
 ``df`` increased to fit instead, and ``periodogram.coarsened`` records it.
@@ -138,6 +144,8 @@ class _ObjTask:
     lit_catalog: str | None = None
     night_ties: dict[int, tuple[float, float]] = field(default_factory=dict)
     transits: list[_TransitDet] = field(default_factory=list)
+    #: this object's nights the best tie run ties loosely (no BLS, no transit matching)
+    loose_night_ids: frozenset[int] = frozenset()
 
 
 @dataclass(slots=True)
@@ -180,6 +188,14 @@ def _select_target_obj_ids(
     with conn.cursor() as cur:
         cur.execute(sql)
         return [row[0] for row in cur.fetchall()]
+
+
+def _best_run_id(runs: dict[int, tuple[set[int], object]], obj_night_ids: set[int]) -> int:
+    """The tie run that ties most of an object's nights (ties: the most recently loaded).
+
+    ``runs`` maps ``mn_run_id`` to ``(night_ids the run ties for this object, loaded_at)``.
+    """
+    return max(runs, key=lambda rid: (len(runs[rid][0] & obj_night_ids), runs[rid][1]))
 
 
 def _fetch_chunk_data(
@@ -240,7 +256,8 @@ def _fetch_chunk_data(
 
         cur.execute(
             """
-            SELECT t.obj_id, t.night_id, t.mn_run_id, r.loaded_at, t.mag, t.mag_err
+            SELECT t.obj_id, t.night_id, t.mn_run_id, r.loaded_at, t.mag, t.mag_err,
+                   r.loose_night_ids
             FROM relphot.tie t
             JOIN relphot.mn_run r ON r.mn_run_id = t.mn_run_id
             WHERE t.obj_id = ANY(%(obj_ids)s)
@@ -276,7 +293,9 @@ def _fetch_chunk_data(
     # and the run's own loaded_at
     runs_by_obj: dict[int, dict[int, tuple[set[int], object]]] = {}
     tie_by_obj: dict[int, dict[int, dict[int, tuple[float, float]]]] = {}
-    for obj_id, night_id, mn_run_id, loaded_at, mag, mag_err in tie_rows:
+    loose_by_run: dict[int, frozenset[int]] = {}
+    for obj_id, night_id, mn_run_id, loaded_at, mag, mag_err, loose_ids in tie_rows:
+        loose_by_run[mn_run_id] = frozenset(loose_ids or ())
         runs = runs_by_obj.setdefault(obj_id, {})
         nights_set, _ = runs.get(mn_run_id, (set(), loaded_at))
         nights_set.add(night_id)
@@ -290,17 +309,18 @@ def _fetch_chunk_data(
 
         tie_map: dict[int, tuple[float, float]] | None = None
         night_ties: dict[int, tuple[float, float]] = {}
+        loose_ids: frozenset[int] = frozenset()
         runs = runs_by_obj.get(obj_id)
         if runs and obj_night_ids:
-            best_run_id = max(
-                runs, key=lambda rid: (len(runs[rid][0] & obj_night_ids), runs[rid][1])
-            )
+            best_run_id = _best_run_id(runs, obj_night_ids)
             covered, _ = runs[best_run_id]
+            loose_ids = loose_by_run.get(best_run_id, frozenset()) & obj_night_ids
             night_ties = {
                 nid: entry for nid, entry in tie_by_obj[obj_id][best_run_id].items()
                 if entry[0] is not None
             }
-            if obj_night_ids <= covered:
+            # a loose night need not be tied for the run to count as tying the object
+            if (obj_night_ids - loose_ids) <= covered:
                 tie_map = tie_by_obj[obj_id][best_run_id]
 
         tasks[obj_id] = _ObjTask(
@@ -316,6 +336,7 @@ def _fetch_chunk_data(
             lit_catalog=lit_cat,
             night_ties=night_ties,
             transits=transits_by_obj.get(obj_id, []),
+            loose_night_ids=loose_ids,
         )
     return tasks
 
@@ -383,17 +404,20 @@ def _good_night_flux(nd: _NightData) -> tuple[np.ndarray, np.ndarray, np.ndarray
 
 
 def _concat_night_normalised_flux(
-    task: _ObjTask,
+    task: _ObjTask, exclude_night_ids: frozenset[int] = frozenset(),
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray] | None:
     """Every night's own-median-normalised flux, concatenated and time-sorted.
 
-    The last element is each point's ``night_id``.
+    The last element is each point's ``night_id``. Nights in ``exclude_night_ids`` are
+    left out.
     """
     ts: list[np.ndarray] = []
     ys: list[np.ndarray] = []
     dys: list[np.ndarray] = []
     ns: list[np.ndarray] = []
     for nd in task.nights:
+        if nd.night_id in exclude_night_ids:
+            continue
         got = _good_night_flux(nd)
         if got is None:
             continue
@@ -978,6 +1002,14 @@ _ESTIMATE_INSERT_SQL = """
 """
 
 
+def _matchable_shapes(shapes: list[dict], task: _ObjTask) -> list[dict]:
+    """``shapes`` without those of a loose night's events (no cross-night transit matching)."""
+    loose_det_ids = {
+        det.det_id for det in task.transits if det.night_id in task.loose_night_ids
+    }
+    return [sh for sh in shapes if sh["det_id"] not in loose_det_ids]
+
+
 def _shape_values(obj_id: int, sh: dict) -> tuple:
     """The :data:`_SHAPE_INSERT_SQL` parameters of one :func:`_fit_transit_shape` result."""
     return (
@@ -1015,12 +1047,34 @@ def recompute_matches(conn: psycopg.Connection, obj_id: int, settings: DbSetting
     Used after a shape was added outside :func:`analyze` (a user's reprocess request): the
     pairs of every converged stored shape are compared exactly as :func:`analyze` does, and
     the object's earlier match rows are replaced. Does not commit. Returns the number of pairs.
+    Shapes of a night the object's best tie run ties loosely are not matched (see
+    :func:`analyze`).
     """
     with conn.cursor() as cur:
+        cur.execute("SELECT night_id FROM relphot.star_night WHERE obj_id = %s", (obj_id,))
+        obj_night_ids = {night_id for (night_id,) in cur.fetchall()}
+        cur.execute(
+            """
+            SELECT t.mn_run_id, t.night_id, r.loaded_at, r.loose_night_ids
+            FROM relphot.tie t JOIN relphot.mn_run r ON r.mn_run_id = t.mn_run_id
+            WHERE t.obj_id = %s
+            """,
+            (obj_id,),
+        )
+        runs: dict[int, tuple[set[int], object]] = {}
+        loose_by_run: dict[int, frozenset[int]] = {}
+        for mn_run_id, night_id, loaded_at, loose_ids in cur.fetchall():
+            runs.setdefault(mn_run_id, (set(), loaded_at))[0].add(night_id)
+            loose_by_run[mn_run_id] = frozenset(loose_ids or ())
+        loose_ids_obj = (
+            loose_by_run[_best_run_id(runs, obj_night_ids)] if runs and obj_night_ids
+            else frozenset()
+        )
         cur.execute(
             """
             SELECT ts.det_id, ts.tc, ts.depth, ts.depth_err, ts.t14_h, ts.t14_err,
-                   ts.t14_lower_limit, ts.ingress_frac, ts.ingress_err, ts.converged, n.telescope
+                   ts.t14_lower_limit, ts.ingress_frac, ts.ingress_err, ts.converged,
+                   n.telescope, d.night_id
             FROM relphot.transit_shape ts
             JOIN relphot.detection d ON d.det_id = ts.det_id
             LEFT JOIN relphot.night n ON n.night_id = d.night_id
@@ -1032,7 +1086,10 @@ def recompute_matches(conn: psycopg.Connection, obj_id: int, settings: DbSetting
         telescope_of: dict[int, str | None] = {}
         for (
             det_id, tc, depth, depth_err, t14_h, t14_err, t14_low, ing, ing_err, converged, tele,
+            night_id,
         ) in cur.fetchall():
+            if night_id in loose_ids_obj:
+                continue
             shapes.append({
                 "det_id": det_id, "tc": tc, "depth": depth, "depth_err": depth_err,
                 "t14_h": t14_h, "t14_err": t14_err, "t14_lower_limit": bool(t14_low),
@@ -1460,8 +1517,9 @@ def _compute_object(task: _ObjTask) -> _ObjResult:
             if row is not None:
                 rows.append(row)
 
-        if task.bls_eligible:
-            flux_combined = _concat_night_normalised_flux(task)
+        n_transit_nights = sum(1 for nd in task.nights if nd.night_id not in task.loose_night_ids)
+        if task.bls_eligible and n_transit_nights >= 2:
+            flux_combined = _concat_night_normalised_flux(task, task.loose_night_ids)
             if flux_combined is not None:
                 t_f, y_f, dy_f, span_f, _night_f = flux_combined
                 row = _run_bls(t_f, y_f, dy_f, span_f, s)
@@ -1474,7 +1532,8 @@ def _compute_object(task: _ObjTask) -> _ObjResult:
         for det in task.transits for nd in task.nights if nd.night_id == det.night_id
     }
     return _ObjResult(
-        periodograms=rows, shapes=shapes, matches=_match_pairs(shapes, telescope_of, s),
+        periodograms=rows, shapes=shapes,
+        matches=_match_pairs(_matchable_shapes(shapes, task), telescope_of, s),
         estimate=_period_estimate(task),
     )
 

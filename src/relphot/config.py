@@ -203,12 +203,37 @@ class MultiNightSettings:
     #: used with >= 3 nights.
     seeing_crowding_degree: int = 1
 
+    # --- loose nights (relphot.multinight.tie_loose_nights) ---
+    #: Labels of nights tied "loosely", e.g. a cloudy night that would distort the tie of
+    #: the good ones. The other (core) nights are tied by exactly the same code as without
+    #: this setting -- run on the core subset, so their zero points, calibration floors,
+    #: mean magnitudes and aperture choice are bit-identical to a run without the loose
+    #: nights. Each loose night is then fit only to that fixed core frame (the core nights'
+    #: calibrated weighted mean) with a low-order surface (the two degrees below, at most
+    #: ``spatial_degree``/``mag_degree``; no seeing term) and gets its own calibration floor
+    #: measured against the frame, which inflates its errors everywhere the floor is used.
+    #: A loose night takes part in the variability tests (inter-night chi2, Lomb-Scargle,
+    #: per-night verdict recurrence) but never in the transit ones (BLS, period
+    #: compatibility, per-night transit events): see :mod:`relphot.multinight_search`.
+    loose_nights: tuple[str, ...] = ()
+    #: Degree of the tangent-plane polynomial of a loose night's zero-point surface.
+    loose_spatial_degree: int = 1
+    #: Degree of the magnitude polynomial of a loose night's zero-point surface.
+    loose_mag_degree: int = 1
+
     # --- Unit B: cross-night search (relphot.multinight_search) ---
     #: Inter-night (long-term) variability chi2 p-value threshold.
     internight_p_threshold: float = 1e-4
     #: Minimum max-min nightly-mean spread (mag) also required for an
     #: inter-night variability candidate.
     internight_min_amplitude_mag: float = 0.005
+    #: A loose night alone never makes an inter-night candidate. A star with a loose
+    #: night among its nights is a candidate only if the test on all its nights passes
+    #: (``internight_p_threshold``, ``internight_min_amplitude_mag``) AND the same chi2
+    #: test on its core nights alone (loose night dropped) has p below this; a star with
+    #: fewer than 2 core nights is then never a candidate. Stars without a loose night
+    #: are unaffected.
+    loose_internight_support_p: float = 1e-2
     #: Which stars get the combined Lomb-Scargle periodogram (B4)/BLS search
     #: (B6): "candidates" (union of variability/transit-flagged stars) or "all".
     periodogram_stars: str = "candidates"
@@ -243,6 +268,32 @@ class MultiNightSettings:
     #: NaN/False LS and BLS columns; skipped stars are logged once, not
     #: per star.
     min_nights_periodic: int = 3
+
+    def __post_init__(self) -> None:
+        if len(set(self.loose_nights)) != len(self.loose_nights):
+            msg = f"multinight.loose_nights has duplicate labels: {self.loose_nights!r}"
+            raise ConfigError(msg)
+        if self.anchor in self.loose_nights:
+            msg = f"multinight.anchor {self.anchor!r} cannot be a loose night"
+            raise ConfigError(msg)
+        for name, cap_name in (
+            ("loose_spatial_degree", "spatial_degree"), ("loose_mag_degree", "mag_degree"),
+        ):
+            value = getattr(self, name)
+            cap = getattr(self, cap_name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= cap:
+                msg = (
+                    f"multinight.{name} must be an integer in [0, {cap_name}={cap}], "
+                    f"got {value!r}"
+                )
+                raise ConfigError(msg)
+        value = self.loose_internight_support_p
+        if (
+            isinstance(value, bool) or not isinstance(value, int | float)
+            or not 0.0 < value <= 1.0
+        ):
+            msg = f"multinight.loose_internight_support_p must be in (0, 1], got {value!r}"
+            raise ConfigError(msg)
 
 
 @dataclass(frozen=True, slots=True)

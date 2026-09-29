@@ -19,13 +19,18 @@ from psycopg.types.json import Jsonb
 
 from relphot.config import DbSettings, Settings
 from relphot.db.analyze import (
+    _concat_night_normalised_flux,
+    _fetch_chunk_data,
+    _matchable_shapes,
     _NightData,
     _ObjTask,
     _phase_stats,
     _refine_fourier,
     _tied_series,
+    _TransitDet,
     _verification_windows,
     analyze,
+    recompute_matches,
 )
 from relphot.db.connect import resolve_dsn
 from relphot.db.refresh import refresh_objects
@@ -1881,3 +1886,137 @@ def test_a_long_period_peak_on_the_grid_edge_is_not_verified() -> None:
     interior[5] = 2.0
     ok = _verification_windows(freq, interior, 2.4, 0.15, long_period_days=1.0)
     assert ok[0] is not None and ok[0][1] == 5
+
+
+# --------------------------------------------------------------------------
+# loose nights of a multi-night run: variability yes, BLS / transit matching no
+# --------------------------------------------------------------------------
+
+
+def _insert_loose_run(conn: psycopg.Connection, stem: str, loose_night_ids: list[int]) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.mn_run (stem, labels, anchor, loaded_at, loose_night_ids) "
+            "VALUES (%s, %s, %s, now(), %s) RETURNING mn_run_id",
+            (stem, ["a", "b", "c"], "a", loose_night_ids),
+        )
+        (mn_run_id,) = cur.fetchone()
+    return mn_run_id
+
+
+def _insert_tie(conn, mn_run_id: int, obj_id: int, night_id: int, mag: float = 15.0) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.tie (mn_run_id, obj_id, night_id, mag, mag_err) "
+            "VALUES (%s, %s, %s, %s, 0.01)",
+            (mn_run_id, obj_id, night_id, mag),
+        )
+
+
+def _object_on_three_nights(conn: psycopg.Connection, name: str) -> tuple[int, list[int]]:
+    obj_id = _insert_object(conn, name)
+    t = 2460000.0 + np.linspace(0.0, 0.3, 30)
+    night_ids = []
+    for i in range(3):
+        night_id = _insert_night(conn, f"{name}_{i}")
+        _insert_star_night_and_lc(conn, obj_id, night_id, i, t + i, np.ones(30), np.full(30, 0.01))
+        night_ids.append(night_id)
+    return obj_id, night_ids
+
+
+def test_a_loose_night_need_not_be_tied_for_the_run_to_tie_the_object(test_conn) -> None:
+    # object 1: the run ties the two core nights only and lists the third as loose
+    obj1, nights1 = _object_on_three_nights(test_conn, "loose_ok")
+    run1 = _insert_loose_run(test_conn, "run_loose_ok", [nights1[2]])
+    for night_id in nights1[:2]:
+        _insert_tie(test_conn, run1, obj1, night_id)
+    # object 2: the same rows, but the run does not call the third night loose
+    obj2, nights2 = _object_on_three_nights(test_conn, "loose_missing")
+    run2 = _insert_loose_run(test_conn, "run_not_loose", [])
+    for night_id in nights2[:2]:
+        _insert_tie(test_conn, run2, obj2, night_id)
+    test_conn.commit()
+
+    tasks = _fetch_chunk_data(test_conn, [obj1, obj2], _SETTINGS.db)
+    assert tasks[obj1].tie is not None and set(tasks[obj1].tie) == set(nights1[:2])
+    assert tasks[obj1].loose_night_ids == frozenset({nights1[2]})
+    assert tasks[obj2].tie is None  # unchanged rule: a night the run does not tie voids the tie
+    assert tasks[obj2].loose_night_ids == frozenset()
+    assert set(tasks[obj2].night_ties) == set(nights2[:2])
+
+
+def test_the_run_that_ties_the_loose_night_wins_and_its_flag_travels(test_conn) -> None:
+    obj, nights = _object_on_three_nights(test_conn, "loose_wins")
+    core_run = _insert_loose_run(test_conn, "run_core_only", [])
+    loose_run = _insert_loose_run(test_conn, "run_with_loose", [nights[2]])
+    for night_id in nights[:2]:
+        _insert_tie(test_conn, core_run, obj, night_id)
+    for night_id in nights:
+        _insert_tie(test_conn, loose_run, obj, night_id)
+    test_conn.commit()
+
+    task = _fetch_chunk_data(test_conn, [obj], _SETTINGS.db)[obj]
+    assert task.tie is not None and set(task.tie) == set(nights)  # 3 nights beat 2
+    assert task.loose_night_ids == frozenset({nights[2]})
+
+
+def _task_with_loose_night() -> _ObjTask:
+    t = 2460000.0 + np.linspace(0.0, 0.3, 30)
+    nights = [
+        _NightData(i + 1, date(2025, 1, 1 + i), t + i, np.ones(30), np.full(30, 0.01))
+        for i in range(3)
+    ]
+    transits = [
+        _TransitDet(det_id=10 + i, night_id=i + 1, tc=float(t[10] + i), depth=0.01, duration_h=2.0)
+        for i in range(3)
+    ]
+    return _ObjTask(
+        obj_id=1, is_exop=True, bls_eligible=True, nights=nights, tie=None,
+        settings=DbSettings(), transits=transits, loose_night_ids=frozenset({3}),
+    )
+
+
+def test_bls_input_and_transit_matching_leave_out_loose_nights() -> None:
+    task = _task_with_loose_night()
+    everything = _concat_night_normalised_flux(task)
+    core_only = _concat_night_normalised_flux(task, task.loose_night_ids)
+    assert everything is not None and core_only is not None
+    assert set(np.unique(everything[4])) == {1, 2, 3}
+    assert set(np.unique(core_only[4])) == {1, 2}
+    assert core_only[0].size == 60
+
+    shapes = [{"det_id": 10}, {"det_id": 11}, {"det_id": 12}]
+    assert [sh["det_id"] for sh in _matchable_shapes(shapes, task)] == [10, 11]
+    plain = replace(task, loose_night_ids=frozenset())
+    assert len(_matchable_shapes(shapes, plain)) == 3
+
+
+def test_recompute_matches_skips_loose_night_shapes(test_conn) -> None:
+    obj, nights = _object_on_three_nights(test_conn, "loose_matches")
+    run = _insert_loose_run(test_conn, "run_matches", [nights[2]])
+    for night_id in nights:
+        _insert_tie(test_conn, run, obj, night_id)
+    det_ids = []
+    with test_conn.cursor() as cur:
+        for night_id in nights:
+            cur.execute(
+                "INSERT INTO relphot.detection (obj_id, night_id, kind, snr) "
+                "VALUES (%s, %s, 'transit', 10.0) RETURNING det_id",
+                (obj, night_id),
+            )
+            (det_id,) = cur.fetchone()
+            det_ids.append(det_id)
+            cur.execute(
+                "INSERT INTO relphot.transit_shape (det_id, obj_id, tc, depth, depth_err, "
+                "t14_h, t14_err, ingress_frac, ingress_err, converged) "
+                "VALUES (%s, %s, 2460000.1, 0.01, 0.001, 2.0, 0.1, 0.2, 0.05, true)",
+                (det_id, obj),
+            )
+    test_conn.commit()
+
+    n_pairs = recompute_matches(test_conn, obj, _SETTINGS.db)
+    assert n_pairs == 1  # only the two core-night shapes are compared, not 3 pairs
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT det_a, det_b FROM relphot.transit_match WHERE obj_id = %s", (obj,))
+        assert cur.fetchall() == [(det_ids[0], det_ids[1])]
+    test_conn.commit()

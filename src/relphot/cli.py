@@ -47,6 +47,7 @@ from relphot.match import match_night
 from relphot.multinight import (
     build_multinight_lightcurves,
     check_compatible,
+    core_crossmatch,
     crossmatch_nights,
     load_multinight,
     load_night_products,
@@ -56,6 +57,8 @@ from relphot.multinight import (
     save_multinight,
     save_multinight_tables,
     save_tie_report,
+    split_loose_nights,
+    tie_loose_nights,
     tie_nights,
 )
 from relphot.multinight_search import (
@@ -1065,10 +1068,23 @@ def _run_multinight(args: argparse.Namespace) -> int:
         logger.exception("failed to load config %s", args.config)
         return 1
 
-    if args.aper is not None:
-        settings = replace(settings, multinight=replace(settings.multinight, aperture=args.aper))
-    if args.anchor is not None:
-        settings = replace(settings, multinight=replace(settings.multinight, anchor=args.anchor))
+    try:
+        if args.aper is not None:
+            settings = replace(
+                settings, multinight=replace(settings.multinight, aperture=args.aper)
+            )
+        if args.anchor is not None:
+            settings = replace(
+                settings, multinight=replace(settings.multinight, anchor=args.anchor)
+            )
+        if args.loose is not None:
+            loose_labels = tuple(s for s in args.loose.split(",") if s)
+            settings = replace(
+                settings, multinight=replace(settings.multinight, loose_nights=loose_labels)
+            )
+    except RelphotError:
+        logger.exception("invalid multinight option")
+        return 1
 
     if args.labels is not None:
         labels: list[str | None] = args.labels.split(",")
@@ -1088,9 +1104,17 @@ def _run_multinight(args: argparse.Namespace) -> int:
             for d, lbl in zip(args.night_dirs, labels, strict=True)
         ]
         nights = check_compatible(nights)
-        anchor_index = resolve_anchor_index(nights, settings.multinight.anchor)
+        core, loose = split_loose_nights(nights, settings.multinight.loose_nights)
+        anchor_index = resolve_anchor_index(core, settings.multinight.anchor)
+        nights = core + loose
         xmatch = crossmatch_nights(nights, anchor_index, settings.multinight.match_radius_arcsec)
-        tie = tie_nights(nights, xmatch, anchor_index, settings.multinight)
+        if loose:
+            tie_core = tie_nights(
+                core, core_crossmatch(xmatch, len(core)), anchor_index, settings.multinight
+            )
+            tie = tie_loose_nights(core, loose, xmatch, tie_core, settings.multinight)
+        else:
+            tie = tie_nights(nights, xmatch, anchor_index, settings.multinight)
         mlc = build_multinight_lightcurves(nights, xmatch, tie, settings.multinight)
     except RelphotError:
         logger.exception("multinight processing failed")
@@ -1126,10 +1150,11 @@ def _run_multinight(args: argparse.Namespace) -> int:
         chi2_val = float(tie.chi2_after[n, a_report])
         chi2_holdout_val = float(tie.chi2_holdout[n, a_report])
         logger.info(
-            "night %s: frames kept %d/%d, stars %d, matched %d, tie stars %d, "
+            "night %s%s: frames kept %d/%d, stars %d, matched %d, tie stars %d, "
             "resid bright %.2f mmag, floor(bright) %.2f mmag, chi2_after %.2f, "
             "chi2_holdout %.2f",
-            night.label, int(np.count_nonzero(night.frame_kept)), night.n_frames, night.n_stars,
+            night.label, " (loose)" if tie.loose[n] else "",
+            int(np.count_nonzero(night.frame_kept)), night.n_frames, night.n_stars,
             int(xmatch.n_matched[n]), int(tie.n_tie[n, a_report]),
             float(tie.resid_mad_bright[n, a_report]) * 1000.0,
             floor_bright_mmag if np.isfinite(floor_bright_mmag) else float("nan"),
@@ -1598,6 +1623,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     multinight.add_argument(
         "--aper", type=int, default=None, help="override settings.multinight.aperture",
+    )
+    multinight.add_argument(
+        "--loose", default=None,
+        help="comma-separated night labels to tie loosely to the other nights' fixed frame "
+        "(overrides settings.multinight.loose_nights)",
     )
     multinight.add_argument("--config", type=Path, default=None, help="TOML settings file")
     multinight.add_argument(

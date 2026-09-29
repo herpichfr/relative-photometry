@@ -25,6 +25,17 @@ estimated from the night-to-night scatter of tie stars after convergence and
 added in quadrature to the reported errors, so that ``chi2_after`` comes out
 close to 1 when the tie is self-consistent.
 
+A night can instead be tied *loosely* (``settings.loose_nights``,
+:func:`split_loose_nights`, :func:`tie_loose_nights`): the other (core) nights
+are tied by the unchanged code on the core subset alone, and each loose night
+is then fit only to that fixed core frame -- the core nights' calibrated
+weighted mean -- by a low-order surface, with a calibration floor measured
+against the frame. A loose night therefore cannot move any core night's zero
+point, floor, mean magnitude or aperture, and its own offset and errors stay
+loose (a night that would break the tie, e.g. a cloudy one, is still usable for
+variability work). :attr:`NightTie.loose` marks these nights; the multi-night
+search (:mod:`relphot.multinight_search`) keeps them out of every transit test.
+
 Vectorised over stars throughout; the only Python-level loops are over
 nights (2-10), apertures, and alternating-fit iterations, per the project's
 usual convention.
@@ -60,6 +71,7 @@ __all__ = [
     "NightTie",
     "build_multinight_lightcurves",
     "check_compatible",
+    "core_crossmatch",
     "crossmatch_nights",
     "evaluate_zero_point",
     "load_multinight",
@@ -69,6 +81,8 @@ __all__ = [
     "save_multinight",
     "save_multinight_tables",
     "save_tie_report",
+    "split_loose_nights",
+    "tie_loose_nights",
     "tie_nights",
 ]
 
@@ -255,6 +269,34 @@ def resolve_anchor_index(nights: list[NightProducts], anchor: str) -> int:
     raise MultiNightError(msg)
 
 
+def split_loose_nights(
+    nights: list[NightProducts], loose_labels: tuple[str, ...]
+) -> tuple[list[NightProducts], list[NightProducts]]:
+    """``(core, loose)``: ``nights`` split by ``settings.loose_nights``, each in its own order.
+
+    Callers tie ``core + loose`` (core first), so that every core night's rows of the
+    global star list come before any star only a loose night contains (see
+    :func:`core_crossmatch`).
+
+    Raises
+    ------
+    MultiNightError
+        If a label in ``loose_labels`` is not among ``nights``, or fewer than 2 core
+        nights remain while some night is loose.
+    """
+    labels = [n.label for n in nights]
+    missing = [label for label in loose_labels if label not in labels]
+    if missing:
+        msg = f"loose night(s) {missing} not found among {labels}"
+        raise MultiNightError(msg)
+    core = [n for n in nights if n.label not in loose_labels]
+    loose = [n for n in nights if n.label in loose_labels]
+    if loose and len(core) < 2:
+        msg = f"loose nights need at least 2 core nights, got {[n.label for n in core]}"
+        raise MultiNightError(msg)
+    return core, loose
+
+
 @dataclass(frozen=True, slots=True)
 class NightCrossMatch:
     """Global star list built by cross-matching every night against the anchor first.
@@ -351,6 +393,34 @@ def crossmatch_nights(
         index=star_index,
         labels=labels,
         n_matched=n_matched,
+    )
+
+
+def core_crossmatch(xmatch: NightCrossMatch, n_core: int) -> NightCrossMatch:
+    """The first ``n_core`` nights' cross-match, without the stars only later nights contain.
+
+    ``xmatch`` must come from :func:`crossmatch_nights` with the core nights first:
+    that function appends a night's unmatched stars after every earlier night's
+    stars, so the global stars any core night contains are a prefix of the list, and
+    this is that prefix -- identical to the cross-match of the core nights alone.
+
+    Raises
+    ------
+    MultiNightError
+        If the columns any core night contains are not a prefix of the list.
+    """
+    index = xmatch.index[:n_core]
+    present = (index >= 0).any(axis=0)
+    n_core_global = int(np.count_nonzero(present))
+    if not np.all(present[:n_core_global]):
+        msg = "core nights' stars are not a prefix of the global list (core must come first)"
+        raise MultiNightError(msg)
+    return NightCrossMatch(
+        ra=xmatch.ra[:n_core_global],
+        dec=xmatch.dec[:n_core_global],
+        index=index[:, :n_core_global],
+        labels=xmatch.labels[:n_core],
+        n_matched=xmatch.n_matched[:n_core],
     )
 
 
@@ -724,6 +794,14 @@ class NightTie:
     (:func:`relphot.decorrelate.compute_crowding`). See
     :func:`evaluate_zero_point` for how these combine into
     ``beta(M, crowding) * (F_n - F_anchor)``.
+
+    ``loose`` is ``(n_nights,)``: True for a night tied loosely to the fixed core
+    frame by :func:`tie_loose_nights` (all False when there is none, and for a
+    file written before the field existed). A loose night's ``coef`` row is its
+    low-order surface written into the core basis (other terms zero), it has no
+    seeing term, its ``floor`` is measured against the frame in the core nights'
+    magnitude bins, and ``tie_star`` marks its fit stars; the core nights' entries,
+    ``mean_mag``, ``rejected`` and ``floor_mag_centres`` are the core tie's own.
     """
 
     labels: tuple[str, ...]
@@ -756,6 +834,11 @@ class NightTie:
     seeing_crowd0: np.ndarray
     night_fwhm: np.ndarray
     crowding: np.ndarray
+    loose: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.loose is None:
+            self.loose = np.zeros(len(self.labels), dtype=bool)
 
     def floor_at(self, night_index: int, aperture: int, mag) -> np.ndarray:
         """Calibration floor (mag) at magnitude ``mag``, night ``night_index``, ``aperture``.
@@ -1114,6 +1197,321 @@ def tie_nights(
     )
 
 
+def _pad_stars(arr: np.ndarray, axis: int, n_pad: int, fill) -> np.ndarray:
+    """``arr`` extended by ``n_pad`` entries of ``fill`` at the end of ``axis`` (the star axis)."""
+    shape = list(arr.shape)
+    shape[axis] = n_pad
+    return np.concatenate([arr, np.full(shape, fill, dtype=arr.dtype)], axis=axis)
+
+
+def _loose_floor_bins(
+    r: np.ndarray, s2: np.ndarray, bin_idx: np.ndarray, n_bins: int, min_bin_stars: int
+) -> np.ndarray:
+    """Per-bin calibration floor (mag) of one loose night against the core frame.
+
+    ``r`` are its residuals against the frame, ``s2`` their variance without any floor
+    (its own statistical variance plus the frame's). Per bin the floor variance ``V >=
+    0`` solves ``median(r**2 / (s2 + V)) == median(chi^2_1)``
+    (:func:`_solve_floor_variance`), the same statistic the core floor uses. NaN for a
+    bin with fewer than ``min_bin_stars`` stars.
+    """
+    floor = np.full(n_bins, np.nan)
+    for b in range(n_bins):
+        sel = bin_idx == b
+        if np.count_nonzero(sel) < min_bin_stars:
+            continue
+        floor[b] = np.sqrt(_solve_floor_variance(r[sel] ** 2, s2[sel]))
+    return floor
+
+
+def _loose_chi2(
+    r: np.ndarray, s2: np.ndarray, bin_idx: np.ndarray, floor: np.ndarray, n_bins: int
+) -> tuple[float, np.ndarray]:
+    """Median ``r**2 / (s2 + floor**2)`` over the stars, ``/ median(chi^2_1)``: pooled, per bin.
+
+    A bin with no finite floor or no star is left out (NaN per bin; NaN pooled if every
+    bin is).
+    """
+    chi2_bins = np.full(n_bins, np.nan)
+    pooled: list[np.ndarray] = []
+    for b in range(n_bins):
+        sel = bin_idx == b
+        if not np.isfinite(floor[b]) or not np.any(sel):
+            continue
+        terms = r[sel] ** 2 / (s2[sel] + floor[b] ** 2)
+        pooled.append(terms)
+        chi2_bins[b] = float(np.median(terms)) / _MEDIAN_CHI2_1
+    if not pooled:
+        return float("nan"), chi2_bins
+    return float(np.median(np.concatenate(pooled))) / _MEDIAN_CHI2_1, chi2_bins
+
+
+def _core_frame(tie_core: NightTie, aperture: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The core nights' fixed frame at ``aperture``: ``(mag, err, n_nights)`` per core star.
+
+    ``mag`` is the weighted mean over the core nights of ``night_mag - zp`` with
+    weights ``1 / (s**2 + floor**2)`` (``floor`` = :meth:`NightTie.floor_at` at the
+    star's ``mean_mag``; 0 where unavailable), ``err = 1 / sqrt(sum of weights)``,
+    ``n_nights`` the number of core nights that contribute. NaN/0 where none does.
+    """
+    n_core = tie_core.zp.shape[0]
+    a = aperture
+    cal = tie_core.night_mag[:, :, a] - tie_core.zp[:, :, a]
+    s = tie_core.night_mag_err[:, :, a]
+    m = tie_core.mean_mag[:, a]
+    floor = np.stack([tie_core.floor_at(n, a, m) for n in range(n_core)])
+    floor = np.where(np.isfinite(floor), floor, 0.0)
+    var = s**2 + floor**2
+    ok = np.isfinite(cal) & np.isfinite(var) & (var > 0)
+    w = np.where(ok, 1.0 / np.where(ok, var, 1.0), 0.0)
+    wtot = w.sum(axis=0)
+    has = wtot > 0
+    safe_wtot = np.where(has, wtot, 1.0)
+    frame = np.where(has, (w * np.where(ok, cal, 0.0)).sum(axis=0) / safe_wtot, np.nan)
+    err = np.where(has, 1.0 / np.sqrt(safe_wtot), np.nan)
+    return frame, err, ok.sum(axis=0)
+
+
+def tie_loose_nights(
+    core: list[NightProducts], loose: list[NightProducts], xmatch: NightCrossMatch,
+    tie_core: NightTie, settings: MultiNightSettings,
+) -> NightTie:
+    """Tie ``loose`` nights to the fixed core frame of ``tie_core``; return the extended tie.
+
+    ``xmatch`` is the full cross-match of ``core + loose`` (core first; the core
+    tie ``tie_core`` came from :func:`tie_nights` on ``core`` and
+    :func:`core_crossmatch`). The core nights' entries of the result are
+    ``tie_core``'s own, padded with NaN/False for the stars only a loose night
+    contains -- nothing about them is refit. For each loose night and aperture:
+
+    1. The frame is :func:`_core_frame`; the fit stars are the loose night's
+       comparison stars with a finite nightly magnitude and error, at least 2 core
+       nights in the frame and no whole-star rejection in the core tie.
+    2. ``m_loose - frame`` is fit by weighted least squares (weights ``1 / (s**2 +
+       frame_err**2 + tie_err_floor_mag**2)``) with the low-order polynomial
+       ``settings.loose_spatial_degree`` / ``loose_mag_degree`` in the core tie's
+       ``xi``, ``eta`` and ``dm = mean_mag - mag0``, clipping stars beyond
+       ``settings.clip_sigma`` robust sigmas until the set is stable. No seeing term.
+       The surface is stored in the core basis (unused terms zero), so
+       :func:`evaluate_zero_point` evaluates it unchanged.
+    3. The calibration floor is measured per bin of the core tie's magnitude bins
+       (edges recomputed from ``tie_core``) by :func:`_loose_floor_bins` on the
+       residuals, with the frame's error counted in the noise, not by the pairwise
+       non-negative solve of the core: the frame is fixed, so the loose night's floor
+       is the only unknown.
+
+    Raises
+    ------
+    MultiNightError
+        If a loose surface term is not in the core basis, or a loose night has fewer
+        than ``settings.min_tie_stars`` fit stars (or a singular fit) in some aperture.
+    """
+    n_loose = len(loose)
+    if n_loose == 0:
+        return tie_core
+    n_core = len(core)
+    n_global = int(xmatch.ra.shape[0])
+    n_core_global = int(tie_core.mean_mag.shape[0])
+    n_pad = n_global - n_core_global
+    n_aper = int(tie_core.coef.shape[1])
+    n_coef = int(tie_core.coef.shape[2])
+    n_bins = int(tie_core.floor.shape[2])
+
+    loose_terms = _make_basis_terms(settings.loose_spatial_degree, settings.loose_mag_degree)
+    missing_terms = [t for t in loose_terms if t not in tie_core.basis_terms]
+    if missing_terms:
+        msg = (
+            f"loose surface terms {missing_terms} are not in the core basis "
+            f"{tie_core.basis_terms}"
+        )
+        raise MultiNightError(msg)
+    term_cols = [tie_core.basis_terms.index(t) for t in loose_terms]
+    n_fit_min = max(settings.min_tie_stars, len(loose_terms) + 1)
+    min_split = max(10, settings.floor_min_bin_stars // 2)
+
+    ra0, dec0 = tie_core.centre_radec
+    xi_raw, eta_raw = _gnomonic(xmatch.ra[n_core_global:], xmatch.dec[n_core_global:], ra0, dec0)
+    xi = np.concatenate([tie_core.xi, xi_raw / tie_core.scale_deg])
+    eta = np.concatenate([tie_core.eta, eta_raw / tie_core.scale_deg])
+
+    coef = np.concatenate([tie_core.coef, np.zeros((n_loose, n_aper, n_coef))], axis=0)
+    zp = np.concatenate(
+        [_pad_stars(tie_core.zp, 1, n_pad, np.nan),
+         np.full((n_loose, n_global, n_aper), np.nan)], axis=0,
+    )
+    night_mag = np.concatenate(
+        [_pad_stars(tie_core.night_mag, 1, n_pad, np.nan),
+         np.full((n_loose, n_global, n_aper), np.nan)], axis=0,
+    )
+    night_mag_err = np.concatenate(
+        [_pad_stars(tie_core.night_mag_err, 1, n_pad, np.nan),
+         np.full((n_loose, n_global, n_aper), np.nan)], axis=0,
+    )
+    tie_star = np.concatenate(
+        [_pad_stars(tie_core.tie_star, 1, n_pad, False),
+         np.zeros((n_loose, n_global, n_aper), dtype=bool)], axis=0,
+    )
+    mean_mag = _pad_stars(tie_core.mean_mag, 0, n_pad, np.nan)
+    rejected = _pad_stars(tie_core.rejected, 0, n_pad, False)
+    floor = np.concatenate([tie_core.floor, np.full((n_loose, n_aper, n_bins), np.nan)], axis=0)
+    n_tie = np.concatenate([tie_core.n_tie, np.zeros((n_loose, n_aper), dtype=np.int64)], axis=0)
+    nan_rows = np.full((n_loose, n_aper), np.nan)
+    resid_mad = np.concatenate([tie_core.resid_mad, nan_rows], axis=0)
+    resid_mad_bright = np.concatenate([tie_core.resid_mad_bright, nan_rows], axis=0)
+    chi2_after = np.concatenate([tie_core.chi2_after, nan_rows], axis=0)
+    chi2_holdout = np.concatenate([tie_core.chi2_holdout, nan_rows], axis=0)
+    chi2_holdout_bins = np.concatenate(
+        [tie_core.chi2_holdout_bins, np.full((n_loose, n_aper, n_bins), np.nan)], axis=0
+    )
+    night_fwhm = np.concatenate([
+        tie_core.night_fwhm,
+        [float(nanmedian_quiet(night.fwhm[night.frame_kept])) for night in loose],
+    ])
+    crowding = _pad_stars(tie_core.crowding, 0, n_pad, np.nan)
+
+    for j, night in enumerate(loose):
+        n = n_core + j
+        index_n = xmatch.index[n : n + 1]
+        m_local, s_local = _nightly_mag_err(night)
+        night_mag[n] = _project_to_global(index_n, [m_local], np.nan)[0]
+        night_mag_err[n] = _project_to_global(index_n, [s_local], np.nan)[0]
+        comparison = _project_to_global(index_n, [night.comparison_mask], False)[0]
+        present = xmatch.index[n] >= 0
+
+        for a in range(n_aper):
+            frame_core, frame_err_core, n_frame_core = _core_frame(tie_core, a)
+            frame = _pad_stars(frame_core, 0, n_pad, np.nan)
+            frame_err = _pad_stars(frame_err_core, 0, n_pad, np.nan)
+            n_frame = _pad_stars(n_frame_core, 0, n_pad, 0)
+            dm_all = mean_mag[:, a] - tie_core.mag0[a]
+
+            zmask = present & np.isfinite(frame) & np.isfinite(dm_all)
+            gid = np.nonzero(zmask)[0]
+            x_z = _design_matrix(
+                {"xi": xi[gid], "eta": eta[gid], "dm": dm_all[gid]}, loose_terms
+            )
+            mn = night_mag[n, gid, a]
+            sn = night_mag_err[n, gid, a]
+            fr = frame[gid]
+            fe = frame_err[gid]
+            var0 = sn**2 + fe**2
+            err2 = var0 + settings.tie_err_floor_mag**2
+            base = (
+                comparison[gid, a] & np.isfinite(mn) & np.isfinite(sn) & (n_frame[gid] >= 2)
+                & ~rejected[gid, a]
+            )
+            rows = base.copy()
+            fit = None
+            for _ in range(settings.max_iter):
+                if np.count_nonzero(rows) < n_fit_min:
+                    msg = (
+                        f"aperture {a}: fewer than {n_fit_min} fit stars for loose night "
+                        f"{night.label} against the core frame"
+                    )
+                    raise MultiNightError(msg)
+                fit = _weighted_lstsq(x_z[rows], (mn - fr)[rows], 1.0 / err2[rows])
+                if fit is None:
+                    msg = f"aperture {a}: singular loose-night fit for {night.label}"
+                    raise MultiNightError(msg)
+                r = mn - fr - x_z @ fit
+                z_score = r / np.sqrt(err2)
+                sigma = float(mad_sigma(z_score[rows]))
+                if not (np.isfinite(sigma) and sigma > 0):
+                    break
+                new_rows = base & (np.abs(z_score) < settings.clip_sigma * sigma)
+                if np.array_equal(new_rows, rows):
+                    break
+                rows = new_rows
+            if np.count_nonzero(rows) < n_fit_min:
+                msg = (
+                    f"aperture {a}: fewer than {n_fit_min} fit stars for loose night "
+                    f"{night.label} against the core frame"
+                )
+                raise MultiNightError(msg)
+
+            coef[n, a, term_cols] = fit
+            zp[n, gid, a] = x_z @ fit
+            tie_star[n, gid[rows], a] = True
+            n_tie[n, a] = int(np.count_nonzero(rows))
+
+            r = mn - fr - x_z @ fit
+            m_z = mean_mag[gid, a]
+            resid_mad[n, a] = float(mad_sigma(r[rows]))
+            bright = _bright_decile_mask(m_z, rows)
+            resid_mad_bright[n, a] = float(mad_sigma(r[bright])) if np.any(bright) else np.nan
+
+            any_tie = tie_core.tie_star[:, :, a].any(axis=0)
+            if np.any(any_tie):
+                edges = np.quantile(
+                    tie_core.mean_mag[any_tie, a], np.linspace(0.0, 1.0, n_bins + 1)
+                )
+            else:
+                edges = np.linspace(-1.0, 1.0, n_bins + 1)
+            bin_z = np.clip(np.searchsorted(edges, m_z, side="right") - 1, 0, n_bins - 1)
+
+            r_f, s2_f, bin_f, gid_f = r[rows], var0[rows], bin_z[rows], gid[rows]
+            floor_a = _loose_floor_bins(r_f, s2_f, bin_f, n_bins, settings.floor_min_bin_stars)
+            floor[n, a] = floor_a
+            chi2_after[n, a], _chi2_bins = _loose_chi2(r_f, s2_f, bin_f, floor_a, n_bins)
+            if not np.any(np.isfinite(floor_a)):
+                logger.warning(
+                    "aperture %d: loose night %s has no magnitude bin with >= %d fit stars; "
+                    "calibration floor unavailable", a, night.label, settings.floor_min_bin_stars,
+                )
+            else:
+                logger.info(
+                    "aperture %d: loose night %s: %d fit stars, calibration floor, brightest "
+                    "-> faintest bin (mmag): %s", a, night.label, n_tie[n, a],
+                    np.array2string(floor_a * 1000.0, precision=2),
+                )
+
+            even = (gid_f % 2) == 0
+            floor_e = _loose_floor_bins(r_f[even], s2_f[even], bin_f[even], n_bins, min_split)
+            floor_o = _loose_floor_bins(r_f[~even], s2_f[~even], bin_f[~even], n_bins, min_split)
+            chi2_e, chi2_bin_e = _loose_chi2(
+                r_f[~even], s2_f[~even], bin_f[~even], floor_e, n_bins
+            )
+            chi2_o, chi2_bin_o = _loose_chi2(r_f[even], s2_f[even], bin_f[even], floor_o, n_bins)
+            with np.errstate(invalid="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                chi2_holdout[n, a] = np.nanmean([chi2_e, chi2_o])
+                chi2_holdout_bins[n, a] = np.nanmean(np.stack([chi2_bin_e, chi2_bin_o]), axis=0)
+
+    return NightTie(
+        labels=xmatch.labels,
+        anchor_index=tie_core.anchor_index,
+        coef=coef,
+        basis_terms=tie_core.basis_terms,
+        xi=xi,
+        eta=eta,
+        centre_radec=tie_core.centre_radec,
+        scale_deg=tie_core.scale_deg,
+        mag0=tie_core.mag0,
+        zp=zp,
+        mean_mag=mean_mag,
+        night_mag=night_mag,
+        night_mag_err=night_mag_err,
+        tie_star=tie_star,
+        rejected=rejected,
+        floor_mag_centres=tie_core.floor_mag_centres,
+        floor=floor,
+        n_tie=n_tie,
+        resid_mad=resid_mad,
+        resid_mad_bright=resid_mad_bright,
+        chi2_after=chi2_after,
+        chi2_holdout=chi2_holdout,
+        chi2_holdout_bins=chi2_holdout_bins,
+        n_iter=tie_core.n_iter,
+        seeing_basis_terms=tie_core.seeing_basis_terms,
+        seeing_coef=tie_core.seeing_coef,
+        seeing_mag0=tie_core.seeing_mag0,
+        seeing_crowd0=tie_core.seeing_crowd0,
+        night_fwhm=night_fwhm,
+        crowding=crowding,
+        loose=np.concatenate([np.zeros(n_core, dtype=bool), np.ones(n_loose, dtype=bool)]),
+    )
+
+
 def evaluate_zero_point(
     tie: NightTie, night_index: int, aperture: int, xi: np.ndarray, eta: np.ndarray,
     mag: np.ndarray, crowding: np.ndarray | None = None,
@@ -1130,7 +1528,9 @@ def evaluate_zero_point(
     ``beta(mag, crowding) * (F_n - F_anchor)`` -- see the module docstring
     and :func:`tie_nights`. It is required whenever ``tie.seeing_basis_terms``
     is non-empty (``settings.use_seeing_term`` was ``True``); with an empty
-    ``tie.seeing_basis_terms`` (``use_seeing_term=False``) it is ignored.
+    ``tie.seeing_basis_terms`` (``use_seeing_term=False``) it is ignored. A loose
+    night (``tie.loose[night_index]``) has no seeing term either, so ``crowding``
+    is ignored for it.
     """
     xi = np.asarray(xi, dtype=np.float64)
     if night_index == tie.anchor_index:
@@ -1140,7 +1540,7 @@ def evaluate_zero_point(
     design = _design_matrix({"xi": xi, "eta": eta, "dm": dm}, tie.basis_terms)
     z = design @ tie.coef[night_index, aperture]
 
-    if tie.seeing_basis_terms:
+    if tie.seeing_basis_terms and not tie.loose[night_index]:
         if crowding is None:
             msg = "tie has a fitted seeing term (use_seeing_term=True); crowding is required"
             raise MultiNightError(msg)
@@ -1185,9 +1585,15 @@ class MultiNightLightCurves:
 
 
 def _choose_aperture(
-    nights: list[NightProducts], xmatch: NightCrossMatch, settings: MultiNightSettings
+    nights: list[NightProducts], xmatch: NightCrossMatch, settings: MultiNightSettings,
+    loose: np.ndarray,
 ) -> np.ndarray:
-    """Per global star, the single aperture used in every night (see the module docstring)."""
+    """Per global star, the single aperture used in every night (see the module docstring).
+
+    Loose nights do not vote: the choice (the aperture of the lowest median RMS over
+    nights) uses the core nights only, so it is the one a run without the loose
+    nights makes, and a star only a loose night contains has no aperture.
+    """
     n_aper = nights[0].n_aper
     n_global = xmatch.ra.shape[0]
     if settings.aperture >= 0:
@@ -1197,6 +1603,7 @@ def _choose_aperture(
         return np.full(n_global, settings.aperture, dtype=np.int64)
 
     night_rms = _project_to_global(xmatch.index, [night.rms for night in nights], np.nan)
+    night_rms[loose] = np.nan
     med_rms = nanmedian_quiet(night_rms, axis=0)  # (n_global, n_aper)
     has_finite = np.isfinite(med_rms).any(axis=1)
     med_rms_filled = np.where(np.isfinite(med_rms), med_rms, np.inf)
@@ -1212,7 +1619,7 @@ def build_multinight_lightcurves(
     n_global = xmatch.ra.shape[0]
     labels = xmatch.labels
 
-    aperture = _choose_aperture(nights, xmatch, settings)
+    aperture = _choose_aperture(nights, xmatch, settings, tie.loose)
     has_aper = aperture >= 0
     aper_safe = np.where(has_aper, aperture, 0)
 
@@ -1364,6 +1771,7 @@ def save_multinight(
         tie_seeing_crowd0=tie.seeing_crowd0,
         tie_night_fwhm=tie.night_fwhm,
         tie_crowding=tie.crowding,
+        tie_loose=tie.loose,
         mlc_night_of_frame=mlc.night_of_frame,
         mlc_frame_in_night=mlc.frame_in_night,
         mlc_bjd_tdb=mlc.bjd_tdb,
@@ -1430,6 +1838,7 @@ def load_multinight(
             seeing_crowd0=data["tie_seeing_crowd0"],
             night_fwhm=data["tie_night_fwhm"],
             crowding=data["tie_crowding"],
+            loose=data["tie_loose"] if "tie_loose" in data.files else None,
         )
         mlc = MultiNightLightCurves(
             labels=labels,

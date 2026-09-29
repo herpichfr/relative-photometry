@@ -458,3 +458,28 @@ def test_combined_analyze_uses_tied_mag(test_conn, tmp_path) -> None:
         row = cur.fetchone()
     assert row is not None
     assert row[0] == "tied-mag"
+
+
+def test_load_multinight_stores_loose_night_ids(test_conn, tmp_path) -> None:
+    scenario = _build_scenario(test_conn, tmp_path)
+    npz_path = scenario["stem"].with_suffix(".npz")
+
+    # the hand-written file has no `tie_loose` key (a file older than the field): no loose night
+    report = load_multinight(test_conn, scenario["stem"])
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT loose_night_ids FROM relphot.mn_run WHERE mn_run_id = %s", (report.mn_run_id,)
+        )
+        assert cur.fetchone() == ([],)
+
+    with np.load(npz_path, allow_pickle=False) as data:
+        contents = {k: data[k] for k in data.files}
+    np.savez(npz_path, **contents, tie_loose=np.array([False, True]))
+    reloaded = load_multinight(test_conn, scenario["stem"])
+    assert reloaded.mn_run_id == report.mn_run_id  # a reload reuses the run
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT loose_night_ids FROM relphot.mn_run WHERE mn_run_id = %s",
+            (reloaded.mn_run_id,),
+        )
+        assert cur.fetchone() == ([scenario["report2"].night_id],)
