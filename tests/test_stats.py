@@ -7,7 +7,7 @@ from conftest import make_synthetic_night
 
 from relphot.comparison import select_comparison_stars
 from relphot.config import Settings
-from relphot.lightcurve import compute_light_curves
+from relphot.lightcurve import LightCurveResult, compute_light_curves
 from relphot.reference import (
     build_references,
     select_candidates,
@@ -139,3 +139,92 @@ def test_best_aperture_per_star() -> None:
     with_core_and_mag = with_core & np.isfinite(comparison_result.mag[:, 0])
     for i in np.where(with_core_and_mag)[0]:
         assert star_best_aper[i] >= -1, f"Star {i} should have aperture >= -1"
+
+
+def test_expected_noise_stays_formal_and_chi2_uses_the_inflated_error() -> None:
+    """With error inflation ``expected_noise`` is the formal prediction, ``chi2`` the used error."""
+    from relphot.lightcurve import LightCurveResult
+
+    n_stars, n_frames = 5, 200
+    rng = np.random.default_rng(7)
+    lc = (1.0 + 0.03 * rng.standard_normal((n_stars, n_frames, 1))).astype(np.float32)
+    raw = np.full((n_stars, n_frames, 1), 0.01, dtype=np.float32)
+    scale = np.full((n_stars, 1), 3.0)
+    lc_result = LightCurveResult(
+        lc=lc, lc_err=raw * 3.0, lc_raw=lc.copy(), epoch_ok=np.ones((n_stars, n_frames), bool),
+        decorrelation=None, lc_err_raw=raw, err_scale=scale,
+        blended=np.array([True, False, False, False, False]),
+    )
+    stats = compute_star_stats(lc_result)
+
+    np.testing.assert_allclose(stats.expected_noise[:, 0], 0.01, rtol=1e-2)
+    # scatter 0.03 against the inflated error 0.03: chi2_red ~ 1 (it would be ~9 against 0.01)
+    assert np.all((stats.chi2_reduced[:, 0] > 0.7) & (stats.chi2_reduced[:, 0] < 1.4))
+    assert stats.err_scale is scale
+    assert stats.blended.tolist() == [True, False, False, False, False]
+
+    # a result without inflation information behaves exactly as before
+    plain = LightCurveResult(
+        lc=lc, lc_err=raw, lc_raw=lc.copy(), epoch_ok=np.ones((n_stars, n_frames), bool),
+        decorrelation=None,
+    )
+    stats0 = compute_star_stats(plain)
+    np.testing.assert_allclose(stats0.expected_noise[:, 0], 0.01, rtol=1e-2)
+    assert stats0.err_scale is None and stats0.blended is None
+
+
+def test_compute_star_stats_near_edge_passthrough() -> None:
+    """compute_star_stats passes through near_edge array."""
+    n_stars = 5
+    n_frames = 10
+    n_aper = 1
+    lc = np.ones((n_stars, n_frames, n_aper))
+    raw = np.ones((n_stars, n_frames, n_aper)) * 0.01
+    lc_result = LightCurveResult(
+        lc=lc, lc_err=raw, lc_raw=lc.copy(), epoch_ok=np.ones((n_stars, n_frames), bool),
+        decorrelation=None,
+    )
+
+    # Create near_edge mask
+    near_edge = np.array([True, False, True, False, True])
+
+    stats = compute_star_stats(lc_result, near_edge=near_edge)
+
+    assert stats.near_edge is not None
+    np.testing.assert_array_equal(stats.near_edge, near_edge)
+
+
+def test_compute_star_stats_near_edge_defaults_none() -> None:
+    """compute_star_stats defaults to near_edge=None."""
+    n_stars = 5
+    n_frames = 10
+    n_aper = 1
+    lc = np.ones((n_stars, n_frames, n_aper))
+    raw = np.ones((n_stars, n_frames, n_aper)) * 0.01
+    lc_result = LightCurveResult(
+        lc=lc, lc_err=raw, lc_raw=lc.copy(), epoch_ok=np.ones((n_stars, n_frames), bool),
+        decorrelation=None,
+    )
+
+    stats = compute_star_stats(lc_result)
+
+    assert stats.near_edge is None
+
+
+def test_compute_star_stats_tailed_passthrough() -> None:
+    """compute_star_stats passes through the tailed array and defaults it to None."""
+    n_stars = 5
+    n_frames = 10
+    lc = np.ones((n_stars, n_frames, 1))
+    raw = np.ones((n_stars, n_frames, 1)) * 0.01
+    lc_result = LightCurveResult(
+        lc=lc, lc_err=raw, lc_raw=lc.copy(), epoch_ok=np.ones((n_stars, n_frames), bool),
+        decorrelation=None,
+    )
+    tailed = np.array([False, True, False, False, True])
+
+    stats = compute_star_stats(lc_result, tailed=tailed)
+
+    assert stats.tailed is not None
+    np.testing.assert_array_equal(stats.tailed, tailed)
+    assert compute_star_stats(lc_result).tailed is None

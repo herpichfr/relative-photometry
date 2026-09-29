@@ -7,7 +7,8 @@ versioned migrations packaged under :mod:`relphot.db.sql`;
 :mod:`relphot.db.load_multinight` loads one multi-night tie run's tie rows
 and detections; :mod:`relphot.db.refresh` recomputes derived
 ``relphot.object`` summaries; :mod:`relphot.db.analyze` computes
-periodograms and PERIOD. Requires the ``db`` extra
+periodograms and PERIOD; :mod:`relphot.db.reprocess` works off the web's user-guided
+reprocess requests. Requires the ``db`` extra
 (``pip install 'relphot[db]'``).
 """
 
@@ -18,12 +19,14 @@ from relphot.db.connect import connect, default_env_path, read_env_value, resolv
 from relphot.db.load_multinight import MultiNightLoadReport, load_multinight
 from relphot.db.load_night import LoadReport, load_night
 from relphot.db.refresh import refresh_objects
+from relphot.db.reprocess import ReprocessReport, reprocess
 from relphot.db.schema import current_version, init_schema, migration_files
 
 __all__ = [
     "AnalyzeReport",
     "LoadReport",
     "MultiNightLoadReport",
+    "ReprocessReport",
     "analyze",
     "connect",
     "current_version",
@@ -34,5 +37,6 @@ __all__ = [
     "migration_files",
     "read_env_value",
     "refresh_objects",
+    "reprocess",
     "resolve_dsn",
 ]

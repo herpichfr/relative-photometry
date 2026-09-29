@@ -43,6 +43,26 @@
           </label>
         </fieldset>
 
+        <fieldset>
+          <legend>Night review</legend>
+          <label>Needs review
+            <select id="filter-needs-review" name="needs_review"
+                    title="objects with a night (or multi-night event) still awaiting your verdict">
+              <option value="">any</option>
+              <option value="true">yes</option>
+              <option value="false">no</option>
+            </select>
+          </label>
+          <label>Reviewed by you
+            <select id="filter-user-reviewed" name="user_reviewed"
+                    title="objects with at least one night carrying a verdict, a note or a decided event">
+              <option value="">any</option>
+              <option value="true">yes</option>
+              <option value="false">no</option>
+            </select>
+          </label>
+        </fieldset>
+
         <label class="field">Min transit-match p
           <input type="number" step="any" min="0" max="1" id="filter-min-p-match" name="min_p_match"
                  title="objects with a pair of transit events whose matching probability is at least this">
@@ -205,7 +225,7 @@
         <table id="detail-detections">
           <thead>
             <tr><th>Kind</th><th>Source</th><th>SNR</th><th>Depth</th><th>Duration</th>
-                <th>Tier</th><th>Period</th><th>FAP</th></tr>
+                <th>Tier</th><th>Period</th><th>FAP</th><th>Status</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -243,27 +263,48 @@
 
     <h3>Period verification</h3>
     <div class="note">One row per re-observation (set of nights): the period found in the data
-      against the literature period; delta = P_obs / harmonic - P_lit.</div>
+      against the literature period; delta = P_obs / harmonic - P_lit. A period longer than a
+      night (1 d) is measured on tie-calibrated magnitudes without per-night offsets and needs a
+      multi-night tie; phase coverage below 50% (in red) means the period is poorly sampled.
+      <b>LS-guided</b> rows come from a re-run with your own period guess (see below).</div>
     <div class="table-scroll">
       <table id="detail-period-estimates">
         <thead>
-          <tr><th>Computed</th><th>Nights</th><th>Last night</th><th>Baseline (d)</th>
-              <th>P_obs (d)</th><th>Harmonic</th><th>P_lit (d)</th><th>Delta (d)</th>
-              <th>z</th><th>Verification</th><th>Note</th></tr>
+          <tr><th>Computed</th><th>Method</th><th>Nights</th><th>Last night</th>
+              <th>Baseline (d)</th><th>Guess (d)</th><th>P_obs (d)</th><th>Harmonic</th>
+              <th>P_lit (d)</th><th>Delta (d)</th><th>z</th>
+              <th title="fraction of 20 phase bins holding a point">Coverage</th>
+              <th title="baseline in periods">Cycles</th><th>Verification</th><th>Note</th>
+              <th></th></tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
     <div id="plot-period-verification" class="plot"></div>
 
+    <h3>Night reviews</h3>
+    <div class="note">Your verdicts apply only to the night they are set on. New nights are always
+      evaluated automatically. Blank = use the automatic result. Literature (known planet/variable)
+      always counts.</div>
+    <div id="night-review-summary" class="note"></div>
+    <div class="table-scroll">
+      <table id="detail-night-reviews">
+        <thead>
+          <tr><th>Night</th><th>Auto EXOP</th><th>Auto VAR</th><th>EXOP</th><th>VAR</th>
+              <th>Note</th><th>Effective</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
     <h3>Manual edit</h3>
     <div id="edit-box" class="button-row">
-      <label><input type="checkbox" id="edit-exop-check"> Exoplanet host</label>
+      <label><input type="checkbox" id="edit-exop-check"> Exoplanet host (set on the nights loaded now)</label>
       <button type="button" id="btn-reset-exop-auto">reset to auto</button>
-      <label><input type="checkbox" id="edit-var-check"> Variable</label>
+      <label><input type="checkbox" id="edit-var-check"> Variable (set on the nights loaded now)</label>
       <button type="button" id="btn-reset-var-auto">reset to auto</button>
       <span id="edit-flag-source" class="note"></span>
-      <label>Status
+      <label>Status (informational, does not change class)
         <select id="edit-status-select">
           <option value="">-</option>
           <option value="UNCONFIRMED">UNCONFIRMED</option>
@@ -286,14 +327,81 @@
     <div id="night-buttons" class="button-row"></div>
     <div id="plot-lightcurve" class="plot"></div>
 
-    <h3>Phase diagram</h3>
-    <div class="button-row">
-      <label>Period (days) <input type="number" step="any" id="phase-period-input"></label>
-      <button type="button" id="btn-phase-x2">x2</button>
-      <button type="button" id="btn-phase-div2">/2</button>
-      <span id="phase-period-note" class="note"></span>
+    <div id="phase-section">
+      <h3>Phase diagram</h3>
+      <div class="note">All nights folded at the chosen period, coloured by night (error bars
+        include the inflation for blended stars).</div>
+      <div id="phase-mode-note" class="note"></div>
+      <div class="button-row">
+        <label>Period from
+          <select id="phase-candidate-select"></select>
+        </label>
+        <label>Period (days) <input type="number" step="any" min="0" id="phase-period-input"></label>
+        <button type="button" id="btn-phase-x2">x2</button>
+        <button type="button" id="btn-phase-div2">/2</button>
+        <label>Epoch
+          <select id="phase-epoch-select">
+            <option value="first">first epoch</option>
+            <option value="fit">fitted phase zero (deepest minimum)</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="phase-range-check"> phase -0.25 to 1.25</label>
+        <label><input type="checkbox" id="phase-model-check" checked> Fourier model</label>
+      </div>
+      <div id="phase-coverage-note" class="note"></div>
+      <div id="phase-aliases" class="button-row"></div>
+      <div id="plot-phase" class="plot"></div>
     </div>
-    <div id="plot-phase" class="plot"></div>
+
+    <h3>Re-run (on demand)</h3>
+    <div class="note">Nothing is re-run unless you tick RERUN, fill an entry and press the run button.
+      Per night tick EXOP (transit centre + width: trapezoid fit, adds a user event; search events are
+      never touched) and/or VAR (period guess: adds an LS-guided estimate; PERIOD changes only if you
+      adopt it). "All nights rerun" uses every night of the object; unticked, the period search uses
+      only the chosen night. Clicking the light curve fills the transit centre of the entry you last
+      edited. The worker (<code>relphot db reprocess --watch</code>) works the queue off.</div>
+    <label id="rerun-toggle"><input type="checkbox" id="rerun-check"> RERUN</label>
+    <div id="rerun-panel" hidden>
+      <div id="rerun-entries"></div>
+      <div class="button-row">
+        <label class="field-wide">Note <input type="text" id="rp-note" maxlength="2000"></label>
+        <button type="button" id="btn-rp-submit">Run selected re-runs</button>
+        <span id="rp-msg"></span>
+      </div>
+    </div>
+    <template id="rerun-entry-template">
+      <fieldset class="rerun-entry">
+        <legend class="rr-title"></legend>
+        <div class="button-row">
+          <label class="rr-night-label">Night <select class="rr-night"></select></label>
+          <label><input type="checkbox" class="rr-exop"> EXOP</label>
+          <label><input type="checkbox" class="rr-var"> VAR</label>
+        </div>
+        <div class="button-row rr-exop-box" hidden>
+          <label>Transit centre, BJD_TDB (within the night) <input type="number" step="any" class="rr-tc"></label>
+          <label>Width of the suspected eclipse (h, 0.1 to 12) <input type="number" step="any" min="0.1" max="12" class="rr-width"></label>
+        </div>
+        <div class="button-row rr-var-box" hidden>
+          <label>Period guess (days) <input type="number" step="any" min="0" class="rr-period"></label>
+          <label><input type="checkbox" class="rr-all-nights"> All nights rerun</label>
+          <span class="note">One night can only constrain periods shorter than about its span.</span>
+        </div>
+        <div class="button-row">
+          <label class="rr-add-label"><input type="checkbox" class="rr-add"> Add another rerun</label>
+          <span class="rr-msg warn"></span>
+        </div>
+      </fieldset>
+    </template>
+    <div id="rp-queue" class="note"></div>
+    <div class="table-scroll">
+      <table id="detail-reprocess">
+        <thead>
+          <tr><th>#</th><th>Kind</th><th>Guess</th><th>Requested</th><th>Status</th>
+              <th>Result</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
 
     <h3>Periodogram</h3>
     <div class="button-row">

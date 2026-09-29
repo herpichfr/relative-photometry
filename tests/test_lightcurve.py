@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
+import pytest
 from conftest import make_synthetic_night
 
 from relphot.comparison import select_comparison_stars
 from relphot.config import Settings
-from relphot.lightcurve import compute_light_curves
+from relphot.exceptions import ConfigError
+from relphot.lightcurve import (
+    NEIGHBOUR_FLAG_MASK,
+    compute_light_curves,
+    error_inflation,
+    point_to_point_sigma,
+)
 from relphot.reference import (
     build_references,
     select_candidates,
@@ -243,3 +252,134 @@ def test_lightcurve_best_aperture_selection() -> None:
             break
 
     assert differs, "Best aperture should differ between magnitude bins for at least one tile"
+
+
+# --------------------------------------------------------------------------
+# error inflation (blended / excess-scatter stars)
+# --------------------------------------------------------------------------
+
+_N_FRAMES = 300
+
+
+def _inflation_case(seed: int = 0):
+    """4 stars, 1 aperture, formal error 0.005 everywhere.
+
+    star 0: blended (neighbour flag in 30 % of frames), scatter 3x the error;
+    star 1: unblended, scatter 3x the error; star 2: unblended, scatter = error;
+    star 3: blended, scatter = error.
+    """
+    rng = np.random.default_rng(seed)
+    err = 0.005
+    scatter = np.array([3.0, 3.0, 1.0, 1.0]) * err
+    lc = 1.0 + rng.standard_normal((4, _N_FRAMES, 1)) * scatter[:, None, None]
+    lc_err = np.full((4, _N_FRAMES, 1), err)
+    epoch_ok = np.ones((4, _N_FRAMES), dtype=bool)
+    flags = np.zeros((4, _N_FRAMES), dtype=np.int32)
+    flags[0, ::3] = 2
+    flags[3, ::3] = 1
+    return lc, lc_err, epoch_ok, flags
+
+
+def _settings_with(mode: str) -> Settings:
+    base = Settings()
+    return replace(base, lightcurve=replace(base.lightcurve, inflate_errors=mode))
+
+
+def test_point_to_point_sigma_ignores_a_transit_and_slow_variability() -> None:
+    """sigma_p2p reads the white noise, not a 3 % transit nor a slow sinusoid (transit-safe)."""
+    rng = np.random.default_rng(1)
+    n = 400
+    t = np.arange(n)
+    clean = 1.0 + 0.005 * rng.standard_normal(n)
+    dip = np.where((t > 150) & (t < 200), 0.03, 0.0)
+    slow = 0.02 * np.sin(2 * np.pi * t / 150.0)
+    lc = np.stack([clean, clean - dip + slow], axis=0)[:, :, None]
+    sigma = point_to_point_sigma(lc, np.ones((2, n), dtype=bool))
+    assert sigma[0, 0] == pytest.approx(0.005, rel=0.15)
+    assert sigma[1, 0] == pytest.approx(sigma[0, 0], rel=0.05)
+
+
+def test_point_to_point_sigma_needs_enough_pairs_and_skips_dropped_epochs() -> None:
+    lc = 1.0 + 0.01 * np.random.default_rng(2).standard_normal((2, 30, 1))
+    ok = np.ones((2, 30), dtype=bool)
+    ok[1, ::2] = False  # every other epoch dropped: no two consecutive kept epochs
+    sigma = point_to_point_sigma(lc, ok, min_pairs=10)
+    assert np.isfinite(sigma[0, 0])
+    assert np.isnan(sigma[1, 0])
+
+
+def test_inflation_blended_mode_scales_only_the_blended_star() -> None:
+    lc, lc_err, epoch_ok, flags = _inflation_case()
+    scale, blended = error_inflation(lc, lc_err, epoch_ok, flags, _settings_with("blended"))
+    assert blended.tolist() == [True, False, False, True]
+    assert scale[0, 0] == pytest.approx(3.0, rel=0.2)
+    # the same excess on an unblended star is NOT inflated with setting 'blended'
+    assert scale[1, 0] == 1.0
+    assert scale[2, 0] == 1.0
+    # a blended star that is not noisier than its error keeps a factor of ~1 (never below 1)
+    assert 1.0 <= scale[3, 0] < 1.25
+
+
+def test_inflation_other_modes() -> None:
+    lc, lc_err, epoch_ok, flags = _inflation_case()
+    excess, _ = error_inflation(lc, lc_err, epoch_ok, flags, _settings_with("excess"))
+    assert excess[0, 0] == pytest.approx(3.0, rel=0.2)
+    assert excess[1, 0] == pytest.approx(3.0, rel=0.2)  # unblended but a clear excess
+    assert excess[2, 0] == 1.0  # ~1.0x: below err_scale_excess_min, unblended
+    everyone, _ = error_inflation(lc, lc_err, epoch_ok, flags, _settings_with("all"))
+    assert np.all(everyone >= 1.0)
+    assert everyone[2, 0] == pytest.approx(1.0, abs=0.25)
+    none, blended = error_inflation(lc, lc_err, epoch_ok, flags, _settings_with("none"))
+    assert np.all(none == 1.0)
+    assert blended[0]  # the flag verdict is reported whatever the mode
+    with pytest.raises(ConfigError, match="inflate_errors"):
+        error_inflation(lc, lc_err, epoch_ok, flags, _settings_with("sometimes"))
+
+
+def test_inflation_counts_only_kept_epochs_for_the_blend_fraction() -> None:
+    lc, lc_err, epoch_ok, flags = _inflation_case()
+    flags[1, :] = 0
+    flags[1, :20] = NEIGHBOUR_FLAG_MASK  # 20 flagged frames ...
+    epoch_ok[1, 20:] = False  # ... but they are ALL the star's kept frames
+    _scale, blended = error_inflation(lc, lc_err, epoch_ok, flags, _settings_with("blended"))
+    assert blended[1]
+
+
+def test_compute_light_curves_inflates_lc_err_and_keeps_the_raw_error() -> None:
+    """End to end on a synthetic night: an injected 3x excess on a blended star."""
+    night, _airmass, _flux0 = make_synthetic_night(n_stars=400, n_frames=60, seed=21)
+    settings = replace(
+        Settings(),
+        decorrelation=replace(Settings().decorrelation, enabled=False),
+        lightcurve=replace(Settings().lightcurve, inflate_errors="blended"),
+    )
+    blended_star, plain_star = 10, 11
+    rng = np.random.default_rng(5)
+    for i in (blended_star, plain_star):
+        night.flux[i, :, 0] += rng.standard_normal(night.n_frames) * 3.0 * night.fluxerr[i, :, 0]
+    night.flags[blended_star, ::2] = 2
+
+    variable_mask = np.zeros(night.n_stars, dtype=bool)
+    candidates = select_candidates(night, variable_mask, settings, aper=0)
+    tilemap = build_tilemap(night, candidates, settings)
+    frame_selection = select_reference_frames_and_stars(
+        night, tilemap, candidates, settings, aper=0
+    )
+    reference_result = build_references(night, tilemap, frame_selection, settings)
+    comparison_result = select_comparison_stars(
+        night, tilemap, reference_result, variable_mask, settings
+    )
+    assert tilemap.core_tile[blended_star] >= 0 and tilemap.core_tile[plain_star] >= 0
+
+    res = compute_light_curves(night, tilemap, reference_result, comparison_result, settings)
+
+    assert res.blended[blended_star] and not res.blended[plain_star]
+    assert res.err_scale[blended_star, 0] > 1.8
+    assert res.err_scale[plain_star, 0] == 1.0
+    ok = res.epoch_ok[blended_star]
+    np.testing.assert_allclose(
+        res.lc_err[blended_star, ok, 0],
+        res.lc_err_raw[blended_star, ok, 0] * res.err_scale[blended_star, 0],
+        rtol=1e-5,
+    )
+    np.testing.assert_array_equal(res.lc_err[plain_star], res.lc_err_raw[plain_star])

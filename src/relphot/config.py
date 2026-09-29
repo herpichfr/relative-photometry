@@ -19,6 +19,7 @@ from typing import Any
 from relphot.exceptions import ConfigError
 
 __all__ = [
+    "BorderSettings",
     "CatalogSettings",
     "ColumnMap",
     "ComparisonSettings",
@@ -30,6 +31,7 @@ __all__ = [
     "SearchSettings",
     "Settings",
     "SiteSettings",
+    "TailSettings",
     "TileSettings",
     "VariableSettings",
     "load_settings",
@@ -357,6 +359,19 @@ class DbSettings:
     #: Half-width, as a fraction of ``lit_period * harmonic``, of the window in
     #: which a literature period is verified against the data.
     lit_period_window_frac: float = 0.05
+    #: Periods longer than this (days) cannot be measured on per-night-normalised
+    #: flux, nor with a free offset per night: both absorb variability slower than
+    #: a night. Their period analysis uses tie-calibrated magnitudes and no
+    #: per-night offsets, and needs a multi-night tie covering >= 2 nights.
+    long_period_days: float = 1.0
+    #: Half-width, as a fraction of ``period_guess * harmonic``, of the windows a
+    #: user-guided period search (``relphot db reprocess``) looks in (harmonics 0.5, 1, 2).
+    guided_period_window_frac: float = 0.2
+    #: Number of phase bins used for ``period_estimate.phase_coverage`` (the
+    #: fraction of them holding at least one point).
+    phase_coverage_bins: int = 20
+    #: Most alias / next-peak candidate periods stored per period estimate.
+    max_alias_candidates: int = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +383,23 @@ class LightcurveSettings:
     keep_all_apertures_in_table: bool = False
     output_format: str = "auto"
     make_plot: bool = True
+    #: Which stars get ``lc_err`` inflated by their point-to-point excess scatter
+    #: (``err_scale = max(1, sigma_p2p / median(lc_err))``, see
+    #: :func:`relphot.lightcurve.error_inflation`): ``"none"``; ``"blended"`` (stars whose
+    #: SExtractor neighbour/blend flags are set in at least ``blend_min_frame_fraction`` of
+    #: the kept frames); ``"excess"`` (blended stars, plus any star whose measured
+    #: ``err_scale`` is at least ``err_scale_excess_min`` -- the excess is a bright-star
+    #: noise floor the formal errors lack, whether or not the star is blended); ``"all"``.
+    inflate_errors: str = "excess"
+    #: Fraction of a star's kept frames with a neighbour/blend FLAGS bit (1 or 2) at which
+    #: it counts as blended.
+    blend_min_frame_fraction: float = 0.05
+    #: ``inflate_errors = "excess"``: smallest measured ``err_scale`` that is inflated
+    #: for a star that is not blended.
+    err_scale_excess_min: float = 1.5
+    #: Fewest consecutive-epoch differences a star/aperture needs for a point-to-point
+    #: estimate; below it ``err_scale`` is 1.
+    p2p_min_pairs: int = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -526,6 +558,59 @@ class SearchSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class BorderSettings:
+    """Night-level border-eligibility cut for reference and comparison stars.
+
+    Comparison and reference stars must never come from near the detector border.
+    Margins are computed per night from the measured per-night drift and telescope-
+    specific extra margins. The T80S 20 rows at top and bottom are per the user's
+    statement, not reproduced from the reduced SCI planes.
+
+    ``telescope_extra_px``: per-telescope extra margins [left, right, bottom, top] (px),
+    keys are upper-cased TELESCOP header values. List order and JSON round trip.
+    ``edge_buffer_px`` covers the largest aperture (8 px) + background mesh + rotation.
+    """
+
+    enabled: bool = True
+    edge_buffer_px: float = 30.0
+    drift_min_common_stars: int = 20
+    telescope_extra_px: dict[str, list[float]] = field(default_factory=lambda: {
+        "T80": [0.0, 0.0, 20.0, 20.0], "T80S": [0.0, 0.0, 20.0, 20.0]})
+
+
+@dataclass(frozen=True, slots=True)
+class TailSettings:
+    """Night-level isolated-dip ("tail") cut for reference and comparison stars.
+
+    A star with at least ``min_low`` epochs below ``-k_sigma`` (and ``asym_ratio`` times
+    as many below as above ``+k_sigma``) in its residual against the local median of its
+    ``n_neighbours`` nearest bright stars is withdrawn from the reference and the
+    comparison pool for the whole night; it keeps its light curve and is still searched.
+    Residuals are detrended with a running median over ``window`` epochs (an odd number;
+    a transit longer than ``window // 2`` epochs is not touched), divided by the star's
+    point-to-point sigma and by a per-frame noise factor (cloud).
+
+    ``aperture``: aperture index the screen is computed at; -1 means the default
+    aperture (1 if the night has at least two apertures, else 0). One aperture serves
+    the reference and every comparison pool, so the same stars are removed from both.
+    ``pool_min_snr``: median SNR a neighbour star needs (it must also have FLAGS == 0
+    wherever present). ``min_snr``: median SNR a star needs to be evaluated.
+    ``min_epochs``: valid epochs a star needs to be evaluated.
+    """
+
+    enabled: bool = True
+    aperture: int = -1
+    k_sigma: float = 5.0
+    min_low: int = 3
+    asym_ratio: float = 3.0
+    window: int = 7
+    n_neighbours: int = 25
+    pool_min_snr: float = 15.0
+    min_snr: float = 5.0
+    min_epochs: int = 20
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Top-level relphot settings."""
 
@@ -540,6 +625,8 @@ class Settings:
     search: SearchSettings = field(default_factory=SearchSettings)
     multinight: MultiNightSettings = field(default_factory=MultiNightSettings)
     db: DbSettings = field(default_factory=DbSettings)
+    border: BorderSettings = field(default_factory=BorderSettings)
+    tails: TailSettings = field(default_factory=TailSettings)
 
 
 def _build(cls: type, data: dict[str, Any], origin: str, path: str) -> Any:

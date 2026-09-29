@@ -124,6 +124,9 @@ def load_night(path: Path | str) -> tuple[MatchedNight, Settings]:
             n_sources=d["n_sources"],
             aperture_radii_px=tuple(d["aperture_radii_px"]),
             wcs=None,
+            naxis1=d.get("naxis1", 0),
+            naxis2=d.get("naxis2", 0),
+            telescope=d.get("telescope", ""),
         )
         for d in frame_meta_raw
     ]
@@ -290,6 +293,13 @@ def save_lightcurves_npz(
         "config_json": config_json,
     }
 
+    if lc_result.lc_err_raw is not None:
+        savez_dict["lc_err_raw"] = lc_result.lc_err_raw
+    if lc_result.err_scale is not None:
+        savez_dict["err_scale"] = lc_result.err_scale
+    if lc_result.blended is not None:
+        savez_dict["blended"] = lc_result.blended
+
     if lc_result.decorrelation is not None:
         savez_dict["decorr_beta_star"] = lc_result.decorrelation.beta_star
         savez_dict["decorr_lc_corrected"] = lc_result.decorrelation.lc_corrected
@@ -331,6 +341,10 @@ def load_lightcurves_npz(path: Path | str):
             lc_raw=data["lc_raw"],
             epoch_ok=data["epoch_ok"],
             decorrelation=None,  # Will be set below if present
+            # products written before error inflation carry none of these
+            lc_err_raw=data.get("lc_err_raw"),
+            err_scale=data.get("err_scale"),
+            blended=data.get("blended"),
         )
 
         star_stats = StarStats(
@@ -338,6 +352,8 @@ def load_lightcurves_npz(path: Path | str):
             chi2_reduced=data["chi2_reduced"],
             expected_noise=data["expected_noise"],
             n_epochs=data["n_epochs"],
+            err_scale=lc_result.err_scale,
+            blended=lc_result.blended,
         )
 
         best_aper_per_tile = data["best_aper_per_tile"]
@@ -456,6 +472,9 @@ def save_lightcurve_table(
         "lc_err": lc_result.lc_err[si, fj, ak],
         "lc_raw": lc_result.lc_raw[si, fj, ak],
     }
+    if lc_result.lc_err_raw is not None:
+        # lc_err above is the inflated error; the formal one stays available
+        columns["lc_err_raw"] = lc_result.lc_err_raw[si, fj, ak]
     if settings.lightcurve.keep_all_apertures_in_table:
         columns["is_best_aperture"] = ak == best_a[si]
     table = Table(columns)
@@ -557,6 +576,28 @@ def save_starstats_table(
             "expected_noise": _at_best(star_stats.expected_noise, np.nan),
             "n_epochs": _at_best(star_stats.n_epochs, 0).astype(np.int64),
             "is_comparison": _at_best(comparison_result.mask, False).astype(bool),
+            # factor applied to lc_err at the best aperture (1 = none) and the neighbour-flag
+            # verdict; a stats object without them (older product) reads as 1 / False
+            "err_scale": (
+                _at_best(star_stats.err_scale, 1.0)
+                if star_stats.err_scale is not None
+                else np.ones(idx.size)
+            ),
+            "blended": (
+                np.asarray(star_stats.blended, dtype=bool)[idx]
+                if star_stats.blended is not None
+                else np.zeros(idx.size, dtype=bool)
+            ),
+            "near_edge": (
+                np.asarray(star_stats.near_edge, dtype=bool)[idx]
+                if star_stats.near_edge is not None
+                else np.zeros(idx.size, dtype=bool)
+            ),
+            "tailed": (
+                np.asarray(star_stats.tailed, dtype=bool)[idx]
+                if star_stats.tailed is not None
+                else np.zeros(idx.size, dtype=bool)
+            ),
         }
     )
 

@@ -10,17 +10,28 @@ so each test controls its light curve's timestamps and signal precisely.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 
 import numpy as np
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 
 from relphot.config import DbSettings, Settings
-from relphot.db.analyze import analyze
+from relphot.db.analyze import (
+    _NightData,
+    _ObjTask,
+    _phase_stats,
+    _refine_fourier,
+    _tied_series,
+    _verification_windows,
+    analyze,
+)
 from relphot.db.connect import resolve_dsn
 from relphot.db.refresh import refresh_objects
 from relphot.db.schema import init_schema
 from relphot.exceptions import ConfigError
+from relphot.objflags import night_state, refresh_flags
 
 _SETTINGS = replace(Settings(), db=replace(DbSettings(), max_expected_noise=0.05))
 
@@ -374,7 +385,8 @@ def test_coarsening_triggers_with_tiny_max_points(test_conn) -> None:
 
 
 # --------------------------------------------------------------------------
-# CLASS flags: is_exop / is_var are independent, each with its own manual guard
+# CLASS flags: is_exop / is_var are independent, derived from the literature, the detections
+# and the person's per-night verdicts (relphot.user_night_review)
 # --------------------------------------------------------------------------
 
 
@@ -433,49 +445,493 @@ def test_transit_detection_on_known_variable_is_both_flags(test_conn) -> None:
     assert (is_exop, is_var, klass) == (True, True, "EXOP+VAR")
 
 
-def test_manual_exop_flag_is_not_overwritten_and_var_stays_automatic(test_conn) -> None:
-    obj_id = _insert_object(test_conn, "manual_exop_false")
+def _insert_review(
+    conn: psycopg.Connection, obj_id: int, night_id: int, *,
+    exop: str | None = None, var: str | None = None, note: str | None = None,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.user_night_review "
+            "(obj_id, night_id, exop_verdict, var_verdict, note) VALUES (%s, %s, %s, %s, %s)",
+            (obj_id, night_id, exop, var, note),
+        )
+
+
+def _insert_status_detection(
+    conn: psycopg.Connection, obj_id: int, night_id: int, kind: str, status: str | None,
+    origin: str = "search",
+) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind, snr, status, origin) "
+            "VALUES (%s, %s, %s, 10.0, %s, %s) RETURNING det_id",
+            (obj_id, night_id, kind, status, origin),
+        )
+        (det_id,) = cur.fetchone()
+    return det_id
+
+
+def _refresh(conn: psycopg.Connection, obj_id: int, **kwargs) -> None:
+    refresh_objects(conn, [obj_id], **kwargs)
+    conn.commit()
+
+
+def _counts(conn: psycopg.Connection, obj_id: int) -> tuple:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT n_review_pending, n_nights_reviewed FROM relphot.object WHERE obj_id = %s",
+            (obj_id,),
+        )
+        return cur.fetchone()
+
+
+def test_night_reject_verdict_cannot_remove_a_known_planet_and_var_stays_automatic(
+    test_conn,
+) -> None:
+    obj_id = _insert_object(test_conn, "planet_rejected_night")
     night_id = _insert_night(test_conn, "20250101")
     _insert_catalog_match(test_conn, obj_id, "TOI", "TOI-1.01", period=2.0)
     _insert_detection(test_conn, obj_id, night_id, "variable")
-    with test_conn.cursor() as cur:
-        cur.execute(
-            "UPDATE relphot.object SET is_exop = false, exop_source = 'manual' WHERE obj_id = %s",
-            (obj_id,),
-        )
+    _insert_review(test_conn, obj_id, night_id, exop="REJECTED")
     test_conn.commit()
 
-    refresh_objects(test_conn, [obj_id])
-    test_conn.commit()
+    _refresh(test_conn, obj_id)
 
     is_exop, is_var, exop_source, var_source, klass, class_source, _status = _flags(
         test_conn, obj_id
     )
-    assert (is_exop, exop_source) == (False, "manual")  # a known planet does not override it
+    assert (is_exop, exop_source) == (True, "manual")  # literature always counts
     assert (is_var, var_source) == (True, "auto")  # the other flag still follows the data
-    assert (klass, class_source) == ("VAR", "manual")
+    assert (klass, class_source) == ("EXOP+VAR", "manual")
 
 
-def test_manual_var_flag_true_without_evidence_survives_refresh(test_conn) -> None:
-    obj_id = _insert_object(test_conn, "manual_var_true")
+@pytest.mark.parametrize(
+    ("catalog", "verdict_key", "flag_index"),
+    [("NASA Exoplanet Archive", "exop", 0), ("TOI", "exop", 0), ("VSX", "var", 1)],
+)
+def test_a_rejected_night_never_removes_literature_evidence(
+    test_conn, catalog, verdict_key, flag_index
+) -> None:
+    obj_id = _insert_object(test_conn, "literature")
+    night_id = _insert_night(test_conn, "20250101")
+    _insert_catalog_match(test_conn, obj_id, catalog, "Known 1", period=2.0)
+    _insert_review(test_conn, obj_id, night_id, **{verdict_key: "REJECTED"})
+    test_conn.commit()
+
+    _refresh(test_conn, obj_id)
+
+    assert _flags(test_conn, obj_id)[flag_index] is True
+
+
+def test_var_confirmed_verdict_without_evidence_counts_and_is_manual(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "confirmed_var")
     night_id = _insert_night(test_conn, "20250101")
     _insert_detection(test_conn, obj_id, night_id, "transit")
-    with test_conn.cursor() as cur:
-        cur.execute(
-            "UPDATE relphot.object SET is_var = true, var_source = 'manual' WHERE obj_id = %s",
-            (obj_id,),
-        )
+    _insert_review(test_conn, obj_id, night_id, var="CONFIRMED")
     test_conn.commit()
 
-    refresh_objects(test_conn, [obj_id])
+    for _ in range(2):  # a second refresh changes nothing
+        _refresh(test_conn, obj_id)
+        is_exop, is_var, exop_source, var_source, klass, class_source, _status = _flags(
+            test_conn, obj_id
+        )
+        assert (is_exop, exop_source) == (True, "auto")
+        assert (is_var, var_source) == (True, "manual")
+        assert (klass, class_source) == ("EXOP+VAR", "manual")
+
+
+def test_rejected_night_is_not_exop_and_a_new_night_is_evaluated_automatically(
+    test_conn,
+) -> None:
+    obj_id = _insert_object(test_conn, "per_night")
+    night1 = _insert_night(test_conn, "20250101")
+    _insert_detection(test_conn, obj_id, night1, "transit")
+    _insert_review(test_conn, obj_id, night1, exop="REJECTED")
     test_conn.commit()
+
+    _refresh(test_conn, obj_id)
+    is_exop, _is_var, exop_source, _vs, klass, class_source, _status = _flags(test_conn, obj_id)
+    assert (is_exop, exop_source, klass, class_source) == (False, "manual", "UNC", "manual")
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT exop_verdict, var_verdict, note, updated_at FROM relphot.user_night_review"
+        )
+        review_before = cur.fetchall()
+
+    # a new night arrives with its own transit: evaluated automatically, the old verdict stays
+    night2 = _insert_night(test_conn, "20250102")
+    _insert_detection(test_conn, obj_id, night2, "transit")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+
+    assert _flags(test_conn, obj_id)[:5:4] == (True, "EXOP")
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT night_id, exop_verdict, var_verdict, note, updated_at "
+            "FROM relphot.user_night_review"
+        )
+        rows = cur.fetchall()
+    assert rows == [(night1, *review_before[0])]
+
+
+def test_confirmed_night_verdict_without_a_detection_sets_the_flag(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "confirmed_exop")
+    night_id = _insert_night(test_conn, "20250101")
+    _insert_review(test_conn, obj_id, night_id, exop="CONFIRMED")
+    test_conn.commit()
+
+    _refresh(test_conn, obj_id)
 
     is_exop, is_var, exop_source, var_source, klass, class_source, _status = _flags(
         test_conn, obj_id
     )
-    assert (is_exop, exop_source) == (True, "auto")
-    assert (is_var, var_source) == (True, "manual")
-    assert (klass, class_source) == ("EXOP+VAR", "manual")
+    assert (is_exop, is_var) == (True, False)
+    assert (exop_source, var_source) == ("manual", "auto")
+    assert (klass, class_source) == ("EXOP", "manual")
+    assert _counts(test_conn, obj_id) == (0, 1)
+
+
+def test_exop_and_var_verdicts_are_independent_and_both_can_hold(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "both_flags")
+    night_id = _insert_night(test_conn, "20250101")
+    _insert_detection(test_conn, obj_id, night_id, "transit")
+    _insert_detection(test_conn, obj_id, night_id, "variable")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[:2] == (True, True)
+
+    _insert_review(test_conn, obj_id, night_id, exop="REJECTED", var="CONFIRMED")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[:6] == (False, True, "manual", "manual", "VAR", "manual")
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.user_night_review SET exop_verdict = 'CONFIRMED', "
+            "var_verdict = 'REJECTED'"
+        )
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[:2] == (True, False)
+
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.user_night_review SET var_verdict = 'CONFIRMED'")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[:2] == (True, True)
+    assert _flags(test_conn, obj_id)[4] == "EXOP+VAR"
+
+
+def test_sources_are_derived_from_the_presence_of_verdicts(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "sources")
+    night_id = _insert_night(test_conn, "20250101")
+    _insert_detection(test_conn, obj_id, night_id, "transit")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[2:6:1] == ("auto", "auto", "EXOP", "auto")
+
+    _insert_review(test_conn, obj_id, night_id, exop="CONFIRMED")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[2:6:1] == ("manual", "auto", "EXOP", "manual")
+
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.user_night_review SET var_verdict = 'REJECTED'")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[2:6:1] == ("manual", "manual", "EXOP", "manual")
+
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.user_night_review")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[2:6:1] == ("auto", "auto", "EXOP", "auto")
+
+
+def test_a_rejected_detection_removes_only_that_events_evidence(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "two_transits")
+    night_id = _insert_night(test_conn, "20250101")
+    det_a = _insert_status_detection(test_conn, obj_id, night_id, "transit", "UNCONFIRMED")
+    det_b = _insert_status_detection(test_conn, obj_id, night_id, "transit", "UNCONFIRMED")
+    test_conn.commit()
+
+    def set_status(det_id: int, status: str) -> None:
+        with test_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE relphot.detection SET status = %s WHERE det_id = %s", (status, det_id)
+            )
+        test_conn.commit()
+
+    set_status(det_a, "REJECTED")
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[0] is True  # the other event still stands
+
+    set_status(det_b, "REJECTED")
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[0] is False
+
+    set_status(det_b, "CONFIRMED")  # a CONFIRMED event is evidence, and no longer awaits review
+    _refresh(test_conn, obj_id)
+    assert _flags(test_conn, obj_id)[0] is True
+    assert _counts(test_conn, obj_id) == (0, 1)
+
+
+def test_a_null_detection_status_reads_as_unconfirmed(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "null_status")
+    night_id = _insert_night(test_conn, "20250101")
+    _insert_status_detection(test_conn, obj_id, night_id, "transit", None)
+    mn_run_id = _insert_mn_run(test_conn, "null_status_stem")
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, mn_run_id, kind, snr, status) "
+            "VALUES (%s, %s, 'recurrent', 10.0, NULL)",
+            (obj_id, mn_run_id),
+        )
+    test_conn.commit()
+
+    _refresh(test_conn, obj_id)
+
+    assert _flags(test_conn, obj_id)[:2] == (True, True)
+    assert _counts(test_conn, obj_id) == (2, 0)
+
+
+def test_user_origin_detections_never_count(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "user_origin")
+    night_id = _insert_night(test_conn, "20250101")
+    _insert_status_detection(test_conn, obj_id, night_id, "transit", None, origin="user")
+    test_conn.commit()
+
+    _refresh(test_conn, obj_id)
+
+    assert _flags(test_conn, obj_id)[:2] == (False, False)
+    assert _counts(test_conn, obj_id) == (0, 0)
+
+
+def test_gated_multinight_detections_count_and_a_rejected_one_does_not(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "mn_gated")
+    mn_run_id = _insert_mn_run(test_conn, "mn_gated_stem")
+    _insert_multinight_detection(test_conn, obj_id, mn_run_id, "recurrent")
+    _insert_multinight_detection(test_conn, obj_id, mn_run_id, "bls")
+    test_conn.commit()
+
+    _refresh(test_conn, obj_id)  # default gate: only 'recurrent' -> a variable, not a planet host
+    assert _flags(test_conn, obj_id)[:2] == (False, True)
+    assert _flags(test_conn, obj_id)[4] == "VAR"
+
+    _refresh(test_conn, obj_id, class_multinight_kinds=("recurrent", "bls"))
+    assert _flags(test_conn, obj_id)[:2] == (True, True)
+    assert _flags(test_conn, obj_id)[4] == "EXOP+VAR"
+    assert _counts(test_conn, obj_id) == (2, 0)  # both gated events still await a verdict
+
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.detection SET status = 'REJECTED' WHERE kind = 'recurrent'")
+    test_conn.commit()
+    _refresh(test_conn, obj_id, class_multinight_kinds=("recurrent", "bls"))
+    assert _flags(test_conn, obj_id)[:2] == (True, False)
+    assert _counts(test_conn, obj_id) == (1, 0)
+
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.detection SET status = 'REJECTED' WHERE kind = 'bls'")
+    test_conn.commit()
+    _refresh(test_conn, obj_id, class_multinight_kinds=("recurrent", "bls"))
+    assert _flags(test_conn, obj_id)[:2] == (False, False)
+    assert _counts(test_conn, obj_id) == (0, 0)
+
+
+def test_a_night_verdict_does_not_touch_multinight_evidence(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "mn_and_night_verdict")
+    night_id = _insert_night(test_conn, "20250101")
+    mn_run_id = _insert_mn_run(test_conn, "mn_and_night_stem")
+    _insert_multinight_detection(test_conn, obj_id, mn_run_id, "recurrent")
+    _insert_review(test_conn, obj_id, night_id, var="REJECTED")
+    test_conn.commit()
+
+    _refresh(test_conn, obj_id)
+
+    assert _flags(test_conn, obj_id)[:4] == (False, True, "auto", "manual")
+
+
+def test_review_counters_lifecycle(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "counters")
+    night1 = _insert_night(test_conn, "20250101")
+    night2 = _insert_night(test_conn, "20250102")
+    night3 = _insert_night(test_conn, "20250103")
+    _insert_detection(test_conn, obj_id, night1, "transit")
+    det2 = _insert_status_detection(test_conn, obj_id, night2, "transit", "UNCONFIRMED")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _counts(test_conn, obj_id) == (2, 0)
+
+    _insert_review(test_conn, obj_id, night1, exop="REJECTED")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _counts(test_conn, obj_id) == (1, 1)
+
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.detection SET status = 'CONFIRMED' WHERE det_id = %s", (det2,))
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _counts(test_conn, obj_id) == (0, 2)  # a decided event is a reviewed night
+
+    # a night with both kinds of event stays pending until BOTH flags have a verdict
+    _insert_detection(test_conn, obj_id, night3, "transit")
+    _insert_detection(test_conn, obj_id, night3, "variable")
+    _insert_review(test_conn, obj_id, night3, exop="CONFIRMED")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _counts(test_conn, obj_id) == (1, 3)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.user_night_review SET var_verdict = 'REJECTED' WHERE night_id = %s",
+            (night3,),
+        )
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _counts(test_conn, obj_id) == (0, 3)
+
+    # an unconfirmed gated multi-night event awaits review too
+    mn_run_id = _insert_mn_run(test_conn, "counters_stem")
+    _insert_multinight_detection(test_conn, obj_id, mn_run_id, "recurrent")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _counts(test_conn, obj_id) == (1, 3)
+
+    # deleting every review and resetting the event leaves only the automatic state
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.user_night_review")
+        cur.execute("UPDATE relphot.detection SET status = 'UNCONFIRMED'")
+    test_conn.commit()
+    _refresh(test_conn, obj_id)
+    assert _counts(test_conn, obj_id) == (4, 0)
+
+
+def test_a_note_only_review_row_counts_as_a_reviewed_night_but_sets_no_source(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "note_only")
+    night_id = _insert_night(test_conn, "20250101")
+    _insert_detection(test_conn, obj_id, night_id, "transit")
+    _insert_review(test_conn, obj_id, night_id, note="looks like a systematic")
+    test_conn.commit()
+
+    _refresh(test_conn, obj_id)
+
+    assert _flags(test_conn, obj_id)[:4] == (True, False, "auto", "auto")
+    assert _counts(test_conn, obj_id) == (1, 1)
+
+
+def test_refresh_flags_rederives_every_object_and_an_empty_list_is_a_noop(test_conn) -> None:
+    obj_id = _insert_object(test_conn, "stale")
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.object SET is_exop = true, is_var = true, class = 'EXOP+VAR' "
+            "WHERE obj_id = %s",
+            (obj_id,),
+        )
+    test_conn.commit()
+
+    refresh_flags(test_conn, [], class_multinight_kinds=("recurrent",))
+    assert _flags(test_conn, obj_id)[:2] == (True, True)
+    refresh_flags(test_conn, class_multinight_kinds=("recurrent",))  # every object
+    test_conn.commit()
+    is_exop, is_var, exop_source, var_source, klass, class_source, _status = _flags(
+        test_conn, obj_id
+    )
+    assert (is_exop, is_var, klass) == (False, False, "UNC")
+    assert (exop_source, var_source, class_source) == ("auto", "auto", "auto")
+
+
+def test_period_logic_runs_on_the_flags_of_this_refresh(test_conn) -> None:
+    def add_combined_bls(obj_id: int) -> None:
+        with test_conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO relphot.periodogram (obj_id, scope, method, fmin, df, n, power, "
+                "peak_period, peak_power, fap, computed_at, extra) "
+                "VALUES (%s, 'combined', 'BLS', 0.1, 0.01, 3, %s, 1.3, 0.9, NULL, now(), %s)",
+                (obj_id, [0.1, 0.9, 0.1], Jsonb({"depth_snr": 50.0})),
+            )
+
+    # a planet host only through the person's CONFIRMED verdict: the BLS period is used
+    confirmed = _insert_object(test_conn, "bls_confirmed")
+    night_id = _insert_night(test_conn, "20250101")
+    _insert_review(test_conn, confirmed, night_id, exop="CONFIRMED")
+    add_combined_bls(confirmed)
+    # the only transit night is REJECTED: not a planet host, so the BLS branch is not taken
+    rejected = _insert_object(test_conn, "bls_rejected")
+    _insert_detection(test_conn, rejected, night_id, "transit")
+    _insert_review(test_conn, rejected, night_id, exop="REJECTED")
+    add_combined_bls(rejected)
+    test_conn.commit()
+
+    refresh_objects(test_conn, [confirmed, rejected])
+    test_conn.commit()
+
+    assert _refetch_object(test_conn, confirmed) == ("EXOP", pytest.approx(1.3), "BLS")
+    assert _refetch_object(test_conn, rejected) == ("UNC", None, None)
+
+
+_NIGHT_MATRIX_DETECTIONS = [
+    [],
+    [("transit", "UNCONFIRMED", "search")],
+    [("transit", None, "search")],
+    [("transit", "REJECTED", "search")],
+    [("transit", "CONFIRMED", "search")],
+    [("transit", "UNCONFIRMED", "search"), ("transit", "REJECTED", "search")],
+    [("transit", "CONFIRMED", "search"), ("variable", "UNCONFIRMED", "search")],
+    [("bls", "UNCONFIRMED", "search")],
+    [("variable", "UNCONFIRMED", "search")],
+    [("variable", "REJECTED", "search")],
+    [("internight", "UNCONFIRMED", "search"), ("ls_periodic", "CONFIRMED", "search")],
+    [("recurrent", "UNCONFIRMED", "search")],
+    [("transit", "UNCONFIRMED", "user")],
+    [("variable", "UNCONFIRMED", "user"), ("transit", "UNCONFIRMED", "search")],
+]
+
+
+def test_night_state_agrees_with_the_sql_on_a_matrix(test_conn) -> None:
+    night_id = _insert_night(test_conn, "20250101")
+    cases = []
+    for dets in _NIGHT_MATRIX_DETECTIONS:
+        for exop in (None, "CONFIRMED", "REJECTED"):
+            for var in (None, "CONFIRMED", "REJECTED"):
+                obj_id = _insert_object(test_conn, f"matrix{len(cases)}")
+                for kind, status, origin in dets:
+                    _insert_status_detection(test_conn, obj_id, night_id, kind, status, origin)
+                if exop or var:
+                    _insert_review(test_conn, obj_id, night_id, exop=exop, var=var)
+                cases.append((obj_id, dets, exop, var))
+    test_conn.commit()
+
+    refresh_flags(test_conn, class_multinight_kinds=("recurrent",))
+    test_conn.commit()
+
+    for obj_id, dets, exop, var in cases:
+        state = night_state(
+            [{"kind": k, "status": s, "origin": o} for k, s, o in dets], exop, var
+        )
+        with test_conn.cursor() as cur:
+            cur.execute(
+                "SELECT is_exop, is_var, n_review_pending FROM relphot.object WHERE obj_id = %s",
+                (obj_id,),
+            )
+            got = cur.fetchone()
+        want = (state["exop_effective"], state["var_effective"], int(state["pending"]))
+        assert got == want, (dets, exop, var, got, want)
+
+
+def test_night_state_reports_the_automatic_evidence_and_open_events() -> None:
+    dets = [
+        {"kind": "transit", "status": "UNCONFIRMED", "origin": "search"},
+        {"kind": "variable", "status": "CONFIRMED", "origin": "search"},
+        {"kind": "transit", "status": "REJECTED", "origin": "search"},
+        {"kind": "bls", "status": "UNCONFIRMED", "origin": "user"},
+    ]
+    assert night_state(dets, None, None) == {
+        "auto_exop": True, "auto_var": True, "exop_open": True, "var_open": False,
+        "exop_effective": True, "var_effective": True, "pending": True,
+    }
+    decided = night_state(dets, "REJECTED", None)
+    assert (decided["auto_exop"], decided["exop_effective"], decided["pending"]) == (
+        True, False, False,
+    )
 
 
 def test_period_uses_best_period_estimate_and_catalog_period_beats_it(test_conn) -> None:
@@ -1243,3 +1699,185 @@ def test_literature_period_with_too_little_data_is_still_recorded(test_conn) -> 
     assert lit == pytest.approx(1.2)
     assert baseline == pytest.approx(0.05)
     assert _verify_status(test_conn, obj_id)[0][0] == "insufficient_data"
+
+
+# --------------------------------------------------------------------------
+# long periods (> 1 d, >= 2 nights): tie-calibrated magnitudes, no per-night offsets
+# --------------------------------------------------------------------------
+
+_LONG_P = 2.5
+#: three nights about a day apart, half a night long: baseline 2.8 d = 1.1 cycles of 2.5 d
+_LONG_NIGHT_STARTS = (0.0, 1.1, 2.3)
+
+
+def _long_period_series(seed: int = 3, amp: float = 0.15, noise: float = 0.003):
+    """Per night ``(t, mag)`` of a 2.5 d sinusoid, and the night's median (the tie's mean mag)."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for t0 in _LONG_NIGHT_STARTS:
+        t = 2460000.0 + np.sort(t0 + rng.uniform(0.0, 0.5, 120))
+        mag = 15.0 + amp * np.sin(2 * np.pi * (t - 2460000.0) / _LONG_P) + rng.normal(0, noise, 120)
+        out.append((t, mag, float(np.median(mag))))
+    return out
+
+
+def _insert_long_period_object(
+    conn: psycopg.Connection, name: str, *, tied: bool, seed: int = 3
+) -> int:
+    obj_id = _insert_object(conn, name)
+    mn_run = _insert_mn_run(conn, f"mn_{name}") if tied else None
+    for i, (t, mag, mag_median) in enumerate(_long_period_series(seed)):
+        night_id = _insert_night(conn, f"{name}_{i}")
+        _insert_detection(conn, obj_id, night_id, "variable")
+        flux = 10.0 ** (-0.4 * (mag - mag_median))
+        _insert_star_night_and_lc(conn, obj_id, night_id, i, t, flux, np.full_like(t, 0.003) * flux)
+        if tied:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO relphot.tie (mn_run_id, obj_id, night_id, mag, mag_err) "
+                    "VALUES (%s, %s, %s, %s, 0.005)",
+                    (mn_run, obj_id, night_id, mag_median),
+                )
+    return obj_id
+
+
+def _estimate_row(conn: psycopg.Connection, obj_id: int, method: str = "LS") -> dict:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT input, n_nights, period, period_err, verify_status, verify_note, harmonic, "
+            "delta, phase_coverage, n_cycles, alias_periods, alias_powers, baseline_days "
+            "FROM relphot.period_estimate WHERE obj_id = %s AND method = %s",
+            (obj_id, method),
+        )
+        cols = [d.name for d in cur.description]
+        return dict(zip(cols, cur.fetchone(), strict=True))
+
+
+def test_long_period_is_recovered_on_tied_nights_with_aliases_and_coverage(test_conn) -> None:
+    obj_id = _insert_long_period_object(test_conn, "long_tied", tied=True)
+    test_conn.commit()
+    analyze(test_conn, obj_ids=[obj_id], settings=_SETTINGS, workers=1)
+    test_conn.commit()
+
+    est = _estimate_row(test_conn, obj_id)
+    assert est["input"] == "tied" and est["n_nights"] == 3
+    assert est["period"] == pytest.approx(_LONG_P, abs=0.03)
+    assert 0 < est["period_err"] < 0.02
+    assert abs(est["period"] - _LONG_P) < 5 * est["period_err"]
+    assert est["verify_status"] == "no_literature"
+    # the baseline holds 1.1 cycles: the note says the period is only bounded from below
+    assert est["n_cycles"] == pytest.approx(est["baseline_days"] / est["period"], rel=1e-3)
+    assert 1.0 < est["n_cycles"] < 2.0
+    assert "baseline covers" in est["verify_note"] and "< 2" in est["verify_note"]
+    assert 0.3 < est["phase_coverage"] <= 1.0
+    # the one-day aliases 1/(f + 1 d^-1) and 1/|f - 1 d^-1| of f = 1/2.5 are listed
+    f0 = 1.0 / est["period"]
+    aliases = est["alias_periods"]
+    assert 1 <= len(aliases) <= _SETTINGS.db.max_alias_candidates
+    assert any(a == pytest.approx(1.0 / (f0 + 1.0), rel=0.03) for a in aliases)
+    assert any(a == pytest.approx(1.0 / abs(f0 - 1.0), rel=0.03) for a in aliases)
+    assert len(est["alias_powers"]) == len(aliases)
+    assert est["alias_powers"] == sorted(est["alias_powers"], reverse=True)
+
+
+def test_long_period_is_verified_against_the_literature_on_tied_nights(test_conn) -> None:
+    obj_id = _insert_long_period_object(test_conn, "long_lit", tied=True)
+    _insert_catalog_match(
+        test_conn, obj_id, "VSX", "V* Slow", var_type="ROT", period=_LONG_P, period_err=0.01
+    )
+    test_conn.commit()
+    analyze(test_conn, obj_ids=[obj_id], settings=_SETTINGS, workers=1)
+    test_conn.commit()
+
+    est = _estimate_row(test_conn, obj_id)
+    assert est["verify_status"] == "verified" and est["harmonic"] == 1.0
+    assert abs(est["delta"]) < 0.03
+
+
+def test_long_period_on_untied_nights_is_flagged_not_measured(test_conn) -> None:
+    """Per-night normalisation removes the night-to-night changes a 2.5 d period lives in."""
+    obj_id = _insert_long_period_object(test_conn, "long_untied", tied=False)
+    _insert_catalog_match(test_conn, obj_id, "VSX", "V* Slow", var_type="ROT", period=_LONG_P)
+    test_conn.commit()
+    analyze(test_conn, obj_ids=[obj_id], settings=_SETTINGS, workers=1)
+    test_conn.commit()
+
+    est = _estimate_row(test_conn, obj_id)
+    assert est["input"] == "night"
+    assert est["verify_status"] == "long_period_needs_tie"
+    assert "long period needs a multi-night tie" in est["verify_note"]
+    assert est["period_err"] is None
+    assert (est["harmonic"], est["delta"]) == (None, None)
+    # such a row never becomes the object's PERIOD_err / n_nights source
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT period, period_source, period_n_nights FROM relphot.object WHERE obj_id = %s",
+            (obj_id,),
+        )
+        assert cur.fetchone() == (_LONG_P, "catalog", None)
+
+
+def test_untied_long_period_without_literature_does_not_set_period_from_the_estimate(
+    test_conn,
+) -> None:
+    obj_id = _insert_long_period_object(test_conn, "long_untied_nolit", tied=False)
+    test_conn.commit()
+    analyze(test_conn, obj_ids=[obj_id], settings=_SETTINGS, workers=1)
+    test_conn.commit()
+    est = _estimate_row(test_conn, obj_id)
+    assert est["verify_status"] == "long_period_needs_tie" and est["period_err"] is None
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT period_n_nights FROM relphot.object WHERE obj_id = %s", (obj_id,))
+        assert cur.fetchone() == (None,)
+
+
+def _long_period_task(seed: int = 3) -> _ObjTask:
+    nights, tie = [], {}
+    for i, (t, mag, mag_median) in enumerate(_long_period_series(seed)):
+        flux = 10.0 ** (-0.4 * (mag - mag_median))
+        nights.append(
+            _NightData(i + 1, date(2025, 1, 1 + i), t, flux, np.full_like(t, 0.003) * flux)
+        )
+        tie[i + 1] = (mag_median, 0.005)
+    return _ObjTask(
+        obj_id=1, is_exop=False, bls_eligible=False, nights=nights, tie=tie, settings=DbSettings(),
+        is_var=True, night_ties=tie,
+    )
+
+
+def test_a_free_offset_per_night_absorbs_the_long_period_signal() -> None:
+    """The offsets-free fit measures the period ~9x better than one offset per night would."""
+    task = _long_period_task()
+    t, y, dy, label, span, night_idx = _tied_series(task, task.night_ties)
+    assert label == "tied-mag"
+    f0 = 1.0 / 2.53
+    free = _refine_fourier(t, y, dy, night_idx, f0, span, per_night_offsets=False)
+    offsets = _refine_fourier(t, y, dy, night_idx, f0, span, per_night_offsets=True)
+    assert free is not None and offsets is not None
+    assert 1.0 / free[0] == pytest.approx(_LONG_P, abs=0.02)
+    err_free, err_off = free[1] / free[0] ** 2, offsets[1] / offsets[0] ** 2
+    assert err_off > 4.0 * err_free
+
+
+def test_phase_stats_coverage_and_cycles() -> None:
+    t = 2460000.0 + np.linspace(0.0, 0.5, 200)
+    coverage, cycles = _phase_stats(t, 2.5, 20)
+    assert cycles == pytest.approx(0.2)
+    assert coverage == pytest.approx(0.2, abs=0.05)  # 0.2 of the cycle: 4 of 20 bins (+/- 1)
+    coverage_short, cycles_short = _phase_stats(t, 0.1, 20)
+    assert coverage_short == 1.0 and cycles_short == pytest.approx(5.0)
+
+
+def test_a_long_period_peak_on_the_grid_edge_is_not_verified() -> None:
+    """A maximum on the first grid point is the grid's edge, not a resolved peak."""
+    freq = np.linspace(0.4, 2.0, 100)
+    power = np.linspace(1.0, 0.0, 100)  # falls from the very first point
+    edge = _verification_windows(freq, power, 2.4, 0.05, long_period_days=1.0)
+    assert edge[0] is None and edge[1] == "no_peak_in_window"
+    # a short-period window keeps the old rule: the same first-point maximum counts
+    short = _verification_windows(freq, power, 2.4, 0.05)
+    assert short[0] is not None and short[1] == "verified"
+    interior = power.copy()
+    interior[5] = 2.0
+    ok = _verification_windows(freq, interior, 2.4, 0.15, long_period_days=1.0)
+    assert ok[0] is not None and ok[0][1] == 5

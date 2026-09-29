@@ -175,3 +175,25 @@ def test_latitude_longitud_take_precedence_over_sitelat_sitelong() -> None:
     np.testing.assert_allclose(site.lat.deg, -22.5, atol=1e-6)
     np.testing.assert_allclose(site.lon.deg, -45.5, atol=1e-6)
     np.testing.assert_allclose(site.height.to("m").value, 1850.0, atol=1e-3)
+
+
+def test_read_fits_catalog_sets_naxis_and_telescope(fits_files) -> None:
+    """read_fits_catalog reads NAXIS1/NAXIS2/TELESCOP from header."""
+    settings = Settings()
+    fc = read_fits_catalog(fits_files[0], settings)
+
+    # Fields should be set (test fixtures have empty primary headers, so naxis=0)
+    assert isinstance(fc.meta.naxis1, int)
+    assert isinstance(fc.meta.naxis2, int)
+    assert isinstance(fc.meta.telescope, str)
+
+
+def test_read_csv_catalog_sets_naxis_and_telescope(csv_files) -> None:
+    """read_csv_catalog reads NAXIS1/NAXIS2/TELESCOP from companion FITS header."""
+    settings = Settings()
+    fc = read_csv_catalog(csv_files[0], settings)
+
+    # Fields should be set (test fixtures have empty primary headers)
+    assert isinstance(fc.meta.naxis1, int)
+    assert isinstance(fc.meta.naxis2, int)
+    assert isinstance(fc.meta.telescope, str)

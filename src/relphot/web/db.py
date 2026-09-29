@@ -2,10 +2,11 @@
 connections, and a small cache of which optional columns exist.
 
 Two roles are used: ``relphot_ro`` (SELECT only, every read endpoint) and
-``relphot_web`` (SELECT plus UPDATE on the manual-edit columns of
-``relphot.object``, used only by the PATCH endpoint). Each DSN is resolved
-fresh on every call -- never cached at import time -- so a test process can
-set the environment before each request rather than before the app module
+``relphot_web`` (SELECT plus UPDATE on manual-edit columns of ``relphot.object``
+and ``relphot.user_night_review``, and INSERT/UPDATE/DELETE on
+``relphot.user_night_review``, used by PATCH and PUT endpoints). Each DSN is
+resolved fresh on every call -- never cached at import time -- so a test process
+can set the environment before each request rather than before the app module
 is first imported.
 
 ``default_env_path``/``read_env_value`` are intentionally duplicated here

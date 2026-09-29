@@ -73,6 +73,12 @@ class FrameMeta:
     #: :mod:`relphot.match` to project matched RA/Dec onto the master
     #: frame's pixel grid. Not JSON-serialisable -- excluded by :meth:`to_dict`.
     wcs: WCS | None = None
+    #: Detector X size (NAXIS1), in pixels; 0 if unknown.
+    naxis1: int = 0
+    #: Detector Y size (NAXIS2), in pixels; 0 if unknown.
+    naxis2: int = 0
+    #: Telescope name (TELESCOP header), empty string if unknown.
+    telescope: str = ""
 
     def to_dict(self) -> dict[str, object]:
         """This metadata as a plain, JSON-serialisable dict (drops ``wcs``)."""
@@ -88,6 +94,9 @@ class FrameMeta:
             "median_fwhm": self.median_fwhm,
             "n_sources": self.n_sources,
             "aperture_radii_px": list(self.aperture_radii_px),
+            "naxis1": self.naxis1,
+            "naxis2": self.naxis2,
+            "telescope": self.telescope,
         }
 
 
@@ -311,6 +320,9 @@ def read_fits_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
         wcs = None
 
     jd_utc, bjd_tdb = _compute_times(header, wcs, settings)
+    size = _naxis(header, wcs)
+    naxis1, naxis2 = (int(size[0]), int(size[1])) if size else (0, 0)
+    telescope = str(header.get("TELESCOP", "")).strip()
     meta = FrameMeta(
         file=path,
         date_obs=str(header.get("DATE-OBS", "")),
@@ -324,6 +336,9 @@ def read_fits_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
         n_sources=int(ra.shape[0]),
         aperture_radii_px=aperrad,
         wcs=wcs,
+        naxis1=naxis1,
+        naxis2=naxis2,
+        telescope=telescope,
     )
     return FrameCatalog(
         meta=meta, ra=ra, dec=dec, x=x, y=y, flux=flux, fluxerr=fluxerr,
@@ -393,6 +408,9 @@ def read_csv_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
     airmass = float(header["AIRMASS"]) if header.get("AIRMASS") is not None else None
     filt = str(header.get("FILTER", ""))
     obj = str(header.get("OBJECT", ""))
+    size = _naxis(header, wcs)
+    naxis1, naxis2 = (int(size[0]), int(size[1])) if size else (0, 0)
+    telescope = str(header.get("TELESCOP", "")).strip()
 
     meta = FrameMeta(
         file=path,
@@ -407,6 +425,9 @@ def read_csv_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
         n_sources=int(ra.shape[0]),
         aperture_radii_px=aperrad,
         wcs=wcs,
+        naxis1=naxis1,
+        naxis2=naxis2,
+        telescope=telescope,
     )
     return FrameCatalog(
         meta=meta, ra=ra, dec=dec, x=x, y=y, flux=flux, fluxerr=fluxerr,

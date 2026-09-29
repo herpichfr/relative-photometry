@@ -16,6 +16,9 @@ const state = {
   rows: [],
   currentObject: null, // full /api/object/{id} response
   currentNightId: null,
+  reprocessPending: false,
+  phase: null, // last /api/object/{id}/phase response
+  reprocessTimer: null, // pending poll of the reprocess queue
 };
 
 function $(id) {
@@ -80,6 +83,8 @@ function collectFilters() {
   const selectFields = [
     ["filter-is-exop", "is_exop"],
     ["filter-is-var", "is_var"],
+    ["filter-needs-review", "needs_review"],
+    ["filter-user-reviewed", "user_reviewed"],
     ["filter-known", "known"],
     ["filter-status", "status"],
     ["filter-has-periodogram", "has_periodogram"],
@@ -125,7 +130,8 @@ const RESULT_COLUMNS = [
   "obj_id", "name", "ra", "dec", "class", "is_exop", "is_var", "known", "source_db",
   "known_name", "known_type", "period", "period_err", "period_source", "known_period",
   "mean_mag", "n_nights", "best_snr", "depth", "duration_h", "duration_lower_limit",
-  "amplitude", "status", "first_night", "last_night", "n_transit_events", "max_p_match", "period_delta",
+  "amplitude", "status", "first_night", "last_night", "n_review_pending", "n_nights_reviewed",
+  "n_transit_events", "max_p_match", "period_delta",
   "period_delta_err", "period_verify_status", "period_verify_note",
 ];
 
@@ -294,7 +300,8 @@ const META_FIELDS = [
   ["period_source", "period source"], ["known", "KNOWN"], ["source_db", "SOURCE_DB"],
   ["known_name", "known name"], ["known_type", "known type"], ["known_period", "known period (d)"],
   ["status", "status"], ["gaia_id", "Gaia ID"], ["mean_mag", "mean mag"],
-  ["n_nights", "n nights"], ["notes", "notes"],
+  ["n_nights", "n nights"], ["n_review_pending", "nights awaiting review"],
+  ["n_nights_reviewed", "nights reviewed"], ["notes", "notes"],
 ];
 
 function renderMeta(obj) {
@@ -345,8 +352,25 @@ function renderDetections(rows) {
       td.textContent = v === null || v === undefined ? "" : String(v);
       tr.appendChild(td);
     }
+    const tdStatus = document.createElement("td");
+    tdStatus.appendChild(detectionStatusSelect(r));
+    tr.appendChild(tdStatus);
     tbody.appendChild(tr);
   }
+}
+
+// A REJECTED event is no evidence; a CONFIRMED one is evidence that no longer awaits review.
+function detectionStatusSelect(det) {
+  const sel = document.createElement("select");
+  for (const s of ["UNCONFIRMED", "CONFIRMED", "REJECTED"]) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
+  }
+  sel.value = det.status || "UNCONFIRMED";
+  sel.addEventListener("change", () => patchDetection(det.det_id, { status: sel.value }, det));
+  return sel;
 }
 
 function fmtValue(v, digits) {
@@ -389,16 +413,7 @@ function renderTransitEvents(events) {
       tr.appendChild(td);
     }
     const tdStatus = document.createElement("td");
-    const sel = document.createElement("select");
-    for (const s of ["UNCONFIRMED", "CONFIRMED", "REJECTED"]) {
-      const opt = document.createElement("option");
-      opt.value = s;
-      opt.textContent = s;
-      sel.appendChild(opt);
-    }
-    sel.value = ev.status || "UNCONFIRMED";
-    sel.addEventListener("change", () => patchDetection(ev.det_id, { status: sel.value }, ev));
-    tdStatus.appendChild(sel);
+    tdStatus.appendChild(detectionStatusSelect(ev));
     tr.appendChild(tdStatus);
     const tdView = document.createElement("td");
     const btn = document.createElement("button");
@@ -425,7 +440,25 @@ async function patchDetection(detId, body, ev) {
     ev.status = data.status;
     ev.notes = data.notes;
   }
+  // the event changed the night's automatic evidence: pull the re-derived flags and reviews
+  await refreshObject();
   $("edit-status-msg").textContent = `event ${detId}: ${data.status}`;
+}
+
+// Re-fetch the current object and redraw everything a verdict can change (flags, counters,
+// the per-night review table and both event tables).
+async function refreshObject() {
+  if (!state.currentObject) return;
+  const objId = state.currentObject.object.obj_id;
+  const resp = await fetch(`/api/object/${objId}`);
+  if (!resp.ok || !state.currentObject || state.currentObject.object.obj_id !== objId) return;
+  const data = await resp.json();
+  state.currentObject = data;
+  renderMeta(data.object);
+  renderDetections(data.detections);
+  renderTransitEvents(data.transit_events);
+  renderNightReviews(data.nights, data.object);
+  prefillEditBox(data.object);
 }
 
 function renderTransitMatches(matches) {
@@ -460,27 +493,41 @@ function renderPeriodEstimates(rows) {
   tbody.innerHTML = "";
   for (const r of rows || []) {
     const tr = document.createElement("tr");
+    const lowCoverage = r.phase_coverage !== null && r.phase_coverage !== undefined
+      && r.phase_coverage < 0.5;
     const cells = [
       r.computed_at ? String(r.computed_at).replace("T", " ").slice(0, 19) : "",
+      r.method || "",
       fmtValue(r.n_nights),
       r.last_night || "",
       fmtValue(r.baseline_days, 4),
+      fmtValue(r.guess, 7),
       fmtPm(r.period, r.period_err, 7),
       fmtValue(r.harmonic),
       fmtPm(r.lit_period, r.lit_period_err, 7),
       fmtPm(r.delta, r.delta_err, 3),
       fmtValue(r.delta_z, 3),
+      r.phase_coverage === null || r.phase_coverage === undefined
+        ? "" : `${(100 * r.phase_coverage).toFixed(0)}%${lowCoverage ? " (low)" : ""}`,
+      fmtValue(r.n_cycles, 3),
       r.verify_status || "",
     ];
-    for (const text of cells) {
+    cells.forEach((text, i) => {
       const td = document.createElement("td");
       td.textContent = text;
       if (r.verify_note) td.title = r.verify_note;
+      if (lowCoverage && i === 11) td.className = "warn";
       tr.appendChild(td);
-    }
+    });
     const tdNote = document.createElement("td");
     tdNote.textContent = r.verify_note || "";
     tr.appendChild(tdNote);
+    const tdAdopt = document.createElement("td");
+    if (r.method === "LS-guided" && r.period !== null && r.period !== undefined
+        && r.verify_status !== "long_period_needs_tie") {
+      tdAdopt.appendChild(adoptButton(r.est_id));
+    }
+    tr.appendChild(tdAdopt);
     tbody.appendChild(tr);
   }
   const withDelta = (rows || []).filter((r) => r.delta !== null && r.delta !== undefined);
@@ -505,6 +552,33 @@ function renderPeriodEstimates(rows) {
   }, { responsive: true });
 }
 
+function adoptButton(estId) {
+  const btn = document.createElement("button");
+  btn.textContent = "Adopt as period";
+  btn.title = "set this as the object's manual PERIOD (with its error)";
+  btn.addEventListener("click", () => adoptPeriod(estId));
+  return btn;
+}
+
+async function adoptPeriod(estId) {
+  const objId = state.currentObject.object.obj_id;
+  const resp = await fetch(`/api/object/${objId}/adopt_period`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ est_id: estId }),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    $("edit-status-msg").textContent = data.detail || "adopting the period failed";
+    return;
+  }
+  state.currentObject.object = Object.assign({}, state.currentObject.object, data);
+  renderMeta(state.currentObject.object);
+  prefillEditBox(state.currentObject.object);
+  $("edit-status-msg").textContent = `PERIOD set to ${data.period} d (manual)`;
+  loadPhase(null);
+}
+
 function renderNightButtons(obj, nights) {
   const container = $("night-buttons");
   container.innerHTML = "";
@@ -520,6 +594,132 @@ function renderNightButtons(obj, nights) {
     btn.addEventListener("click", loadCombinedLc);
     container.appendChild(btn);
   }
+}
+
+// ---------------------------------------------------------------------
+// Night reviews: a person's verdict per night (EXOP and VAR each blank = automatic)
+// ---------------------------------------------------------------------
+
+function yesNo(v) {
+  return v ? "yes" : "no";
+}
+
+function autoEvidenceText(has, open) {
+  if (!has) return "no";
+  return open ? "yes (awaiting review)" : "yes";
+}
+
+function reviewSelect(value) {
+  const sel = document.createElement("select");
+  for (const [v, text] of [["", "(auto)"], ["CONFIRMED", "CONFIRMED"], ["REJECTED", "REJECTED"]]) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = text;
+    sel.appendChild(opt);
+  }
+  sel.value = value || "";
+  return sel;
+}
+
+function errorText(data, fallback) {
+  if (data && typeof data.detail === "string") return data.detail;
+  if (data && data.detail) return JSON.stringify(data.detail);
+  return fallback;
+}
+
+function renderNightReviewSummary(nights, obj, message) {
+  const pendingNights = nights.filter((n) => n.pending).length;
+  const parts = [
+    `Literature: known planet host ${yesNo(obj.lit_exop)}, known variable ${yesNo(obj.lit_var)}.`,
+    `${pendingNights} of ${nights.length} night(s) awaiting review`
+      + ` (${obj.n_review_pending || 0} pending item(s) in all),`
+      + ` ${obj.n_nights_reviewed || 0} night(s) reviewed.`,
+  ];
+  if (message) parts.push(message);
+  $("night-review-summary").textContent = parts.join(" ");
+}
+
+async function saveNightReview(index, exopSel, varSel, noteInput, msgSpan) {
+  const nights = state.currentObject.nights;
+  const night = nights[index];
+  const objId = state.currentObject.object.obj_id;
+  msgSpan.textContent = "";
+  const resp = await fetch(`/api/object/${objId}/night/${night.night_id}/review`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      exop: exopSel.value || null,
+      var: varSel.value || null,
+      note: noteInput.value.trim() || null,
+    }),
+  });
+  let data = null;
+  try {
+    data = await resp.json();
+  } catch (err) {
+    data = null;
+  }
+  if (!resp.ok) {
+    msgSpan.textContent = errorText(data, `save failed (${resp.status})`);
+    return;
+  }
+  const review = data.review;
+  night.review_exop = review ? review.exop : null;
+  night.review_var = review ? review.var : null;
+  night.review_note = review ? review.note : null;
+  night.review_updated_at = review ? review.updated_at : null;
+  Object.assign(night, data.night);
+  const obj = Object.assign({}, state.currentObject.object, data.object);
+  state.currentObject.object = obj;
+  renderMeta(obj);
+  prefillEditBox(obj);
+  renderNightReviews(nights, obj, `Saved night ${night.label}.`);
+}
+
+function renderNightReviews(nights, obj, message) {
+  const tbody = qs("#detail-night-reviews tbody");
+  tbody.innerHTML = "";
+  nights.forEach((night, index) => {
+    const tr = document.createElement("tr");
+    if (night.pending) tr.classList.add("needs-review");
+    const exopSel = reviewSelect(night.review_exop);
+    const varSel = reviewSelect(night.review_var);
+    const noteInput = document.createElement("input");
+    noteInput.type = "text";
+    noteInput.maxLength = 2000;
+    noteInput.value = night.review_note || "";
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save";
+    const msgSpan = document.createElement("span");
+    msgSpan.className = "warn";
+    saveBtn.addEventListener("click", () => saveNightReview(index, exopSel, varSel, noteInput, msgSpan));
+
+    const cells = [
+      `${night.label} (${night.telescope || ""})`,
+      autoEvidenceText(night.auto_exop, night.exop_open),
+      autoEvidenceText(night.auto_var, night.var_open),
+    ];
+    for (const text of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    for (const el of [exopSel, varSel, noteInput]) {
+      const td = document.createElement("td");
+      td.appendChild(el);
+      tr.appendChild(td);
+    }
+    const tdEffective = document.createElement("td");
+    tdEffective.textContent = `EXOP ${yesNo(night.exop_effective)}, VAR ${yesNo(night.var_effective)}`;
+    if (night.review_updated_at) tdEffective.title = `verdict saved ${night.review_updated_at}`;
+    tr.appendChild(tdEffective);
+    const tdSave = document.createElement("td");
+    tdSave.appendChild(saveBtn);
+    tdSave.appendChild(msgSpan);
+    tr.appendChild(tdSave);
+    tbody.appendChild(tr);
+  });
+  renderNightReviewSummary(nights, obj, message);
 }
 
 function populatePeriodogramSelectors(periodograms) {
@@ -550,39 +750,6 @@ function populatePeriodogramSelectors(periodograms) {
   }
 }
 
-function findBestPeriodogram(periodograms, objClass) {
-  if (!periodograms || periodograms.length === 0) return null;
-
-  // Preference 1: scope='combined' AND method='BLS' if the object is a planet host
-  if (objClass && objClass.startsWith('EXOP')) {
-    const entry = periodograms.find((p) => p.scope === 'combined' && p.method === 'BLS');
-    if (entry) return entry;
-  }
-
-  // Preference 2: scope='combined' AND method='LS'
-  const combined = periodograms.find((p) => p.scope === 'combined' && p.method === 'LS');
-  if (combined) return combined;
-
-  // Preference 3: first 'night:*' LS entry with smallest fap
-  const nightEntries = periodograms.filter((p) => p.scope && p.scope.startsWith('night:') && p.method === 'LS');
-  if (nightEntries.length > 0) {
-    return nightEntries.reduce((best, current) => {
-      const bestFap = best.fap !== null && best.fap !== undefined ? best.fap : Infinity;
-      const currentFap = current.fap !== null && current.fap !== undefined ? current.fap : Infinity;
-      return currentFap < bestFap ? current : best;
-    });
-  }
-
-  return null;
-}
-
-function updatePhasePeriodNote(noteText) {
-  const noteElem = $("phase-period-note");
-  if (noteElem) {
-    noteElem.textContent = noteText;
-  }
-}
-
 function prefillEditBox(obj) {
   $("edit-exop-check").checked = !!obj.is_exop;
   $("edit-var-check").checked = !!obj.is_var;
@@ -591,27 +758,7 @@ function prefillEditBox(obj) {
   $("edit-status-select").value = obj.status || "";
   $("edit-notes-textarea").value = obj.notes || "";
   $("edit-period-input").value = obj.period === null || obj.period === undefined ? "" : obj.period;
-
-  // Phase period prefill with fallback
-  if (obj.period !== null && obj.period !== undefined) {
-    $("phase-period-input").value = obj.period;
-    updatePhasePeriodNote(`PERIOD (${obj.period_source || ""})`);
-  } else {
-    // No PERIOD set; try to find a fallback from periodograms
-    const best = findBestPeriodogram(state.currentObject.periodograms, obj.class);
-    if (best && best.peak_period) {
-      $("phase-period-input").value = best.peak_period;
-      updatePhasePeriodNote(`PERIOD not set — using ${best.method} ${best.scope} periodogram peak`);
-    } else {
-      $("phase-period-input").value = "";
-      updatePhasePeriodNote("No period available — enter one");
-    }
-  }
-
   $("edit-status-msg").textContent = "";
-
-  // Re-render phase plot if data is available (will be no-op if no light curve loaded yet)
-  plotPhase();
 }
 
 async function loadObject(objId) {
@@ -623,7 +770,6 @@ async function loadObject(objId) {
   const data = await resp.json();
   state.currentObject = data;
   state.currentNightId = null;
-  state.currentCombinedLc = null;
 
   $("detail-panel").hidden = false;
   renderMeta(data.object);
@@ -633,10 +779,20 @@ async function loadObject(objId) {
   renderTransitMatches(data.transit_matches);
   renderPeriodEstimates(data.period_estimates);
   renderNightButtons(data.object, data.nights);
+  renderNightReviews(data.nights, data.object);
   populatePeriodogramSelectors(data.periodograms);
   prefillEditBox(data.object);
   Plotly.purge("plot-lightcurve");
   Plotly.purge("plot-phase");
+  state.phase = null;
+  // the phase diagram is for a variable or any object that has a period (PERIOD, or a guided one)
+  const hasGuided = (data.period_estimates || []).some(
+    (e) => e.method === "LS-guided" && e.period !== null && e.period !== undefined
+  );
+  $("phase-section").hidden = !(data.object.is_var || data.object.period !== null || hasGuided);
+  if (!$("phase-section").hidden) loadPhase(null);
+  resetReprocessBox();
+  loadReprocess();
   $("detail-panel").scrollIntoView({ behavior: "smooth" });
 }
 
@@ -653,7 +809,6 @@ function bestTransitForNight(nightId) {
 
 async function loadNightLc(nightId) {
   state.currentNightId = nightId;
-  state.currentCombinedLc = null;
   const objId = state.currentObject.object.obj_id;
   const resp = await fetch(`/api/object/${objId}/lc?night_id=${nightId}`);
   if (!resp.ok) {
@@ -669,6 +824,7 @@ async function loadNightLc(nightId) {
     hoverinfo: "x+y+text",
     marker: { size: 5 },
     name: lc.night_label || `night ${nightId}`,
+    meta: { night_id: nightId },
   };
   const shapes = [];
   const traces = [trace];
@@ -733,6 +889,7 @@ async function loadNightLc(nightId) {
     annotations,
     margin: { t: 20 },
   }, { responsive: true });
+  attachLightcurveClick();
 }
 
 async function loadCombinedLc() {
@@ -746,7 +903,7 @@ async function loadCombinedLc() {
   const byNight = new Map();
   for (let i = 0; i < lc.bjd_tdb.length; i++) {
     const key = lc.night_id[i];
-    if (!byNight.has(key)) byNight.set(key, { x: [], y: [], err: [], text: [], label: lc.night_label[i] });
+    if (!byNight.has(key)) byNight.set(key, { x: [], y: [], err: [], text: [], label: lc.night_label[i], night_id: key });
     const bucket = byNight.get(key);
     bucket.x.push(lc.bjd_tdb[i] - 2460000);
     bucket.y.push(lc.value[i]);
@@ -757,7 +914,7 @@ async function loadCombinedLc() {
     x: bucket.x, y: bucket.y, type: "scatter", mode: "markers",
     error_y: { type: "data", array: bucket.err, visible: true },
     text: bucket.text, hoverinfo: "x+y+text",
-    marker: { size: 5 }, name: bucket.label,
+    marker: { size: 5 }, name: bucket.label, meta: { night_id: bucket.night_id },
   }));
   const layout = {
     xaxis: { title: "BJD_TDB - 2460000" },
@@ -771,64 +928,212 @@ async function loadCombinedLc() {
       : "combined (per-night normalised flux -- nights are NOT tied)",
   };
   Plotly.newPlot("plot-lightcurve", traces, layout, { responsive: true });
-  state.currentCombinedLc = lc;
+  attachLightcurveClick();
+}
+
+// a click on the light curve fills in the transit centre of the rerun entry you last edited
+function fillRerunFromClick(ev) {
+  if (!ev.points || ev.points.length === 0) return;
+  if (!$("rerun-check").checked) {
+    $("rp-msg").textContent = "tick RERUN first";
+    return;
+  }
+  // Target .rerun-entry.active or the last entry
+  let target = qs(".rerun-entry.active");
+  if (!target) {
+    const entries = qsa(".rerun-entry");
+    target = entries[entries.length - 1];
+  }
+  if (!target) return;
+
+  qs(".rr-exop", target).checked = true;
+  syncRerunEntry(target);
+  const tcValue = (ev.points[0].x + 2460000).toFixed(5);
+  qs(".rr-tc", target).value = tcValue;
+
+  // Get night from meta or currentNightId
+  const nightFromData = ev.points[0].data.meta && ev.points[0].data.meta.night_id;
+  const nightId = nightFromData !== undefined ? nightFromData : state.currentNightId;
+
+  // Find and select the night option if it exists
+  if (nightId) {
+    const nightSelect = qs(".rr-night", target);
+    const options = qsa("option", nightSelect);
+    const opt = options.find(o => o.value === String(nightId));
+    if (opt) {
+      nightSelect.value = nightId;
+      syncRerunEntry(target);
+    }
+  }
+}
+
+function attachLightcurveClick() {
+  const gd = $("plot-lightcurve");
+  if (!gd.on) return;
+  if (gd.removeAllListeners) gd.removeAllListeners("plotly_click");
+  gd.on("plotly_click", fillRerunFromClick);
 }
 
 // ---------------------------------------------------------------------
 // Phase diagram
 // ---------------------------------------------------------------------
 
-function currentPhaseSourceData() {
-  if (state.currentCombinedLc) {
-    const lc = state.currentCombinedLc;
-    return { bjd: lc.bjd_tdb, value: lc.value, night: lc.night_label };
-  }
-  return null;
+// Phase (0 <= phase < 1) of time t at epoch t0 and period P.
+function phaseOf(t, t0, period) {
+  const x = ((t - t0) / period) % 1.0;
+  return x < 0 ? x + 1.0 : x;
 }
 
-async function plotPhase() {
-  const period = parseFloat($("phase-period-input").value);
-  if (!period || period <= 0) return;
+// The 2-harmonic Fourier model of the /phase payload evaluated at time t.
+function modelValue(model, t) {
+  const arg = (2.0 * Math.PI * (t - model.t_ref)) / model.period;
+  const [a1, b1, a2, b2] = model.coef;
+  return model.mean + a1 * Math.cos(arg) + b1 * Math.sin(arg)
+    + a2 * Math.cos(2 * arg) + b2 * Math.sin(2 * arg);
+}
 
-  const source = currentPhaseSourceData();
-  let bjd, value, night;
-  if (source) {
-    ({ bjd, value, night } = source);
-  } else if (state.currentNightId !== null) {
-    const objId = state.currentObject.object.obj_id;
-    const resp = await fetch(`/api/object/${objId}/lc?night_id=${state.currentNightId}`);
-    if (!resp.ok) return;
-    const lc = await resp.json();
-    bjd = lc.bjd_tdb;
-    value = lc.flux;
-    night = lc.bjd_tdb.map(() => lc.night_label);
-  } else {
+// Fraction of 20 phase bins holding a point, and the baseline in periods.
+function phaseCoverageOf(ts, period) {
+  const t0 = Math.min(...ts);
+  const bins = new Set();
+  for (const t of ts) bins.add(Math.min(19, Math.floor(phaseOf(t, t0, period) * 20)));
+  return { coverage: bins.size / 20, cycles: (Math.max(...ts) - t0) / period };
+}
+
+// One scatter trace per night (points coloured by night, with error bars); with `wide`, the
+// points of the first and last quarter cycle are repeated one cycle away (-0.25 to 1.25).
+function phaseTraces(ph, t0, wide) {
+  const byNight = new Map();
+  for (let i = 0; i < ph.bjd_tdb.length; i++) {
+    const key = ph.night_label[i];
+    if (!byNight.has(key)) byNight.set(key, { x: [], y: [], err: [], text: [] });
+    const b = byNight.get(key);
+    const x = phaseOf(ph.bjd_tdb[i], t0, ph.period);
+    const shifts = wide ? [x, ...(x >= 0.75 ? [x - 1] : []), ...(x < 0.25 ? [x + 1] : [])] : [x];
+    for (const xs of shifts) {
+      b.x.push(xs);
+      b.y.push(ph.value[i]);
+      b.err.push(ph.value_err[i]);
+      b.text.push(`${key}<br>${ph.file_name[i] || ""}`);
+    }
+  }
+  return Array.from(byNight.entries()).map(([label, b]) => ({
+    x: b.x, y: b.y, type: "scatter", mode: "markers", name: label || "",
+    error_y: { type: "data", array: b.err, visible: true },
+    marker: { size: 5 }, text: b.text, hoverinfo: "x+y+text",
+  }));
+}
+
+function plotPhase() {
+  const ph = state.phase;
+  if (!ph || !ph.period || ph.bjd_tdb.length === 0) {
+    Plotly.purge("plot-phase");
     return;
   }
-
-  const transit = state.currentObject.detections.find((d) => d.kind === "transit" && d.tc_bjd_tdb !== null);
-  const t0 = transit ? transit.tc_bjd_tdb : bjd[0];
-
-  const byNight = new Map();
-  for (let i = 0; i < bjd.length; i++) {
-    let phase = ((bjd[i] - t0) / period) % 1.0;
-    if (phase < -0.5) phase += 1.0;
-    if (phase > 1.0) phase -= 1.0;
-    const key = night[i];
-    if (!byNight.has(key)) byNight.set(key, { x: [], y: [] });
-    const bucket = byNight.get(key);
-    bucket.x.push(phase);
-    bucket.y.push(value[i]);
+  const wide = $("phase-range-check").checked;
+  const useFit = $("phase-epoch-select").value === "fit" && ph.model;
+  const t0 = useFit ? ph.model.t_zero : ph.t_first;
+  const traces = phaseTraces(ph, t0, wide);
+  if (ph.model && $("phase-model-check").checked) {
+    const xs = [];
+    const ys = [];
+    const lo = wide ? -0.25 : 0.0;
+    const hi = wide ? 1.25 : 1.0;
+    for (let x = lo; x <= hi + 1e-9; x += 0.005) {
+      xs.push(x);
+      ys.push(modelValue(ph.model, t0 + x * ph.period));
+    }
+    traces.push({
+      x: xs, y: ys, type: "scatter", mode: "lines", name: "Fourier model (2 harmonics)",
+      line: { color: "black", width: 2 },
+    });
   }
-  const traces = Array.from(byNight.entries()).map(([label, bucket]) => ({
-    x: bucket.x, y: bucket.y, type: "scatter", mode: "markers",
-    marker: { size: 5 }, name: label || "",
-  }));
   Plotly.newPlot("plot-phase", traces, {
-    xaxis: { title: "phase", range: [-0.5, 1.0] },
-    yaxis: { title: "value" },
-    margin: { t: 20 },
+    xaxis: { title: `phase (P = ${ph.period} d)`, range: wide ? [-0.25, 1.25] : [0, 1] },
+    yaxis: {
+      title: ph.tied ? "tied magnitude" : "relative flux (per-night normalised, untied)",
+      autorange: ph.tied ? "reversed" : true,
+    },
+    title: ph.label,
+    margin: { t: 40 },
   }, { responsive: true });
+}
+
+function renderPhaseControls() {
+  const ph = state.phase;
+  const sel = $("phase-candidate-select");
+  sel.innerHTML = "";
+  for (const c of ph.period_candidates) {
+    const opt = document.createElement("option");
+    opt.value = String(c.period);
+    opt.textContent = `${c.label}: ${Number(c.period).toPrecision(8)} d`;
+    sel.appendChild(opt);
+  }
+  const custom = document.createElement("option");
+  custom.value = "";
+  custom.textContent = "typed value";
+  sel.appendChild(custom);
+  const match = ph.period_candidates.find((c) => c.period === ph.period);
+  sel.value = match ? String(match.period) : "";
+  $("phase-period-input").value = ph.period === null || ph.period === undefined ? "" : ph.period;
+
+  const note = $("phase-mode-note");
+  note.textContent = ph.tied
+    ? "Tie-calibrated magnitudes: the nights are on one scale."
+    : "UNTIED: each night is normalised to its own median, so night-to-night changes are "
+      + "removed and a period longer than a night cannot be seen; ties need a multi-night run.";
+  note.className = ph.tied ? "note" : "note warn";
+
+  const cov = $("phase-coverage-note");
+  if (ph.phase_coverage === null || ph.phase_coverage === undefined) {
+    cov.textContent = "";
+    cov.className = "note";
+  } else {
+    const low = ph.phase_coverage < 0.5;
+    cov.textContent = `Phase coverage ${(100 * ph.phase_coverage).toFixed(0)}% of 20 bins, `
+      + `baseline ${ph.n_cycles.toFixed(2)} cycles`
+      + (low ? " -- WARNING: coverage below 50%, this period is poorly sampled" : "")
+      + (ph.period > ph.long_period_days && !ph.tied
+        ? " -- WARNING: a period longer than a night is not measurable on untied data" : "");
+    cov.className = low || (ph.period > ph.long_period_days && !ph.tied) ? "note warn" : "note";
+  }
+
+  const box = $("phase-aliases");
+  box.innerHTML = "";
+  if (ph.aliases.length) {
+    const label = document.createElement("span");
+    label.className = "note";
+    label.textContent = "alias / next-peak candidates:";
+    box.appendChild(label);
+  }
+  for (const a of ph.aliases) {
+    const btn = document.createElement("button");
+    btn.textContent = `${Number(a.period).toPrecision(6)} d`
+      + (a.power === null || a.power === undefined ? "" : ` (power ${Number(a.power).toFixed(2)})`);
+    btn.addEventListener("click", () => loadPhase(a.period));
+    box.appendChild(btn);
+  }
+}
+
+// Fetch the phase payload (at `period`, or the object's first candidate) and draw it.
+async function loadPhase(period) {
+  if (!state.currentObject) return;
+  const objId = state.currentObject.object.obj_id;
+  const url = `/api/object/${objId}/phase` + (period ? `?period=${encodeURIComponent(period)}` : "");
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    $("phase-mode-note").textContent = "no light curve for the phase diagram";
+    Plotly.purge("plot-phase");
+    return;
+  }
+  state.phase = await resp.json();
+  renderPhaseControls();
+  plotPhase();
+}
+
+function phasePeriodFromInput() {
+  const p = parseFloat($("phase-period-input").value);
+  return Number.isFinite(p) && p > 0 ? p : null;
 }
 
 // ---------------------------------------------------------------------
@@ -881,7 +1186,8 @@ async function loadPeriodogram() {
 async function saveEdit() {
   const objId = state.currentObject.object.obj_id;
   const body = {};
-  // a flag is only sent (and so pinned as manual) when the person changed its checkbox
+  // a flag is only sent when the person changed its checkbox; the server then writes a
+  // CONFIRMED/REJECTED verdict on every night the object has data for now (never on later nights)
   const obj = state.currentObject.object;
   const exopChecked = $("edit-exop-check").checked;
   const varChecked = $("edit-var-check").checked;
@@ -918,10 +1224,354 @@ async function patchObject(objId, body) {
     $("edit-status-msg").textContent = data.detail || "save failed";
     return;
   }
+  state.currentObject.object = Object.assign({}, state.currentObject.object, data);
+  renderMeta(state.currentObject.object);
+  prefillEditBox(state.currentObject.object);
+  // the shorthand wrote (or cleared) per-night verdicts: redraw the review table
+  await refreshObject();
   $("edit-status-msg").textContent = "saved";
-  state.currentObject.object = data;
-  renderMeta(data);
-  prefillEditBox(data);
+}
+
+// ---------------------------------------------------------------------
+// User-guided reprocessing (RERUN on demand)
+// ---------------------------------------------------------------------
+
+function rerunNights() {
+  if (!state.currentObject) return [];
+  return (state.currentObject.nights || []).filter(n => n.has_lc);
+}
+
+function syncRerunEntry(entry) {
+  const exopBox = qs(".rr-exop-box", entry);
+  const varBox = qs(".rr-var-box", entry);
+  const exopChecked = qs(".rr-exop", entry).checked;
+  const varChecked = qs(".rr-var", entry).checked;
+  const allNightsChecked = qs(".rr-all-nights", entry).checked;
+
+  exopBox.hidden = !exopChecked;
+  varBox.hidden = !varChecked;
+
+  // Hide night label when VAR+All nights ticked and EXOP not
+  const nightLabel = qs(".rr-night-label", entry);
+  nightLabel.hidden = (varChecked && allNightsChecked && !exopChecked);
+
+  // Disable .rr-add when no selectable night is left unused and entry has no successor
+  const allEntries = qsa(".rerun-entry");
+  const entryIndex = Array.from(allEntries).indexOf(entry);
+  const addCheckbox = qs(".rr-add", entry);
+  const nextEntry = entryIndex + 1 < allEntries.length ? allEntries[entryIndex + 1] : null;
+
+  const nights = rerunNights();
+  const usedNights = new Set();
+  for (let i = 0; i < allEntries.length; i++) {
+    if (i !== entryIndex) {
+      const nightVal = qs(".rr-night", allEntries[i]).value;
+      if (nightVal) usedNights.add(parseInt(nightVal, 10));
+    }
+  }
+  const availableNights = nights.filter(n => !usedNights.has(n.night_id));
+  const shouldDisable = availableNights.length === 0 && !nextEntry;
+  addCheckbox.disabled = shouldDisable;
+  if (shouldDisable) addCheckbox.title = "no unused night available";
+}
+
+function resetReprocessBox() {
+  if (state.reprocessTimer) {
+    clearTimeout(state.reprocessTimer);
+    state.reprocessTimer = null;
+  }
+  $("rerun-check").checked = false;
+  $("rerun-panel").hidden = true;
+  $("rerun-entries").innerHTML = "";
+  $("rp-note").value = "";
+  $("rp-msg").textContent = "";
+}
+
+function onRerunToggle() {
+  const checked = $("rerun-check").checked;
+  $("rerun-panel").hidden = !checked;
+  if (checked && $("rerun-entries").children.length === 0) {
+    addRerunEntry();
+  }
+}
+
+function addRerunEntry(after) {
+  const template = $("rerun-entry-template");
+  const entry = template.content.cloneNode(true);
+  const fieldset = qs("fieldset", entry);
+
+  // Fill night select
+  const nights = rerunNights();
+  const usedNights = new Set();
+  for (const e of qsa(".rerun-entry")) {
+    const nightVal = qs(".rr-night", e).value;
+    if (nightVal) usedNights.add(parseInt(nightVal, 10));
+  }
+
+  const nightSelect = qs(".rr-night", entry);
+  for (const night of nights) {
+    if (!usedNights.has(night.night_id)) {
+      const opt = document.createElement("option");
+      opt.value = night.night_id;
+      opt.textContent = `${night.label} (${night.telescope})`;
+      nightSelect.appendChild(opt);
+    }
+  }
+  if (nightSelect.options.length > 0) {
+    nightSelect.value = nightSelect.options[0].value;
+  }
+
+  const title = qs(".rr-title", entry);
+  title.textContent = `Rerun ${qsa(".rerun-entry").length + 1}`;
+
+  // Event listeners
+  for (const cls of [".rr-exop", ".rr-var", ".rr-all-nights", ".rr-night"]) {
+    const el = qs(cls, entry);
+    if (el) el.addEventListener("change", () => syncRerunEntry(fieldset));
+  }
+
+  qs(".rr-add", entry).addEventListener("change", (ev) => {
+    if (ev.target.checked) {
+      addRerunEntry();
+    } else {
+      removeEntriesAfter(fieldset);
+    }
+  });
+
+  fieldset.addEventListener("focusin", () => {
+    for (const e of qsa(".rerun-entry.active")) e.classList.remove("active");
+    fieldset.classList.add("active");
+  });
+
+  const container = $("rerun-entries");
+  if (after) {
+    after.parentNode.insertBefore(fieldset, after.nextSibling);
+  } else {
+    container.appendChild(fieldset);
+  }
+
+  fieldset.classList.add("active");
+  syncRerunEntry(fieldset);
+}
+
+function removeEntriesAfter(entry) {
+  const allEntries = qsa(".rerun-entry");
+  const entryIndex = Array.from(allEntries).indexOf(entry);
+  const toRemove = Array.from(allEntries).slice(entryIndex + 1);
+  for (const e of toRemove) {
+    e.remove();
+  }
+}
+
+function readRerunEntry(entry) {
+  const exopChecked = qs(".rr-exop", entry).checked;
+  const varChecked = qs(".rr-var", entry).checked;
+  const nightVal = qs(".rr-night", entry).value;
+  const night_id = nightVal ? parseInt(nightVal, 10) : null;
+
+  const exop = exopChecked ? {
+    tc_guess: qs(".rr-tc", entry).value ? parseFloat(qs(".rr-tc", entry).value) : null,
+    width_guess_h: qs(".rr-width", entry).value ? parseFloat(qs(".rr-width", entry).value) : null,
+  } : null;
+
+  const var_ = varChecked ? {
+    period_guess: qs(".rr-period", entry).value ? parseFloat(qs(".rr-period", entry).value) : null,
+    all_nights: qs(".rr-all-nights", entry).checked,
+  } : null;
+
+  return { night_id, exop, var: var_ };
+}
+
+function validateRerunEntries(entries) {
+  const errors = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (!entry.exop && !entry.var) {
+      errors.push(`entry ${i + 1}: tick EXOP and/or VAR`);
+    }
+    // Server will validate the rest; we can add client-side checks here if desired
+  }
+  return errors;
+}
+
+function reprocessGuess(r) {
+  let msg = "";
+  if (r.kind === "variable") {
+    msg = `P ${fmtValue(r.period_guess, 7)} d`;
+  } else {
+    msg = `tc ${fmtValue(r.tc_guess, 8)}, width ${fmtValue(r.width_guess_h, 3)} h`;
+  }
+  msg += r.night_label ? ", night " + r.night_label : (r.kind === "variable" ? ", all nights" : "");
+  return msg;
+}
+
+// A finished request's result as text, plus the action it offers (if any).
+function reprocessResult(r, tdResult, tdAction) {
+  if (r.status === "failed") {
+    tdResult.textContent = r.error || "failed";
+    tdResult.className = "warn";
+    return;
+  }
+  if (r.status === "queued") {
+    tdResult.textContent = `queued (${r.requests_ahead} ahead)`;
+    return;
+  }
+  if (r.status === "running") {
+    tdResult.textContent = "running...";
+    return;
+  }
+  const res = r.result || {};
+  if (r.kind === "variable") {
+    if (!res.found) {
+      tdResult.textContent = res.verify_note || "no peak near the guess";
+      return;
+    }
+    const usable = res.verify_status !== "long_period_needs_tie";
+    tdResult.textContent = `P = ${fmtPm(res.period, res.period_err, 8)} d (${res.input}, `
+      + `${res.n_nights} nights, coverage ${res.phase_coverage === null ? "?" : (100 * res.phase_coverage).toFixed(0)}%, `
+      + `${fmtValue(res.n_cycles, 3)} cycles); ${res.verify_status || ""}`
+      + (res.delta !== null && res.delta !== undefined
+        ? `; delta ${fmtPm(res.delta, res.delta_err, 3)} d (harmonic ${res.harmonic})` : "")
+      + (res.verify_note ? `; ${res.verify_note}` : "");
+    if (usable) tdAction.appendChild(adoptButton(res.est_id));
+    const plot = document.createElement("button");
+    plot.textContent = "Phase plot";
+    plot.addEventListener("click", () => loadPhase(res.period));
+    tdAction.appendChild(plot);
+  } else {
+    tdResult.textContent = `event ${res.det_id}: tc ${fmtPm(res.tc, res.tc_err, 9)}, depth `
+      + `${fmtPm(res.depth, res.depth_err, 4)}, T14 `
+      + `${res.t14_lower_limit ? ">= " + fmtValue(res.t14_h, 3) : fmtPm(res.t14_h, res.t14_err, 3)} h`
+      + `${res.incomplete_reason ? " (incomplete: " + res.incomplete_reason + ")" : ""}, chi2r `
+      + `${fmtValue(res.chi2_red, 3)}, ${res.n_matches} matching-transit pair(s)`
+      + (res.search_det_id ? `; search event ${res.search_det_id} kept` : "");
+    const btn = document.createElement("button");
+    btn.textContent = "Plot night";
+    btn.addEventListener("click", () => refreshAndPlotNight(res.night_id));
+    tdAction.appendChild(btn);
+  }
+}
+
+// a new user transit event: reload the object (events, matches) and draw its night
+async function refreshAndPlotNight(nightId) {
+  const objId = state.currentObject.object.obj_id;
+  const resp = await fetch(`/api/object/${objId}`);
+  if (resp.ok) {
+    const data = await resp.json();
+    state.currentObject = data;
+    renderTransitEvents(data.transit_events);
+    renderTransitMatches(data.transit_matches);
+    renderDetections(data.detections);
+    renderPeriodEstimates(data.period_estimates);
+  }
+  loadNightLc(nightId);
+}
+
+function renderReprocess(data) {
+  const tbody = qs("#detail-reprocess tbody");
+  tbody.innerHTML = "";
+  for (const r of data.requests) {
+    const tr = document.createElement("tr");
+    const tdResult = document.createElement("td");
+    const tdAction = document.createElement("td");
+    reprocessResult(r, tdResult, tdAction);
+    const cells = [
+      String(r.req_id), r.kind, reprocessGuess(r),
+      r.requested_at ? String(r.requested_at).replace("T", " ").slice(0, 19) : "", r.status,
+    ];
+    for (const text of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (r.note) td.title = r.note;
+      tr.appendChild(td);
+    }
+    tr.appendChild(tdResult);
+    tr.appendChild(tdAction);
+    tbody.appendChild(tr);
+  }
+  $("rp-queue").textContent =
+    `queue: ${data.queue.queued} queued, ${data.queue.running} running (all objects)`;
+}
+
+// Load this object's requests; keep polling every 3 s while one is queued or running.
+async function loadReprocess() {
+  if (state.reprocessTimer) {
+    clearTimeout(state.reprocessTimer);
+    state.reprocessTimer = null;
+  }
+  if (!state.currentObject) return;
+  const objId = state.currentObject.object.obj_id;
+  const resp = await fetch(`/api/object/${objId}/reprocess`);
+  if (!resp.ok || !state.currentObject || state.currentObject.object.obj_id !== objId) return;
+  const data = await resp.json();
+  const wasPending = state.reprocessPending;
+  state.reprocessPending = data.requests.some((r) => r.status === "queued" || r.status === "running");
+  renderReprocess(data);
+  if (state.reprocessPending) {
+    state.reprocessTimer = setTimeout(loadReprocess, 3000);
+  } else if (wasPending) {
+    // a request just finished: pick up its new estimate / event
+    const detail = await fetch(`/api/object/${objId}`);
+    if (detail.ok) {
+      const d = await detail.json();
+      state.currentObject = d;
+      renderTransitEvents(d.transit_events);
+      renderTransitMatches(d.transit_matches);
+      renderDetections(d.detections);
+      renderPeriodEstimates(d.period_estimates);
+      renderMeta(d.object);
+      loadPhase(null);
+    }
+  }
+}
+
+async function submitReprocess() {
+  const objId = state.currentObject.object.obj_id;
+  const entries = [];
+  for (const el of qsa(".rerun-entry")) {
+    entries.push(readRerunEntry(el));
+  }
+
+  // Validate client-side
+  const errors = validateRerunEntries(entries);
+  if (errors.length > 0) {
+    for (let i = 0; i < qsa(".rerun-entry").length; i++) {
+      const entry = qsa(".rerun-entry")[i];
+      const msg = qs(".rr-msg", entry);
+      const entryErrors = errors.filter(e => e.startsWith(`entry ${i + 1}:`));
+      msg.textContent = entryErrors.length > 0 ? entryErrors[0].replace(/^entry \d+: /, "") : "";
+    }
+    $("rp-msg").textContent = errors.join("; ");
+    $("rp-msg").className = "warn";
+    return;
+  }
+
+  const body = {
+    entries,
+    note: $("rp-note").value || null,
+  };
+
+  const resp = await fetch(`/api/object/${objId}/reprocess`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    $("rp-msg").textContent = typeof data.detail === "string" ? data.detail : "request rejected";
+    $("rp-msg").className = "warn";
+    return;
+  }
+  $("rp-msg").className = "";
+  const ids = data.requests.map(r => r.req_id).join(", ");
+  $("rp-msg").textContent = `queued ${data.requests.length} request(s): ${ids}`;
+
+  // Clear entries and add one fresh entry
+  $("rerun-entries").innerHTML = "";
+  addRerunEntry();
+
+  state.reprocessPending = true;
+  loadReprocess();
 }
 
 // ---------------------------------------------------------------------
@@ -953,18 +1603,25 @@ function init() {
   $("periodogram-scope-select").addEventListener("change", loadPeriodogram);
   $("periodogram-method-select").addEventListener("change", loadPeriodogram);
   $("btn-phase-x2").addEventListener("click", () => {
-    const current = parseFloat($("phase-period-input").value);
-    if (!Number.isFinite(current) || current <= 0) return;
-    $("phase-period-input").value = current * 2;
-    plotPhase();
+    const current = phasePeriodFromInput();
+    if (current !== null) loadPhase(current * 2);
   });
   $("btn-phase-div2").addEventListener("click", () => {
-    const current = parseFloat($("phase-period-input").value);
-    if (!Number.isFinite(current) || current <= 0) return;
-    $("phase-period-input").value = current / 2;
-    plotPhase();
+    const current = phasePeriodFromInput();
+    if (current !== null) loadPhase(current / 2);
   });
-  $("phase-period-input").addEventListener("change", plotPhase);
+  $("phase-period-input").addEventListener("change", () => {
+    const current = phasePeriodFromInput();
+    if (current !== null) loadPhase(current);
+  });
+  $("phase-candidate-select").addEventListener("change", (ev) => {
+    if (ev.target.value !== "") loadPhase(parseFloat(ev.target.value));
+  });
+  for (const id of ["phase-epoch-select", "phase-range-check", "phase-model-check"]) {
+    $(id).addEventListener("change", plotPhase);
+  }
+  $("rerun-check").addEventListener("change", onRerunToggle);
+  $("btn-rp-submit").addEventListener("click", submitReprocess);
   $("btn-save-edit").addEventListener("click", saveEdit);
   $("btn-reset-exop-auto").addEventListener("click", resetExopAuto);
   $("btn-reset-var-auto").addEventListener("click", resetVarAuto);

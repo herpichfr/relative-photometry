@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Idempotent installer for the relphot results database (steps: `db`, `web`, `backup`).
-# Usage: deploy/install.sh [db|web|backup]
+# Idempotent installer for the relphot results database (steps: `db`, `web`, `backup`, `worker`).
+# Usage: deploy/install.sh [db|web|backup|worker]
 set -euo pipefail
 
 STEP="${1:-db}"
@@ -113,6 +113,31 @@ install_backup() {
     systemctl --user start relphotdb-backup.service
 }
 
+install_worker() {
+    if [[ ! -f "${ENV_FILE}" ]]; then
+        echo "${ENV_FILE} not found -- run 'deploy/install.sh db' first" >&2
+        return 1
+    fi
+
+    # the unit runs the host's `relphot` (the same install that runs `relphot db load-night`)
+    local relphot_bin
+    relphot_bin="$(command -v relphot || true)"
+    if [[ -z "${relphot_bin}" ]]; then
+        echo "relphot not found on PATH -- install it first: pip install -e '${REPO_DIR}[db]'" >&2
+        return 1
+    fi
+
+    mkdir -p "${SYSTEMD_USER_DIR}"
+    sed "s#__RELPHOT_BIN__#${relphot_bin}#g" "${REPO_DIR}/deploy/systemd/relphotdb-worker.service" \
+        > "${SYSTEMD_USER_DIR}/relphotdb-worker.service"
+
+    systemctl --user daemon-reload
+    systemctl --user enable relphotdb-worker.service
+    systemctl --user restart relphotdb-worker.service
+
+    echo "relphotdb-worker is running: $(systemctl --user is-active relphotdb-worker.service)"
+}
+
 case "${STEP}" in
     db)
         install_db
@@ -122,6 +147,9 @@ case "${STEP}" in
         ;;
     backup)
         install_backup
+        ;;
+    worker)
+        install_worker
         ;;
     *)
         echo "unknown step: ${STEP}" >&2

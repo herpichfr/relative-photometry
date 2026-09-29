@@ -147,8 +147,8 @@ def test_migration_004_from_v3_maps_class_to_flags(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [4, 5]
-    assert current_version(test_conn) == 5
+    assert init_schema(test_conn) == [4, 5, 6]
+    assert current_version(test_conn) == 6
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -282,7 +282,7 @@ def test_migration_005_verify_status_backfill_and_check(test_conn) -> None:
             )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [5]
+    assert init_schema(test_conn) == [5, 6]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -294,3 +294,346 @@ def test_migration_005_verify_status_backfill_and_check(test_conn) -> None:
     test_conn.rollback()
     with test_conn.cursor() as cur:
         cur.execute("UPDATE relphot.period_estimate SET verify_status = 'insufficient_data'")
+
+
+def test_migration_006_guided_reprocessing_schema_from_v5(test_conn) -> None:
+    _apply_up_to(test_conn, 5)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.object (name, ra, dec) VALUES ('o', 0, 0) RETURNING obj_id"
+        )
+        (obj_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+            "VALUES ('T80S', '2025-01-01', 'n', '/tmp/n') RETURNING night_id"
+        )
+        (night_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.star_night (obj_id, night_id, star_id) VALUES (%s, %s, 1)",
+            (obj_id, night_id),
+        )
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind) VALUES (%s, %s, 'transit')",
+            (obj_id, night_id),
+        )
+        cur.execute(
+            "INSERT INTO relphot.period_estimate (obj_id, method, night_ids) "
+            "VALUES (%s, 'LS', %s)",
+            (obj_id, [1]),
+        )
+    test_conn.commit()
+
+    assert init_schema(test_conn) == [6]
+    assert current_version(test_conn) == 6
+
+    with test_conn.cursor() as cur:
+        # existing rows: searches' detections, no inflation information, no new estimate info
+        cur.execute("SELECT origin FROM relphot.detection")
+        assert cur.fetchall() == [("search",)]
+        cur.execute("SELECT err_scale, blended FROM relphot.star_night")
+        assert cur.fetchall() == [(None, None)]
+        cur.execute(
+            "SELECT guess, phase_coverage, n_cycles, alias_periods, alias_powers "
+            "FROM relphot.period_estimate"
+        )
+        assert cur.fetchall() == [(None, None, None, None, None)]
+
+    def rejected(sql: str, params: tuple = ()) -> None:
+        with pytest.raises(psycopg.errors.CheckViolation), test_conn.cursor() as cur:
+            cur.execute(sql, params)
+        test_conn.rollback()
+
+    rejected("UPDATE relphot.detection SET origin = 'bogus'")
+    rejected("UPDATE relphot.period_estimate SET method = 'bogus'")
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.period_estimate SET method = 'LS-guided', guess = 1.5")
+        cur.execute(
+            "UPDATE relphot.period_estimate SET verify_status = 'long_period_needs_tie'"
+        )
+        # the queue: kinds and the guesses each kind needs are enforced by the table
+        for sql in (
+            "INSERT INTO relphot.reprocess_request (obj_id, kind, period_guess) "
+            "VALUES (%s, 'variable', 1.0)",
+            "INSERT INTO relphot.reprocess_request (obj_id, kind, tc_guess, width_guess_h) "
+            "VALUES (%s, 'transit', 2460000.5, 2.0)",
+        ):
+            cur.execute(sql, (obj_id,))
+        cur.execute("SELECT status, requested_at IS NOT NULL FROM relphot.reprocess_request")
+        assert cur.fetchall() == [("queued", True)] * 2
+    test_conn.commit()
+    rejected(
+        "INSERT INTO relphot.reprocess_request (obj_id, kind, period_guess) "
+        "VALUES (%s, 'variable', 0)", (obj_id,)
+    )
+    rejected(
+        "INSERT INTO relphot.reprocess_request (obj_id, kind, tc_guess) "
+        "VALUES (%s, 'transit', 2460000.5)", (obj_id,)
+    )
+    rejected(
+        "INSERT INTO relphot.reprocess_request (obj_id, kind, period_guess) "
+        "VALUES (%s, 'bls', 1.0)", (obj_id,)
+    )
+    rejected("UPDATE relphot.reprocess_request SET status = 'bogus'")
+    # deleting the object takes its requests with it
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.object WHERE obj_id = %s", (obj_id,))
+        cur.execute("SELECT count(*) FROM relphot.reprocess_request")
+        assert cur.fetchone() == (0,)
+    test_conn.commit()
+
+
+def test_migration_006_user_night_review_from_v5_backfills_object_level_flags(test_conn) -> None:
+    _apply_up_to(test_conn, 5)
+    with test_conn.cursor() as cur:
+        night_ids = []
+        for label in ("n1", "n2"):
+            cur.execute(
+                "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+                "VALUES ('T80S', '2025-01-01', %s, %s) RETURNING night_id",
+                (label, f"/tmp/{label}"),
+            )
+            night_ids.append(cur.fetchone()[0])
+        # (name, is_exop, exop_source, is_var, var_source, nights it was observed on)
+        specs = [
+            ("auto", False, "auto", False, "auto", night_ids),
+            ("confirmed_exop", True, "manual", False, "auto", night_ids),
+            ("rejected_exop_confirmed_var", False, "manual", True, "manual", night_ids[:1]),
+            ("no_nights", True, "manual", False, "auto", []),
+        ]
+        obj_ids = {}
+        for star_id, (name, is_exop, exop_source, is_var, var_source, nights) in enumerate(
+            specs
+        ):
+            cur.execute(
+                "INSERT INTO relphot.object (name, ra, dec, is_exop, exop_source, is_var, "
+                "var_source) VALUES (%s, 0, 0, %s, %s, %s, %s) RETURNING obj_id",
+                (name, is_exop, exop_source, is_var, var_source),
+            )
+            obj_ids[name] = cur.fetchone()[0]
+            for night_id in nights:
+                cur.execute(
+                    "INSERT INTO relphot.star_night (obj_id, night_id, star_id) "
+                    "VALUES (%s, %s, %s)",
+                    (obj_ids[name], night_id, star_id),
+                )
+    test_conn.commit()
+
+    assert init_schema(test_conn) == [6]
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT obj_id, night_id, exop_verdict, var_verdict, note FROM "
+            "relphot.user_night_review ORDER BY obj_id, night_id"
+        )
+        rows = cur.fetchall()
+        cur.execute("SELECT n_review_pending, n_nights_reviewed FROM relphot.object")
+        counters = set(cur.fetchall())
+    n1, n2 = night_ids
+    assert rows == [
+        (obj_ids["confirmed_exop"], n1, "CONFIRMED", None, None),
+        (obj_ids["confirmed_exop"], n2, "CONFIRMED", None, None),
+        (obj_ids["rejected_exop_confirmed_var"], n1, "REJECTED", "CONFIRMED", None),
+    ]  # 'auto' gets no row; an object without nights gets none either
+    assert counters == {(0, 0)}  # filled by `relphot db analyze --all`
+
+
+def test_migration_006_grants_on_user_night_review(test_conn) -> None:
+    init_schema(test_conn)
+    table = "relphot.user_night_review"
+
+    def can(role: str, privilege: str, column: str | None = None) -> bool:
+        with test_conn.cursor() as cur:
+            if column is None:
+                cur.execute("SELECT has_table_privilege(%s, %s, %s)", (role, table, privilege))
+            else:
+                cur.execute(
+                    "SELECT has_column_privilege(%s, %s, %s, %s)", (role, table, column, privilege)
+                )
+            return cur.fetchone()[0]
+
+    assert can("relphot_ro", "SELECT")
+    assert not any(can("relphot_ro", p) for p in ("INSERT", "UPDATE", "DELETE"))
+    assert can("relphot_web", "SELECT")
+    assert can("relphot_web", "DELETE")
+    for column in ("obj_id", "night_id", "exop_verdict", "var_verdict", "note"):
+        assert can("relphot_web", "INSERT", column)
+    assert not can("relphot_web", "INSERT", "updated_at")
+    for column in ("exop_verdict", "var_verdict", "note", "updated_at"):
+        assert can("relphot_web", "UPDATE", column)
+    for column in ("obj_id", "night_id"):
+        assert not can("relphot_web", "UPDATE", column)
+    with test_conn.cursor() as cur:
+        for column in ("n_review_pending", "n_nights_reviewed"):
+            cur.execute(
+                "SELECT has_column_privilege('relphot_web', 'relphot.object', %s, 'UPDATE')",
+                (column,),
+            )
+            assert cur.fetchone()[0]
+
+
+def test_user_night_review_check_cascades_and_independence_from_star_night(test_conn) -> None:
+    init_schema(test_conn)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.object (name, ra, dec) VALUES ('o', 0, 0) RETURNING obj_id"
+        )
+        (obj_id,) = cur.fetchone()
+        night_ids = []
+        for label in ("n1", "n2"):
+            cur.execute(
+                "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+                "VALUES ('T80S', '2025-01-01', %s, %s) RETURNING night_id",
+                (label, f"/tmp/{label}"),
+            )
+            night_ids.append(cur.fetchone()[0])
+        cur.execute(
+            "INSERT INTO relphot.star_night (obj_id, night_id, star_id) VALUES (%s, %s, 1)",
+            (obj_id, night_ids[0]),
+        )
+        cur.execute(
+            "SELECT n_review_pending, n_nights_reviewed FROM relphot.object WHERE obj_id = %s",
+            (obj_id,),
+        )
+        assert cur.fetchone() == (0, 0)
+    test_conn.commit()
+
+    def rejected(sql: str, params: tuple) -> None:
+        with pytest.raises(psycopg.errors.CheckViolation), test_conn.cursor() as cur:
+            cur.execute(sql, params)
+        test_conn.rollback()
+
+    rejected(
+        "INSERT INTO relphot.user_night_review (obj_id, night_id, exop_verdict) "
+        "VALUES (%s, %s, 'MAYBE')", (obj_id, night_ids[0]),
+    )
+    rejected(
+        "INSERT INTO relphot.user_night_review (obj_id, night_id, var_verdict) "
+        "VALUES (%s, %s, 'confirmed')", (obj_id, night_ids[0]),
+    )
+
+    def insert_reviews() -> None:
+        with test_conn.cursor() as cur:
+            for night_id in night_ids:
+                cur.execute(
+                    "INSERT INTO relphot.user_night_review (obj_id, night_id, exop_verdict, "
+                    "var_verdict, note) VALUES (%s, %s, 'CONFIRMED', NULL, 'n') "
+                    "ON CONFLICT DO NOTHING",
+                    (obj_id, night_id),
+                )
+        test_conn.commit()
+
+    def n_reviews() -> int:
+        with test_conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM relphot.user_night_review")
+            return cur.fetchone()[0]
+
+    insert_reviews()
+    assert n_reviews() == 2
+    # a reload deletes and re-creates star_night rows: the review must not follow them
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.star_night WHERE obj_id = %s", (obj_id,))
+    test_conn.commit()
+    assert n_reviews() == 2
+    # a review row is unique per (object, night)
+    with pytest.raises(psycopg.errors.UniqueViolation), test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.user_night_review (obj_id, night_id) VALUES (%s, %s)",
+            (obj_id, night_ids[0]),
+        )
+    test_conn.rollback()
+
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.night WHERE night_id = %s", (night_ids[0],))
+    test_conn.commit()
+    assert n_reviews() == 1  # deleting a night takes its reviews with it
+
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.object WHERE obj_id = %s", (obj_id,))
+    test_conn.commit()
+    assert n_reviews() == 0  # so does deleting the object
+
+
+def test_reprocess_insert_notifies_the_worker_channel(test_conn) -> None:
+    init_schema(test_conn)
+    listener = psycopg.connect(_test_dsn(), autocommit=True)
+    try:
+        listener.execute("LISTEN relphot_reprocess")
+        with test_conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO relphot.object (name, ra, dec) VALUES ('o', 0, 0) RETURNING obj_id"
+            )
+            (obj_id,) = cur.fetchone()
+            cur.execute(
+                "INSERT INTO relphot.reprocess_request (obj_id, kind, period_guess) "
+                "VALUES (%s, 'variable', 1.0) RETURNING req_id",
+                (obj_id,),
+            )
+            (req_id,) = cur.fetchone()
+        test_conn.commit()
+        notes = list(listener.notifies(timeout=5.0, stop_after=1))
+    finally:
+        listener.close()
+    assert [n.payload for n in notes] == [str(req_id)]
+
+
+def test_deleting_a_night_cascade_deletes_its_reprocess_requests(test_conn) -> None:
+    init_schema(test_conn)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.object (name, ra, dec) VALUES ('obj', 0, 0) "
+            "RETURNING obj_id"
+        )
+        (obj_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+            "VALUES ('T80S', '2025-01-01', 'n1', '/tmp') RETURNING night_id"
+        )
+        (night_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.reprocess_request "
+            "(obj_id, kind, period_guess, night_id) "
+            "VALUES (%s, 'variable', 1.0, %s)",
+            (obj_id, night_id),
+        )
+    test_conn.commit()
+
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM relphot.reprocess_request")
+        assert cur.fetchone()[0] == 1
+
+    # Delete the night
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.night WHERE night_id = %s", (night_id,))
+    test_conn.commit()
+
+    # The reprocess_request should be cascade-deleted
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM relphot.reprocess_request")
+        assert cur.fetchone()[0] == 0
+
+
+def test_reprocess_request_without_night_id_is_valid_all_nights(test_conn) -> None:
+    init_schema(test_conn)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.object (name, ra, dec) VALUES ('obj', 0, 0) "
+            "RETURNING obj_id"
+        )
+        (obj_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.reprocess_request "
+            "(obj_id, kind, period_guess) "
+            "VALUES (%s, 'variable', 1.0) RETURNING req_id",
+            (obj_id,),
+        )
+        (req_id,) = cur.fetchone()
+    test_conn.commit()
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT obj_id, kind, period_guess, night_id FROM relphot.reprocess_request "
+            "WHERE req_id = %s",
+            (req_id,),
+        )
+        row = cur.fetchone()
+    assert row == (obj_id, "variable", 1.0, None)

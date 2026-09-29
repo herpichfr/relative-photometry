@@ -1,13 +1,17 @@
 """FastAPI application for the relphot results-database web API (see
 docs/DB_PLAN.md, "Web (requirements 10-15)").
 
-Every read goes through the ``relphot_ro`` role (SELECT only); the two
-manual-edit endpoints (``PATCH /api/object/{obj_id}`` and ``PATCH
-/api/detection/{det_id}``) go through ``relphot_web`` (SELECT plus UPDATE on a
-fixed set of ``relphot.object`` / ``relphot.detection`` columns). No query
-ever interpolates a user-supplied *value* into SQL --
-only a handful of fixed, code-controlled identifiers (column names from a
-whitelist, ``ASC``/``DESC``) are ever placed directly in a query string.
+Every read goes through the ``relphot_ro`` role (SELECT only); the manual-edit
+endpoints (``PATCH /api/object/{obj_id}``, ``PATCH /api/detection/{det_id}``,
+``PUT /api/object/{obj_id}/night/{night_id}/review``, and
+``POST /api/object/{obj_id}/adopt_period``) and the reprocess-request endpoint
+(``POST /api/object/{obj_id}/reprocess``, an INSERT into the queue
+``relphot db reprocess`` works off) go through ``relphot_web`` (SELECT plus UPDATE on a
+fixed set of ``relphot.object`` / ``relphot.detection`` / ``relphot.user_night_review``
+columns, plus INSERT on a fixed set of ``relphot.reprocess_request`` columns). No query
+ever interpolates a user-supplied *value* into SQL -- only a handful of fixed,
+code-controlled identifiers (column names from a whitelist, ``ASC``/``DESC``) are
+ever placed directly in a query string.
 """
 
 from __future__ import annotations
@@ -26,7 +30,10 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from relphot.config import DbSettings
+from relphot.objflags import PLANET_CATALOGS, night_state, refresh_flags
 from relphot.web.db import column_exists, get_ro_conn, get_rw_conn, resolve_ro_dsn
+from relphot.web.phase import fourier_model, phase_coverage
 
 __all__ = ["app"]
 
@@ -51,8 +58,8 @@ def _sanitize(obj):
     return obj
 
 
-def _json(data) -> JSONResponse:
-    return JSONResponse(content=_sanitize(jsonable_encoder(data)))
+def _json(data, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(content=_sanitize(jsonable_encoder(data)), status_code=status_code)
 
 
 def _rows_to_dicts(cur, rows) -> list[dict]:
@@ -85,7 +92,7 @@ _SEARCH_COLUMNS = [
     "obj_id", "name", "ra", "dec", "class", "is_exop", "is_var", "known", "source_db",
     "known_name", "known_type", "period", "period_err", "period_source", "known_period",
     "mean_mag", "n_nights", "best_snr", "depth", "duration_h", "duration_lower_limit",
-    "amplitude", "status", "first_night", "last_night",
+    "amplitude", "status", "first_night", "last_night", "n_review_pending", "n_nights_reviewed",
 ]
 #: Result columns computed per object: transit-event count, best "matching transits"
 #: probability, and the latest period verification (delta = P_obs/harmonic - P_lit, with
@@ -106,7 +113,7 @@ _SEARCH_DERIVED_SQL = {
 _SEARCH_JOINS = (
     " LEFT JOIN LATERAL (SELECT pe.delta, pe.delta_err, pe.verify_status, pe.verify_note "
     "FROM relphot.period_estimate pe "
-    "WHERE pe.obj_id = o.obj_id AND pe.lit_period IS NOT NULL "
+    "WHERE pe.obj_id = o.obj_id AND pe.lit_period IS NOT NULL AND pe.method = 'LS' "
     "ORDER BY pe.last_night DESC NULLS LAST, pe.n_nights DESC, pe.computed_at DESC "
     "LIMIT 1) pv ON true"
 )
@@ -132,6 +139,8 @@ def _search_filters(
     known: bool | None = Query(default=None),
     source_db: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    needs_review: bool | None = Query(default=None),
+    user_reviewed: bool | None = Query(default=None),
     telescope: str | None = Query(default=None),
     name: str | None = Query(default=None),
     gaia_id: str | None = Query(default=None),
@@ -155,6 +164,7 @@ def _search_filters(
     return {
         "class_": class_, "is_exop": is_exop, "is_var": is_var, "min_p_match": min_p_match,
         "known": known, "source_db": source_db, "status": status,
+        "needs_review": needs_review, "user_reviewed": user_reviewed,
         "telescope": telescope, "name": name, "gaia_id": gaia_id, "ra": ra, "dec": dec,
         "radius": radius, "mag_min": mag_min, "mag_max": mag_max, "period_min": period_min,
         "period_max": period_max, "snr_min": snr_min, "depth_min": depth_min,
@@ -195,6 +205,16 @@ def _build_where(f: dict) -> tuple[str, dict[str, object]]:
     if f["status"]:
         clauses.append("o.status = %(status)s")
         params["status"] = f["status"]
+    if f["needs_review"] is not None:
+        if f["needs_review"]:
+            clauses.append("o.n_review_pending > 0")
+        else:
+            clauses.append("o.n_review_pending = 0")
+    if f["user_reviewed"] is not None:
+        if f["user_reviewed"]:
+            clauses.append("o.n_nights_reviewed > 0")
+        else:
+            clauses.append("o.n_nights_reviewed = 0")
     if f["telescope"]:
         clauses.append(
             "EXISTS (SELECT 1 FROM relphot.star_night sn "
@@ -401,7 +421,7 @@ _OBJECT_BASE_COLUMNS = [
     "first_night", "last_night", "neighbour_sep_arcsec", "notes", "updated_at",
     "duration_lower_limit",
 ]
-_OBJECT_OPTIONAL_COLUMNS = ["data_updated_at"]
+_OBJECT_OPTIONAL_COLUMNS = ["data_updated_at", "n_review_pending", "n_nights_reviewed"]
 
 
 @app.get("/api/object/{obj_id}")
@@ -427,11 +447,15 @@ def object_detail(obj_id: int):
             )
             catalog_matches = _rows_to_dicts(cur, cur.fetchall())
 
+            # Compute lit_exop and lit_var from catalog matches
+            lit_exop = any(cm["catalog"] in PLANET_CATALOGS for cm in catalog_matches)
+            lit_var = any(cm["catalog"] not in PLANET_CATALOGS for cm in catalog_matches)
+
             cur.execute(
                 "SELECT d.det_id, d.kind, d.snr, d.depth, d.tc_bjd_tdb, d.duration_h, d.tier, "
                 "d.flags, d.amplitude, d.excess, d.period, d.fap, d.extra, d.night_id, "
                 "n.label AS night_label, n.telescope, d.mn_run_id, mr.stem AS mn_run_stem, "
-                "d.status, d.notes, d.duration_lower_limit "
+                "d.status, d.notes, d.duration_lower_limit, d.origin "
                 "FROM relphot.detection d "
                 "LEFT JOIN relphot.night n ON n.night_id = d.night_id "
                 "LEFT JOIN relphot.mn_run mr ON mr.mn_run_id = d.mn_run_id "
@@ -446,11 +470,16 @@ def object_detail(obj_id: int):
 
             cur.execute(
                 "SELECT sn.night_id, n.label, n.telescope, n.night_date, sn.n_epochs, sn.rms, "
-                "sn.expected_noise, sn.mag, sn.best_aperture, (lc.obj_id IS NOT NULL) AS has_lc "
+                "sn.expected_noise, sn.mag, sn.best_aperture, sn.err_scale, sn.blended, "
+                "(lc.obj_id IS NOT NULL) AS has_lc, "
+                "r.exop_verdict AS review_exop, r.var_verdict AS review_var, "
+                "r.note AS review_note, r.updated_at AS review_updated_at "
                 "FROM relphot.star_night sn "
                 "JOIN relphot.night n ON n.night_id = sn.night_id "
                 "LEFT JOIN relphot.lightcurve lc "
                 "ON lc.obj_id = sn.obj_id AND lc.night_id = sn.night_id "
+                "LEFT JOIN relphot.user_night_review r "
+                "ON r.obj_id = sn.obj_id AND r.night_id = sn.night_id "
                 "WHERE sn.obj_id = %s ORDER BY n.night_date",
                 (obj_id,),
             )
@@ -481,7 +510,7 @@ def object_detail(obj_id: int):
                 "SELECT d.det_id, d.night_id, n.label AS night_label, n.telescope, "
                 "n.night_date, d.tc_bjd_tdb AS det_tc, d.depth AS det_depth, "
                 "d.duration_h AS det_duration_h, d.snr, d.tier, d.flags, d.status, d.notes, "
-                "d.duration_lower_limit AS det_duration_lower_limit, "
+                "d.duration_lower_limit AS det_duration_lower_limit, d.origin, "
                 "ts.tc, ts.tc_err, ts.depth, ts.depth_err, ts.t14_h, ts.t14_err, "
                 "ts.t14_lower_limit, ts.incomplete_reason, "
                 "ts.ingress_frac, ts.ingress_err, ts.chi2_red, ts.n_points, ts.input, "
@@ -529,12 +558,34 @@ def object_detail(obj_id: int):
             cur.execute(
                 "SELECT est_id, computed_at, method, input, night_ids, n_nights, last_night, "
                 "baseline_days, period, period_err, power, fap, lit_period, lit_period_err, "
-                "lit_catalog, harmonic, delta, delta_err, delta_z, verify_status, verify_note "
+                "lit_catalog, harmonic, delta, delta_err, delta_z, verify_status, verify_note, "
+                "guess, phase_coverage, n_cycles, alias_periods, alias_powers "
                 "FROM relphot.period_estimate WHERE obj_id = %s "
                 "ORDER BY last_night, n_nights, computed_at",
                 (obj_id,),
             )
             period_estimates = _rows_to_dicts(cur, cur.fetchall())
+
+        # Enrich nights with night_state by grouping detections by night_id
+        night_dets_map: dict[int, list[dict]] = {}
+        for det in detections:
+            if det["night_id"] is not None:
+                if det["night_id"] not in night_dets_map:
+                    night_dets_map[det["night_id"]] = []
+                night_dets_map[det["night_id"]].append(det)
+
+        for night in nights:
+            nid = night["night_id"]
+            ns = night_state(
+                night_dets_map.get(nid, []),
+                night["review_exop"],
+                night["review_var"],
+            )
+            night.update(ns)
+
+        # Add literature flags to object
+        obj["lit_exop"] = lit_exop
+        obj["lit_var"] = lit_var
 
     return _json(
         {
@@ -592,98 +643,213 @@ def object_lc(obj_id: int, night_id: int):
     )
 
 
+def _combined_lc(cur, obj_id: int) -> dict:
+    """Every night's light curve of one object on one scale: the "All nights" series.
+
+    ``mode`` is ``'tied-mag'`` when a multi-night run ties >= 2 of the object's nights (each
+    night's flux is put on that night's tied magnitude; nights the run does not tie are left
+    out), else ``'night-normalised'`` (each night divided by its own median: the nights are
+    NOT tied). ``value_err`` is the photometric error alone, ``tie_err`` (``None`` untied) the
+    night's tie error. Raises a 404 for an unknown object.
+    """
+    cur.execute("SELECT 1 FROM relphot.object WHERE obj_id = %s", (obj_id,))
+    if cur.fetchone() is None:
+        raise HTTPException(status_code=404, detail="object not found")
+
+    cur.execute(
+        "SELECT t.mn_run_id, COUNT(DISTINCT t.night_id) AS n_tied, mr.loaded_at "
+        "FROM relphot.tie t JOIN relphot.mn_run mr ON mr.mn_run_id = t.mn_run_id "
+        "WHERE t.obj_id = %s GROUP BY t.mn_run_id, mr.loaded_at "
+        "HAVING COUNT(DISTINCT t.night_id) >= 2 "
+        "ORDER BY n_tied DESC, mr.loaded_at DESC LIMIT 1",
+        (obj_id,),
+    )
+    best_tie = cur.fetchone()
+
+    if best_tie is not None:
+        mode = "tied-mag"
+        mn_run_id = best_tie[0]
+        cur.execute(
+            "SELECT night_id, mag, mag_err FROM relphot.tie "
+            "WHERE mn_run_id = %s AND obj_id = %s ORDER BY night_id",
+            (mn_run_id, obj_id),
+        )
+        tie_rows = cur.fetchall()
+    else:
+        mode = "night-normalised"
+        cur.execute(
+            "SELECT night_id FROM relphot.lightcurve WHERE obj_id = %s ORDER BY night_id",
+            (obj_id,),
+        )
+        tie_rows = [(r[0], None, None) for r in cur.fetchall()]
+
+    out: dict = {
+        "mode": mode, "bjd_tdb": [], "value": [], "value_err": [], "tie_err": [],
+        "night_id": [], "night_label": [], "file_name": [],
+    }
+    for night_id, tie_mag, tie_mag_err in tie_rows:
+        if mode == "tied-mag" and tie_mag is None:
+            continue  # a night the run could not calibrate
+        cur.execute(
+            "SELECT frame_index, bjd_tdb, flux, flux_err FROM relphot.lightcurve "
+            "WHERE obj_id = %s AND night_id = %s",
+            (obj_id, night_id),
+        )
+        lc_row = cur.fetchone()
+        if lc_row is None:
+            continue
+        frame_index, night_bjd, night_flux, night_flux_err = lc_row
+
+        cur.execute("SELECT label FROM relphot.night WHERE night_id = %s", (night_id,))
+        (night_label,) = cur.fetchone()
+
+        cur.execute(
+            "SELECT frame_index, file_name FROM relphot.frame "
+            "WHERE night_id = %s AND frame_index = ANY(%s)",
+            (night_id, list(frame_index)),
+        )
+        fname_map = {r[0]: r[1] for r in cur.fetchall()}
+
+        flux_arr = np.asarray(night_flux, dtype=float)
+        flux_err_arr = np.asarray(night_flux_err, dtype=float)
+        median_flux = float(np.nanmedian(flux_arr))
+
+        if mode == "tied-mag":
+            point_value = tie_mag - 2.5 * np.log10(flux_arr / median_flux)
+            point_err = 1.0857 * flux_err_arr / flux_arr
+        else:
+            point_value = flux_arr / median_flux
+            point_err = flux_err_arr / median_flux
+
+        n = len(frame_index)
+        out["bjd_tdb"].extend(float(x) for x in night_bjd)
+        out["value"].extend(float(x) for x in point_value)
+        out["value_err"].extend(float(x) for x in point_err)
+        out["tie_err"].extend([None if tie_mag_err is None else float(tie_mag_err)] * n)
+        out["night_id"].extend([night_id] * n)
+        out["night_label"].extend([night_label] * n)
+        out["file_name"].extend(fname_map.get(i) for i in frame_index)
+    return out
+
+
 @app.get("/api/object/{obj_id}/lc/combined")
 def object_lc_combined(obj_id: int):
     with get_ro_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM relphot.object WHERE obj_id = %s", (obj_id,))
-        if cur.fetchone() is None:
-            raise HTTPException(status_code=404, detail="object not found")
+        data = _combined_lc(cur, obj_id)
+    return _json({k: v for k, v in data.items() if k != "tie_err"})
 
+
+# --------------------------------------------------------------------------
+# /api/object/{obj_id}/phase -- the phase diagram of all nights
+# --------------------------------------------------------------------------
+
+#: Periods beyond this (days) are fitted without a free offset per night on tied magnitudes
+#: (mirrors ``DbSettings.long_period_days``; the web cannot import :mod:`relphot.config`'s
+#: database settings without ``relphot.db``, so the default is repeated here).
+_LONG_PERIOD_DAYS = 1.0
+_PHASE_BINS = 20
+
+
+@app.get("/api/object/{obj_id}/phase")
+def object_phase(obj_id: int, period: float | None = Query(default=None, gt=0)):
+    """All nights of one object as one phase-diagram payload.
+
+    Points are tie-calibrated magnitudes when a multi-night run ties >= 2 nights
+    (``tied = true``), else per-night-normalised flux (``tied = false``: the nights are NOT
+    tied, and the diagram is labelled untied). ``value_err`` is the photometric error (already
+    inflated for blended stars at the light-curve stage) plus, tied, the night's tie error in
+    quadrature. ``period_candidates`` lists the object's PERIOD, its latest LS estimate, its
+    latest user-guided one and the literature period; ``aliases`` the latest estimate's alias
+    candidates. With ``period`` (default: the first candidate) the payload carries the
+    2-harmonic Fourier ``model`` at that period (per-night offsets only when untied or when the
+    period is not longer than a night: a longer one lives in the night-to-night changes) and the
+    phase coverage of the points.
+    """
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        data = _combined_lc(cur, obj_id)
         cur.execute(
-            "SELECT t.mn_run_id, COUNT(DISTINCT t.night_id) AS n_tied, mr.loaded_at "
-            "FROM relphot.tie t JOIN relphot.mn_run mr ON mr.mn_run_id = t.mn_run_id "
-            "WHERE t.obj_id = %s GROUP BY t.mn_run_id, mr.loaded_at "
-            "HAVING COUNT(DISTINCT t.night_id) >= 2 "
-            "ORDER BY n_tied DESC, mr.loaded_at DESC LIMIT 1",
+            "SELECT period, period_err, period_source, known_period FROM relphot.object "
+            "WHERE obj_id = %s",
             (obj_id,),
         )
-        best_tie = cur.fetchone()
+        obj_period, obj_period_err, obj_period_source, known_period = cur.fetchone()
+        cur.execute(
+            "SELECT est_id, method, period, period_err, n_nights, computed_at, verify_status, "
+            "phase_coverage, n_cycles, alias_periods, alias_powers, guess "
+            "FROM relphot.period_estimate WHERE obj_id = %s AND period IS NOT NULL "
+            "ORDER BY last_night DESC NULLS LAST, n_nights DESC, computed_at DESC",
+            (obj_id,),
+        )
+        estimates = _rows_to_dicts(cur, cur.fetchall())
 
-        if best_tie is not None:
-            mode = "tied-mag"
-            mn_run_id = best_tie[0]
-            cur.execute(
-                "SELECT night_id, mag, mag_err FROM relphot.tie "
-                "WHERE mn_run_id = %s AND obj_id = %s ORDER BY night_id",
-                (mn_run_id, obj_id),
-            )
-            tie_rows = cur.fetchall()
-        else:
-            mode = "night-normalised"
-            cur.execute(
-                "SELECT night_id FROM relphot.lightcurve WHERE obj_id = %s ORDER BY night_id",
-                (obj_id,),
-            )
-            tie_rows = [(r[0], None, None) for r in cur.fetchall()]
-
-        bjd_tdb: list[float] = []
-        value: list[float] = []
-        value_err: list[float] = []
-        night_ids: list[int] = []
-        night_labels: list = []
-        file_names: list = []
-
-        for night_id, tie_mag, _tie_mag_err in tie_rows:
-            cur.execute(
-                "SELECT frame_index, bjd_tdb, flux, flux_err FROM relphot.lightcurve "
-                "WHERE obj_id = %s AND night_id = %s",
-                (obj_id, night_id),
-            )
-            lc_row = cur.fetchone()
-            if lc_row is None:
-                continue
-            frame_index, night_bjd, night_flux, night_flux_err = lc_row
-
-            cur.execute("SELECT label FROM relphot.night WHERE night_id = %s", (night_id,))
-            (night_label,) = cur.fetchone()
-
-            cur.execute(
-                "SELECT frame_index, file_name FROM relphot.frame "
-                "WHERE night_id = %s AND frame_index = ANY(%s)",
-                (night_id, list(frame_index)),
-            )
-            fname_map = {r[0]: r[1] for r in cur.fetchall()}
-
-            flux_arr = np.asarray(night_flux, dtype=float)
-            flux_err_arr = np.asarray(night_flux_err, dtype=float)
-            median_flux = float(np.nanmedian(flux_arr))
-
-            if mode == "tied-mag":
-                point_value = tie_mag - 2.5 * np.log10(flux_arr / median_flux)
-                point_err = 1.0857 * flux_err_arr / flux_arr
-            else:
-                point_value = flux_arr / median_flux
-                point_err = flux_err_arr / median_flux
-
-            n = len(frame_index)
-            bjd_tdb.extend(float(x) for x in night_bjd)
-            value.extend(float(x) for x in point_value)
-            value_err.extend(float(x) for x in point_err)
-            night_ids.extend([night_id] * n)
-            night_labels.extend([night_label] * n)
-            file_names.extend(fname_map.get(i) for i in frame_index)
-
-    return _json(
-        {
-            "mode": mode,
-            "bjd_tdb": bjd_tdb,
-            "value": value,
-            "value_err": value_err,
-            "night_id": night_ids,
-            "night_label": night_labels,
-            "file_name": file_names,
-        }
+    tied = data["mode"] == "tied-mag"
+    candidates: list[dict] = []
+    if obj_period is not None:
+        candidates.append({
+            "key": "period", "label": f"PERIOD ({obj_period_source or 'unknown'})",
+            "period": obj_period, "period_err": obj_period_err,
+        })
+    latest_ls = next((e for e in estimates if e["method"] == "LS"), None)
+    latest_guided = max(
+        (e for e in estimates if e["method"] == "LS-guided"),
+        key=lambda e: e["computed_at"], default=None,
     )
+    if latest_ls is not None:
+        candidates.append({
+            "key": "estimate", "label": f"latest estimate ({latest_ls['n_nights']} nights)",
+            "period": latest_ls["period"], "period_err": latest_ls["period_err"],
+        })
+    if latest_guided is not None:
+        guess = latest_guided['guess']
+        n_nights = latest_guided['n_nights']
+        candidates.append({
+            "key": "guided", "label": f"latest guided (guess {guess:g} d, {n_nights} night(s))",
+            "period": latest_guided["period"], "period_err": latest_guided["period_err"],
+        })
+    if known_period is not None:
+        candidates.append({
+            "key": "literature", "label": "literature", "period": known_period,
+            "period_err": None,
+        })
+    alias_src = next((e for e in estimates if e["method"] == "LS" and e["alias_periods"]), None)
+    aliases = []
+    if alias_src is not None:
+        powers = alias_src["alias_powers"] or []
+        aliases = [
+            {"period": p, "power": powers[i] if i < len(powers) else None}
+            for i, p in enumerate(alias_src["alias_periods"])
+        ]
+
+    chosen = period if period is not None else (candidates[0]["period"] if candidates else None)
+    t = np.asarray(data["bjd_tdb"], dtype=float)
+    value_err = np.asarray(data["value_err"], dtype=float)
+    if tied:
+        tie_err = np.asarray(
+            [0.0 if e is None else e for e in data["tie_err"]], dtype=float
+        )
+        value_err = np.hypot(value_err, tie_err)
+    model = None
+    coverage = n_cycles = None
+    if chosen is not None and t.size:
+        coverage, n_cycles = phase_coverage(t, chosen, _PHASE_BINS)
+        model = fourier_model(
+            t, np.asarray(data["value"], dtype=float), value_err,
+            np.asarray(data["night_id"]), chosen,
+            per_night_offsets=(not tied) or chosen <= _LONG_PERIOD_DAYS,
+            brighter_is_lower=tied,
+        )
+    return _json({
+        "mode": data["mode"], "tied": tied,
+        "label": "tie-calibrated magnitudes" if tied else "untied: per-night normalised flux",
+        "bjd_tdb": data["bjd_tdb"], "value": data["value"], "value_err": value_err.tolist(),
+        "night_id": data["night_id"], "night_label": data["night_label"],
+        "file_name": data["file_name"],
+        "t_first": float(t.min()) if t.size else None,
+        "baseline_days": float(t.max() - t.min()) if t.size else None,
+        "period_candidates": candidates, "aliases": aliases,
+        "period": chosen, "phase_coverage": coverage, "n_cycles": n_cycles,
+        "model": model, "long_period_days": _LONG_PERIOD_DAYS,
+    })
 
 
 @app.get("/api/object/{obj_id}/periodogram")
@@ -714,15 +880,16 @@ _SOURCE_VALUES = {"auto", "manual"}
 
 
 class ObjectPatchBody(BaseModel):
-    """Manual edits of one object.
+    """Manual edits of one object (shorthand for per-night verdicts).
 
-    ``is_exop`` / ``is_var`` set that flag by hand (its ``*_source`` becomes
-    ``'manual'``, so ``relphot db analyze`` never changes it); the two flags are
-    independent. ``exop_source`` / ``var_source`` = ``'auto'`` hands a flag back to
-    the pipeline. The older ``class`` / ``class_source`` fields still work as
+    ``is_exop`` / ``is_var`` is a shorthand that upserts CONFIRMED/REJECTED verdicts
+    on all nights the object currently has data for; ``exop_source`` / ``var_source``
+    = ``'auto'`` resets those verdicts to NULL on all nights and deletes empty rows.
+    The two flags are independent. The ``class`` / ``class_source`` fields work as
     shorthand: ``class`` sets the flags it names to true (``'UNC'`` clears both) and
     leaves the other flag alone; ``class_source`` = ``'auto'`` resets both flags.
-    ``class`` / ``class_source`` on the row are always re-derived from the flags.
+    Verdicts are then re-evaluated per-night via ``refresh_flags``, and ``class`` /
+    ``class_source`` on the object row are re-derived from the result (never set directly).
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -794,70 +961,75 @@ def patch_object(obj_id: int, body: ObjectPatchBody):
     set_parts: list[str] = []
     params: dict[str, object] = {"obj_id": obj_id}
 
+    # flag edits are a shorthand for per-night verdicts on the nights loaded now
     flags, sources = _flag_edits(provided)
-    if flags or sources:
-        eff_sources: dict[str, str | None] = {}
-        for key in ("exop", "var"):
-            if key in flags:
-                set_parts.append(f"is_{key} = %(is_{key})s")
-                set_parts.append(f"{key}_source = 'manual'")
-                eff_sources[key] = "manual"
-            elif key in sources:
-                set_parts.append(f"{key}_source = %({key}_source)s")
-                eff_sources[key] = sources[key]
-            else:
-                eff_sources[key] = None
-            params[f"is_{key}"] = flags.get(key)
-            params[f"{key}_source"] = eff_sources[key]
-        # class / class_source are derived labels: recompute them from the row as it will be
-        set_parts.append(
-            "class = CASE "
-            "WHEN COALESCE(%(is_exop)s::boolean, is_exop) "
-            "AND COALESCE(%(is_var)s::boolean, is_var) THEN 'EXOP+VAR' "
-            "WHEN COALESCE(%(is_exop)s::boolean, is_exop) THEN 'EXOP' "
-            "WHEN COALESCE(%(is_var)s::boolean, is_var) THEN 'VAR' ELSE 'UNC' END"
-        )
-        set_parts.append(
-            "class_source = CASE "
-            "WHEN COALESCE(%(exop_source)s::text, exop_source) = 'manual' "
-            "OR COALESCE(%(var_source)s::text, var_source) = 'manual' "
-            "THEN 'manual' ELSE 'auto' END"
-        )
-
-    if "period" in provided:
-        set_parts.append("period = %(period)s")
-        set_parts.append("period_source = 'manual'")
-        set_parts.append("period_err = NULL")
-        set_parts.append("period_n_nights = NULL")
-        params["period"] = provided["period"]
-    elif "period_source" in provided:
-        value = provided["period_source"]
-        if value not in _SOURCE_VALUES:
-            raise HTTPException(status_code=400, detail=f"invalid period_source: {value!r}")
-        set_parts.append("period_source = %(period_source)s")
-        params["period_source"] = value
-
-    if "status" in provided:
-        value = provided["status"]
-        if value not in _STATUS_VALUES:
-            raise HTTPException(status_code=400, detail=f"invalid status: {value!r}")
-        set_parts.append("status = %(status)s")
-        params["status"] = value
-
-    if "notes" in provided:
-        set_parts.append("notes = %(notes)s")
-        params["notes"] = provided["notes"]
-
-    if not set_parts:
-        raise HTTPException(status_code=400, detail="no recognised fields to update")
-
-    set_parts.append("updated_at = now()")
-    sql = (
-        f"UPDATE relphot.object SET {', '.join(set_parts)} "
-        "WHERE obj_id = %(obj_id)s RETURNING *"
-    )
     with get_rw_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, params)
+        if flags or sources:
+            for key in ("exop", "var"):
+                if key in flags:
+                    verdict = "CONFIRMED" if flags[key] else "REJECTED"
+                    cur.execute(
+                        f"INSERT INTO relphot.user_night_review (obj_id, night_id, {key}_verdict) "
+                        "SELECT %(obj_id)s, sn.night_id, %(verdict)s FROM relphot.star_night sn "
+                        "WHERE sn.obj_id = %(obj_id)s "
+                        "ON CONFLICT (obj_id, night_id) DO UPDATE SET "
+                        f"{key}_verdict = %(verdict)s, updated_at = now()",
+                        {"obj_id": obj_id, "verdict": verdict},
+                    )
+                elif sources.get(key) == "auto":
+                    cur.execute(
+                        f"UPDATE relphot.user_night_review SET {key}_verdict = NULL, "
+                        "updated_at = now() WHERE obj_id = %(obj_id)s",
+                        {"obj_id": obj_id},
+                    )
+            cur.execute(
+                "DELETE FROM relphot.user_night_review WHERE obj_id = %(obj_id)s "
+                "AND exop_verdict IS NULL AND var_verdict IS NULL AND note IS NULL",
+                {"obj_id": obj_id},
+            )
+            refresh_flags(
+                conn, [obj_id], class_multinight_kinds=DbSettings().class_multinight_kinds
+            )
+
+        # Handle period and status updates
+        if "period" in provided:
+            set_parts.append("period = %(period)s")
+            set_parts.append("period_source = 'manual'")
+            set_parts.append("period_err = NULL")
+            set_parts.append("period_n_nights = NULL")
+            params["period"] = provided["period"]
+        elif "period_source" in provided:
+            value = provided["period_source"]
+            if value not in _SOURCE_VALUES:
+                raise HTTPException(status_code=400, detail=f"invalid period_source: {value!r}")
+            set_parts.append("period_source = %(period_source)s")
+            params["period_source"] = value
+
+        if "status" in provided:
+            value = provided["status"]
+            if value not in _STATUS_VALUES:
+                raise HTTPException(status_code=400, detail=f"invalid status: {value!r}")
+            set_parts.append("status = %(status)s")
+            params["status"] = value
+
+        if "notes" in provided:
+            set_parts.append("notes = %(notes)s")
+            params["notes"] = provided["notes"]
+
+        if not set_parts and not (flags or sources):
+            raise HTTPException(status_code=400, detail="no recognised fields to update")
+
+        if set_parts:
+            set_parts.append("updated_at = now()")
+            sql = (
+                f"UPDATE relphot.object SET {', '.join(set_parts)} "
+                "WHERE obj_id = %(obj_id)s RETURNING *"
+            )
+            cur.execute(sql, params)
+        else:
+            # Only flag edits, no direct object update; fetch the object row
+            cur.execute("SELECT * FROM relphot.object WHERE obj_id = %(obj_id)s", params)
+
         row = cur.fetchone()
         if row is None:
             conn.rollback()
@@ -904,6 +1076,429 @@ def patch_detection(det_id: int, body: DetectionPatchBody):
         if row is None:
             conn.rollback()
             raise HTTPException(status_code=404, detail="detection not found")
+        columns = [d.name for d in cur.description]
+        # a verdict on an event changes the night's automatic evidence: re-derive the flags
+        if "status" in provided:
+            refresh_flags(
+                conn, [row[columns.index("obj_id")]],
+                class_multinight_kinds=DbSettings().class_multinight_kinds,
+            )
+        conn.commit()
+    return _json(dict(zip(columns, row, strict=True)))
+
+
+# --------------------------------------------------------------------------
+# PUT /api/object/{obj_id}/night/{night_id}/review - per-night user verdicts (relphot_web write)
+# --------------------------------------------------------------------------
+
+
+_REVIEW_NOTE_MAX = 2000
+
+
+class NightReviewBody(BaseModel):
+    """Per-night user verdicts on exoplanet and variable classification.
+
+    All-null (and note null/empty) deletes the row; otherwise INSERT ... ON CONFLICT UPDATE.
+    Verdicts must be 'CONFIRMED', 'REJECTED', or null (auto). Note at most 2000 characters.
+    """
+
+    exop: str | None = None
+    var: str | None = None
+    note: str | None = None
+
+
+@app.put("/api/object/{obj_id}/night/{night_id}/review")
+def put_night_review(obj_id: int, night_id: int, body: NightReviewBody):
+    """Upsert or delete a per-night review verdict.
+
+    All null (and note null/empty) -> DELETE row, else INSERT ... ON CONFLICT DO UPDATE.
+    Returns {review, night: night_state dict, object: object row with updated flags/counts}.
+    """
+    provided = body.model_dump(exclude_unset=True)
+
+    for key in ("exop", "var"):
+        if provided.get(key) not in (None, "CONFIRMED", "REJECTED"):
+            raise HTTPException(
+                status_code=400, detail=f"invalid {key}: must be 'CONFIRMED', 'REJECTED', or null"
+            )
+    note = provided.get("note")
+    if note is not None and len(note) > _REVIEW_NOTE_MAX:
+        raise HTTPException(
+            status_code=400, detail=f"note must be at most {_REVIEW_NOTE_MAX} characters"
+        )
+
+    with get_rw_conn() as conn, conn.cursor() as cur:
+        # Check object exists
+        cur.execute("SELECT 1 FROM relphot.object WHERE obj_id = %s", (obj_id,))
+        if cur.fetchone() is None:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="object not found")
+
+        # Check object has data on this night
+        cur.execute(
+            "SELECT 1 FROM relphot.star_night WHERE obj_id = %s AND night_id = %s",
+            (obj_id, night_id),
+        )
+        if cur.fetchone() is None:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="object has no data on this night")
+
+        # Determine action: all null (and note null/empty) -> delete, else upsert
+        exop_v = provided.get("exop")
+        var_v = provided.get("var")
+        note_v = provided.get("note") or ""
+
+        if exop_v is None and var_v is None and not note_v:
+            # Delete
+            cur.execute(
+                "DELETE FROM relphot.user_night_review WHERE obj_id = %s AND night_id = %s",
+                (obj_id, night_id),
+            )
+            review = None
+        else:
+            # Upsert
+            # relphot_web may INSERT only (obj_id, night_id, verdicts, note): updated_at defaults
+            cur.execute(
+                "INSERT INTO relphot.user_night_review "
+                "(obj_id, night_id, exop_verdict, var_verdict, note) "
+                "VALUES (%(obj_id)s, %(night_id)s, %(exop_v)s, %(var_v)s, NULLIF(%(note_v)s, '')) "
+                "ON CONFLICT (obj_id, night_id) DO UPDATE SET "
+                "exop_verdict = EXCLUDED.exop_verdict, var_verdict = EXCLUDED.var_verdict, "
+                "note = EXCLUDED.note, updated_at = now() "
+                "RETURNING exop_verdict, var_verdict, note, updated_at",
+                {
+                    "obj_id": obj_id, "night_id": night_id, "exop_v": exop_v, "var_v": var_v,
+                    "note_v": note_v,
+                },
+            )
+            row = cur.fetchone()
+            if row:
+                review = {
+                    "exop": row[0],
+                    "var": row[1],
+                    "note": row[2],
+                    "updated_at": row[3].isoformat() if row[3] else None,
+                }
+            else:
+                review = None
+
+        # Compute night_state for this night
+        cur.execute(
+            "SELECT d.kind, d.status, d.origin FROM relphot.detection d "
+            "WHERE d.obj_id = %s AND d.night_id = %s",
+            (obj_id, night_id),
+        )
+        night_dets = [{"kind": k, "status": s, "origin": o} for k, s, o in cur.fetchall()]
+        ns = night_state(night_dets, exop_v, var_v)
+
+        refresh_flags(conn, [obj_id], class_multinight_kinds=DbSettings().class_multinight_kinds)
+
+        # Fetch updated object row
+        cur.execute(
+            "SELECT obj_id, is_exop, is_var, exop_source, var_source, class, class_source, "
+            "n_review_pending, n_nights_reviewed FROM relphot.object WHERE obj_id = %s",
+            (obj_id,),
+        )
+        obj_row = cur.fetchone()
+        if obj_row:
+            obj_data = {
+                "is_exop": obj_row[1],
+                "is_var": obj_row[2],
+                "exop_source": obj_row[3],
+                "var_source": obj_row[4],
+                "class": obj_row[5],
+                "class_source": obj_row[6],
+                "n_review_pending": obj_row[7],
+                "n_nights_reviewed": obj_row[8],
+            }
+        else:
+            obj_data = {}
+
+        conn.commit()
+
+    return _json({
+        "review": review,
+        "night": ns,
+        "object": obj_data,
+    })
+
+
+@app.delete("/api/object/{obj_id}/night/{night_id}/review")
+def delete_night_review(obj_id: int, night_id: int):
+    """Delete a per-night review (same as PUT with all null)."""
+    body = NightReviewBody(exop=None, var=None, note=None)
+    return put_night_review(obj_id, night_id, body)
+
+
+# --------------------------------------------------------------------------
+# User-guided reprocessing: /api/object/{obj_id}/reprocess (relphot_web INSERT)
+# --------------------------------------------------------------------------
+
+_WIDTH_RANGE_H = (0.1, 12.0)
+_PERIOD_GUESS_MAX = 1.0e4
+_MAX_ENTRIES = 20
+_REPROCESS_COLUMNS = (
+    "r.req_id, r.kind, r.period_guess, r.tc_guess, r.width_guess_h, r.night_id, r.note, "
+    "r.status, r.requested_at, r.started_at, r.finished_at, r.error, r.result, "
+    "n.label AS night_label, "
+    "CASE WHEN r.status IN ('queued', 'running') THEN "
+    "(SELECT count(*) FROM relphot.reprocess_request q "
+    "WHERE q.status IN ('queued', 'running') "
+    "AND (q.requested_at, q.req_id) < (r.requested_at, r.req_id)) END AS requests_ahead"
+)
+
+
+class ReprocessExop(BaseModel):
+    tc_guess: float | None = None
+    width_guess_h: float | None = None
+
+
+class ReprocessVar(BaseModel):
+    period_guess: float | None = None
+    all_nights: bool = False
+
+
+class ReprocessEntry(BaseModel):
+    night_id: int | None = None
+    exop: ReprocessExop | None = None
+    var: ReprocessVar | None = None
+
+
+class ReprocessBody(BaseModel):
+    entries: list[ReprocessEntry] = Field(min_length=1, max_length=_MAX_ENTRIES)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+def _lightcurve_spans(cur, obj_id: int) -> dict[int, tuple[float | None, float | None]]:
+    """Light curve time span (t_min, t_max) keyed by night_id, or (None, None) if empty."""
+    cur.execute(
+        "SELECT night_id, (SELECT min(x) FROM unnest(bjd_tdb) x), "
+        "(SELECT max(x) FROM unnest(bjd_tdb) x) FROM relphot.lightcurve WHERE obj_id = %s "
+        "ORDER BY night_id",
+        (obj_id,),
+    )
+    return {nid: (t_min, t_max) for nid, t_min, t_max in cur.fetchall()}
+
+
+def _span_holds(
+    spans: dict[int, tuple[float | None, float | None]], night_id: int, tc: float
+) -> bool:
+    """Whether tc is within the span of the given night_id."""
+    if night_id not in spans:
+        return False
+    t_min, t_max = spans[night_id]
+    return t_min is not None and t_min <= tc <= t_max
+
+
+def _plan_reprocess(
+    entries: list[ReprocessEntry], spans: dict[int, tuple[float | None, float | None]]
+) -> list[tuple[str, float | None, float | None, float | None, int | None]]:
+    """Validate and plan reprocess entries; raise HTTPException(400) on error.
+
+    Returns list of (kind, period_guess, tc_guess, width_guess_h, night_id) tuples.
+    """
+    rows: list[tuple[str, float | None, float | None, float | None, int | None]] = []
+    seen_keys: set[tuple[str, int | None]] = set()
+
+    for i, entry in enumerate(entries, start=1):
+        # Neither exop nor var
+        if entry.exop is None and entry.var is None:
+            raise HTTPException(status_code=400, detail=f"entry {i}: tick EXOP and/or VAR")
+
+        # Check exop
+        if entry.exop is not None:
+            if entry.exop.tc_guess is not None and not math.isfinite(entry.exop.tc_guess):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: tc_guess "
+                            f"must be a finite number"),
+                )
+            if entry.exop.width_guess_h is not None and not math.isfinite(entry.exop.width_guess_h):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: width_guess_h "
+                            f"must be a finite number"),
+                )
+
+            if entry.exop.tc_guess is None or entry.exop.width_guess_h is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: EXOP needs "
+                            f"tc_guess and width_guess_h"),
+                )
+            low, high = _WIDTH_RANGE_H
+            if not (low <= entry.exop.width_guess_h <= high):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: width_guess_h must be "
+                            f"between {low:g} and {high:g} hours"),
+                )
+            if entry.night_id is None:
+                raise HTTPException(status_code=400, detail=f"entry {i}: EXOP needs a night")
+            if entry.night_id not in spans:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: night {entry.night_id} has "
+                            f"no light curve of this object"),
+                )
+            if not _span_holds(spans, entry.night_id, entry.exop.tc_guess):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: tc_guess is not inside "
+                            f"night {entry.night_id} of this object"),
+                )
+
+            exop_row = (
+                "transit", None, entry.exop.tc_guess,
+                entry.exop.width_guess_h, entry.night_id,
+            )
+            key = (exop_row[0], exop_row[4])
+            if key in seen_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: repeats an earlier entry "
+                            f"(same kind and night)"),
+                )
+            rows.append(exop_row)
+            seen_keys.add(key)
+
+        # Check var
+        if entry.var is not None:
+            if entry.var.period_guess is not None and not math.isfinite(entry.var.period_guess):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: period_guess "
+                            f"must be a finite number"),
+                )
+
+            if (entry.var.period_guess is None or
+                    not (0.0 < entry.var.period_guess <= _PERIOD_GUESS_MAX)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: a variable request needs "
+                            f"0 < period_guess <= {_PERIOD_GUESS_MAX:g} days"),
+                )
+
+            if not entry.var.all_nights:
+                if entry.night_id is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(f"entry {i}: VAR needs a night unless "
+                                f'"All nights rerun" is ticked'),
+                    )
+                if entry.night_id not in spans:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(f"entry {i}: night {entry.night_id} has "
+                                f"no light curve of this object"),
+                    )
+                night_key = entry.night_id
+            else:
+                night_key = None
+
+            var_row = ("variable", entry.var.period_guess, None, None, night_key)
+            key = (var_row[0], var_row[4])
+            if key in seen_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"entry {i}: repeats an earlier entry "
+                            f"(same kind and night)"),
+                )
+            rows.append(var_row)
+            seen_keys.add(key)
+
+    return rows
+
+
+@app.post("/api/object/{obj_id}/reprocess")
+def post_reprocess(obj_id: int, body: ReprocessBody):
+    """Queue a user-guided re-run of one object (worked off by ``relphot db reprocess``)."""
+    with get_ro_conn() as ro, ro.cursor() as cur:
+        cur.execute("SELECT 1 FROM relphot.object WHERE obj_id = %s", (obj_id,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="object not found")
+        spans = _lightcurve_spans(cur, obj_id)
+
+    # Validate all entries first; insert nothing on error
+    rows = _plan_reprocess(body.entries, spans)
+
+    with get_rw_conn() as conn, conn.cursor() as cur:
+        results = []
+        for kind, period_guess, tc_guess, width_guess_h, night_id in rows:
+            cur.execute(
+                ("INSERT INTO relphot.reprocess_request "
+                 "(obj_id, kind, period_guess, tc_guess, width_guess_h, night_id, note) "
+                 "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                 "RETURNING req_id, kind, night_id, status, requested_at"),
+                (obj_id, kind, period_guess, tc_guess, width_guess_h, night_id, body.note),
+            )
+            req_id, kind_ret, night_id_ret, status, requested_at = cur.fetchone()
+            results.append({
+                "req_id": req_id, "kind": kind_ret, "night_id": night_id_ret,
+                "status": status, "requested_at": requested_at,
+            })
+        conn.commit()
+
+    return _json({"requests": results}, status_code=201)
+
+
+@app.get("/api/object/{obj_id}/reprocess")
+def get_reprocess(obj_id: int):
+    """The object's reprocess requests (newest first) and the global queue depth."""
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM relphot.object WHERE obj_id = %s", (obj_id,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="object not found")
+        cur.execute(
+            f"SELECT {_REPROCESS_COLUMNS} FROM relphot.reprocess_request r "
+            "LEFT JOIN relphot.night n ON n.night_id = r.night_id "
+            "WHERE r.obj_id = %s ORDER BY r.requested_at DESC, r.req_id DESC LIMIT 50",
+            (obj_id,),
+        )
+        requests = _rows_to_dicts(cur, cur.fetchall())
+        cur.execute(
+            "SELECT status, count(*) FROM relphot.reprocess_request "
+            "WHERE status IN ('queued', 'running') GROUP BY status"
+        )
+        queue = {"queued": 0, "running": 0, **dict(cur.fetchall())}
+    return _json({"requests": requests, "queue": queue})
+
+
+class AdoptPeriodBody(BaseModel):
+    est_id: int
+
+
+@app.post("/api/object/{obj_id}/adopt_period")
+def adopt_period(obj_id: int, body: AdoptPeriodBody):
+    """Adopt one period estimate (typically a user-guided one) as the object's manual PERIOD.
+
+    Sets ``period`` to the estimate's period, ``period_err`` and ``period_n_nights`` from it
+    and ``period_source = 'manual'``, so ``relphot db analyze`` never replaces it; ``reset
+    period to auto`` (``PATCH`` with ``period_source: "auto"``) hands it back.
+    """
+    with get_rw_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT period, period_err, n_nights, verify_status FROM relphot.period_estimate "
+            "WHERE est_id = %s AND obj_id = %s",
+            (body.est_id, obj_id),
+        )
+        est = cur.fetchone()
+        if est is None:
+            raise HTTPException(status_code=404, detail="period estimate not found")
+        period, period_err, n_nights, verify_status = est
+        if period is None:
+            raise HTTPException(status_code=400, detail="this estimate has no period")
+        if verify_status == "long_period_needs_tie":
+            raise HTTPException(
+                status_code=400,
+                detail="long period needs a multi-night tie: this estimate cannot be adopted",
+            )
+        cur.execute(
+            "UPDATE relphot.object SET period = %s, period_err = %s, period_n_nights = %s, "
+            "period_source = 'manual', updated_at = now() WHERE obj_id = %s RETURNING *",
+            (period, period_err, n_nights, obj_id),
+        )
+        row = cur.fetchone()
         columns = [d.name for d in cur.description]
         conn.commit()
     return _json(dict(zip(columns, row, strict=True)))

@@ -650,7 +650,17 @@ def test_object_detail_has_transit_events_matches_and_period_estimates(client) -
     assert plain["period_estimates"] == []
 
 
-def test_patch_flags_are_independent_and_class_is_derived(client) -> None:
+def _review_rows(test_conn, obj_id: int) -> list[tuple]:
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT night_id, exop_verdict, var_verdict, note FROM relphot.user_night_review "
+            "WHERE obj_id = %s ORDER BY night_id",
+            (obj_id,),
+        )
+        return cur.fetchall()
+
+
+def test_patch_flags_are_independent_and_class_is_derived(client, test_conn) -> None:
     test_client, ids = client
     url = f"/api/object/{ids['obj_unc']}"
 
@@ -659,57 +669,60 @@ def test_patch_flags_are_independent_and_class_is_derived(client) -> None:
     data = resp.json()
     assert (data["is_var"], data["var_source"]) == (True, "manual")
     assert data["is_exop"] is False
-    assert data["exop_source"] != "manual"
+    assert data["exop_source"] == "auto"
     assert (data["class"], data["class_source"]) == ("VAR", "manual")
+    # the shorthand is a verdict on the (one) night the object has data on
+    assert _review_rows(test_conn, ids["obj_unc"]) == [(ids["night1"], None, "CONFIRMED", None)]
 
     data = test_client.patch(url, json={"is_exop": True}).json()
     assert (data["is_exop"], data["exop_source"]) == (True, "manual")
     assert data["is_var"] is True  # setting one flag never clears the other
     assert data["class"] == "EXOP+VAR"
 
+    # resetting to auto drops the verdict: with no evidence the flag is off again
     data = test_client.patch(url, json={"var_source": "auto"}).json()
-    assert data["var_source"] == "auto"
-    assert (data["class"], data["class_source"]) == ("EXOP+VAR", "manual")  # exop still manual
+    assert (data["is_var"], data["var_source"]) == (False, "auto")
+    assert (data["class"], data["class_source"]) == ("EXOP", "manual")  # exop verdict remains
+    assert _review_rows(test_conn, ids["obj_unc"]) == [(ids["night1"], "CONFIRMED", None, None)]
 
     data = test_client.patch(url, json={"exop_source": "auto"}).json()
-    assert data["class_source"] == "auto"
+    assert (data["class"], data["class_source"]) == ("UNC", "auto")
+    assert _review_rows(test_conn, ids["obj_unc"]) == []
 
     data = test_client.patch(url, json={"is_exop": False, "is_var": False}).json()
     assert (data["class"], data["is_exop"], data["is_var"]) == ("UNC", False, False)
     assert (data["exop_source"], data["var_source"]) == ("manual", "manual")
 
 
-def test_patch_manual_flag_survives_refresh(client, test_conn) -> None:
+def test_patch_flag_shorthand_survives_refresh_but_never_beats_the_literature(
+    client, test_conn
+) -> None:
     from relphot.db.refresh import refresh_objects
 
     test_client, ids = client
-    obj_exop = ids["obj_exop"]
-    resp = test_client.patch(f"/api/object/{obj_exop}", json={"is_exop": False})
-    assert resp.json()["class"] == "UNC"
+    obj_unc, obj_exop = ids["obj_unc"], ids["obj_exop"]
+    assert test_client.patch(f"/api/object/{obj_unc}", json={"is_var": True}).json()["is_var"]
 
-    # the known planet would make it a host again, but the manual flag is never touched
-    with test_conn.cursor() as cur:
-        cur.execute(
-            "SELECT is_exop, exop_source, class FROM relphot.object WHERE obj_id = %s",
-            (obj_exop,),
-        )
-        assert cur.fetchone() == (False, "manual", "UNC")
-    refresh_objects(test_conn, [obj_exop])
+    # a known planet stays a host whatever the person says about its nights
+    data = test_client.patch(f"/api/object/{obj_exop}", json={"is_exop": False}).json()
+    assert (data["is_exop"], data["exop_source"], data["class"]) == (True, "manual", "EXOP")
+    assert [r[1] for r in _review_rows(test_conn, obj_exop)] == ["REJECTED", "REJECTED"]
+
+    refresh_objects(test_conn, [obj_unc, obj_exop])
     test_conn.commit()
     with test_conn.cursor() as cur:
         cur.execute(
-            "SELECT is_exop, exop_source, class, class_source FROM relphot.object "
-            "WHERE obj_id = %s",
-            (obj_exop,),
+            "SELECT obj_id, is_var, is_exop, var_source, exop_source, class_source "
+            "FROM relphot.object WHERE obj_id = ANY(%s) ORDER BY obj_id",
+            ([obj_unc, obj_exop],),
         )
-        assert cur.fetchone() == (False, "manual", "UNC", "manual")
+        rows = {r[0]: r[1:] for r in cur.fetchall()}
+    assert rows[obj_unc] == (True, False, "manual", "auto", "manual")
+    assert rows[obj_exop] == (False, True, "auto", "manual", "manual")
 
-    resp = test_client.patch(f"/api/object/{obj_exop}", json={"exop_source": "auto"})
-    refresh_objects(test_conn, [obj_exop])
-    test_conn.commit()
-    with test_conn.cursor() as cur:
-        cur.execute("SELECT is_exop, class FROM relphot.object WHERE obj_id = %s", (obj_exop,))
-        assert cur.fetchone() == (True, "EXOP")
+    data = test_client.patch(f"/api/object/{obj_exop}", json={"exop_source": "auto"}).json()
+    assert (data["is_exop"], data["exop_source"], data["class_source"]) == (True, "auto", "auto")
+    assert _review_rows(test_conn, obj_exop) == []
 
 
 def test_patch_legacy_class_field_sets_only_the_named_flags(client) -> None:
@@ -717,7 +730,10 @@ def test_patch_legacy_class_field_sets_only_the_named_flags(client) -> None:
     data = test_client.patch(f"/api/object/{ids['obj_var']}", json={"class": "EXOP"}).json()
     assert (data["is_exop"], data["is_var"]) == (True, True)  # 'EXOP' does not clear VAR
     assert data["class"] == "EXOP+VAR"
+    # 'UNC' rejects both flags on the nights loaded now; the known variable still counts
     data = test_client.patch(f"/api/object/{ids['obj_var']}", json={"class": "UNC"}).json()
+    assert (data["is_exop"], data["is_var"], data["class"]) == (False, True, "VAR")
+    data = test_client.patch(f"/api/object/{ids['obj_var2']}", json={"class": "UNC"}).json()
     assert (data["is_exop"], data["is_var"], data["class"]) == (False, False, "UNC")
 
 
@@ -729,6 +745,272 @@ def test_patch_flag_validation(client) -> None:
     assert test_client.patch(url, json={"class": "EXOP+BOGUS"}).status_code == 400
     assert test_client.patch(url, json={"is_exop": None}).status_code == 400
     assert test_client.patch("/api/object/999999", json={"is_var": True}).status_code == 404
+
+
+def test_patch_shorthand_writes_verdicts_only_for_the_nights_loaded_now(
+    client, test_conn
+) -> None:
+    test_client, ids = client
+    obj_unc, night1, night2 = ids["obj_unc"], ids["night1"], ids["night2"]
+    url = f"/api/object/{obj_unc}"
+
+    test_client.patch(url, json={"is_exop": True})
+    assert _review_rows(test_conn, obj_unc) == [(night1, "CONFIRMED", None, None)]
+
+    # the star is observed on a second night afterwards: the old verdict does not cover it
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.star_night (obj_id, night_id, star_id) VALUES (%s, %s, 9)",
+            (obj_unc, night2),
+        )
+    test_conn.commit()
+    test_client.patch(url, json={"is_var": True})
+    assert _review_rows(test_conn, obj_unc) == [
+        (night1, "CONFIRMED", "CONFIRMED", None), (night2, None, "CONFIRMED", None),
+    ]
+
+    # a note keeps a row alive when its verdicts are reset to auto
+    put = test_client.put(
+        f"{url}/night/{night1}/review",
+        json={"exop": "CONFIRMED", "var": "CONFIRMED", "note": "keep me"},
+    )
+    assert put.status_code == 200
+    test_client.patch(url, json={"exop_source": "auto", "var_source": "auto"})
+    assert _review_rows(test_conn, obj_unc) == [(night1, None, None, "keep me")]
+
+
+def test_put_review_upserts_and_returns_the_new_flags(client, test_conn) -> None:
+    test_client, ids = client
+    url = f"/api/object/{ids['obj_unc']}/night/{ids['night1']}/review"
+
+    resp = test_client.put(url, json={"exop": "CONFIRMED", "var": None, "note": "dip visible"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["review"]["exop"] == "CONFIRMED"
+    assert data["review"]["var"] is None
+    assert data["review"]["note"] == "dip visible"
+    assert data["review"]["updated_at"]
+    assert data["night"]["exop_effective"] is True
+    assert (data["night"]["auto_exop"], data["night"]["pending"]) == (False, False)
+    assert data["object"] == {
+        "is_exop": True, "is_var": False, "class": "EXOP", "class_source": "manual",
+        "exop_source": "manual", "var_source": "auto", "n_review_pending": 0,
+        "n_nights_reviewed": 1,
+    }
+    assert _review_rows(test_conn, ids["obj_unc"]) == [
+        (ids["night1"], "CONFIRMED", None, "dip visible")
+    ]
+
+    # a true PUT: the omitted note is cleared, the verdicts are replaced
+    data = test_client.put(url, json={"exop": "REJECTED", "var": "CONFIRMED"}).json()
+    assert data["review"]["note"] is None
+    assert (data["object"]["is_exop"], data["object"]["is_var"]) == (False, True)
+    assert data["object"]["class"] == "VAR"
+    assert _review_rows(test_conn, ids["obj_unc"]) == [
+        (ids["night1"], "REJECTED", "CONFIRMED", None)
+    ]
+
+
+def test_put_review_rejecting_a_night_never_removes_the_literature(client) -> None:
+    test_client, ids = client
+    url = f"/api/object/{ids['obj_exop']}/night/{ids['night1']}/review"
+
+    data = test_client.put(url, json={"exop": "REJECTED"}).json()
+
+    assert data["night"]["auto_exop"] is True
+    assert data["night"]["exop_effective"] is False
+    assert data["night"]["pending"] is False  # the person has decided this night
+    assert (data["object"]["is_exop"], data["object"]["class"]) == (True, "EXOP")  # known planet
+    assert data["object"]["exop_source"] == "manual"
+    assert data["object"]["n_nights_reviewed"] == 1
+
+
+def test_put_all_null_and_delete_remove_the_row(client, test_conn) -> None:
+    test_client, ids = client
+    obj_id, night1 = ids["obj_unc"], ids["night1"]
+    url = f"/api/object/{obj_id}/night/{night1}/review"
+
+    test_client.put(url, json={"exop": "CONFIRMED"})
+    assert len(_review_rows(test_conn, obj_id)) == 1
+    resp = test_client.put(url, json={"exop": None, "var": None, "note": ""})
+    assert resp.status_code == 200
+    assert resp.json()["review"] is None
+    assert _review_rows(test_conn, obj_id) == []
+    assert resp.json()["object"]["class"] == "UNC"
+    assert resp.json()["object"]["exop_source"] == "auto"
+    assert resp.json()["object"]["n_nights_reviewed"] == 0
+
+    test_client.put(url, json={"var": "REJECTED", "note": "x"})
+    assert len(_review_rows(test_conn, obj_id)) == 1
+    resp = test_client.delete(url)
+    assert resp.status_code == 200
+    assert resp.json()["review"] is None
+    assert _review_rows(test_conn, obj_id) == []
+    assert test_client.delete(url).status_code == 200  # deleting nothing is fine
+
+
+def test_put_review_validation_and_missing_targets(client, test_conn) -> None:
+    test_client, ids = client
+    obj_id, night1, night2 = ids["obj_unc"], ids["night1"], ids["night2"]
+    url = f"/api/object/{obj_id}/night/{night1}/review"
+
+    assert test_client.put(url, json={"exop": "MAYBE"}).status_code == 400
+    assert test_client.put(url, json={"var": "confirmed"}).status_code == 400
+    assert test_client.put(url, json={"note": "x" * 2001}).status_code == 400
+    assert test_client.put(url, json={"note": "x" * 2000}).status_code == 200
+    test_client.delete(url)
+    assert _review_rows(test_conn, obj_id) == []
+
+    missing = test_client.put(
+        f"/api/object/999999/night/{night1}/review", json={"exop": "CONFIRMED"}
+    )
+    assert missing.status_code == 404
+    # obj_unc has no data on night 2, and night 999999 does not exist
+    no_data = test_client.put(
+        f"/api/object/{obj_id}/night/{night2}/review", json={"exop": "CONFIRMED"}
+    )
+    assert no_data.status_code == 404
+    assert "no data on this night" in no_data.json()["detail"]
+    no_night = test_client.put(
+        f"/api/object/{obj_id}/night/999999/review", json={"exop": "CONFIRMED"}
+    )
+    assert no_night.status_code == 404
+    assert test_client.delete(f"/api/object/{obj_id}/night/{night2}/review").status_code == 404
+    assert _review_rows(test_conn, obj_id) == []
+
+
+def test_object_detail_nights_carry_the_review_and_night_state(client) -> None:
+    test_client, ids = client
+    data = test_client.get(f"/api/object/{ids['obj_exop']}").json()
+    assert (data["object"]["lit_exop"], data["object"]["lit_var"]) == (True, False)
+    first, second = data["nights"]  # ordered by night date
+    for night in (first, second):
+        for key in (
+            "review_exop", "review_var", "review_note", "review_updated_at", "auto_exop",
+            "auto_var", "exop_open", "var_open", "exop_effective", "var_effective", "pending",
+        ):
+            assert key in night
+    assert first["night_id"] == ids["night1"]
+    assert (first["auto_exop"], first["exop_open"], first["pending"]) == (True, True, True)
+    assert (second["auto_exop"], second["pending"]) == (False, False)
+    assert first["review_exop"] is None
+
+    lit_var = test_client.get(f"/api/object/{ids['obj_var']}").json()["object"]
+    assert (lit_var["lit_exop"], lit_var["lit_var"]) == (False, True)
+    plain = test_client.get(f"/api/object/{ids['obj_both']}").json()["object"]
+    assert (plain["lit_exop"], plain["lit_var"]) == (False, False)
+
+    test_client.put(
+        f"/api/object/{ids['obj_exop']}/night/{ids['night1']}/review",
+        json={"exop": "REJECTED", "note": "systematic"},
+    )
+    first = test_client.get(f"/api/object/{ids['obj_exop']}").json()["nights"][0]
+    assert (first["review_exop"], first["review_var"]) == ("REJECTED", None)
+    assert first["review_note"] == "systematic"
+    assert first["review_updated_at"]
+    assert (first["auto_exop"], first["exop_effective"], first["pending"]) == (True, False, False)
+
+
+def test_search_needs_review_and_user_reviewed_filters(client, test_conn) -> None:
+    from relphot.objflags import refresh_flags
+
+    test_client, ids = client
+    # the raw-SQL fixture never ran the flags step: derive every object's state first
+    refresh_flags(test_conn, class_multinight_kinds=("recurrent",))
+    test_conn.commit()
+    everything = {
+        ids["obj_unc"], ids["obj_exop"], ids["obj_var"], ids["obj_var2"], ids["obj_both"]
+    }
+    awaiting = {ids["obj_exop"], ids["obj_var"], ids["obj_both"]}
+
+    def search(**params) -> set[int]:
+        return _ids_of(test_client.get("/api/search", params=params))
+
+    assert search(needs_review="true") == awaiting
+    assert search(needs_review="false") == everything - awaiting
+    assert search(user_reviewed="true") == set()
+    assert search(user_reviewed="false") == everything
+
+    resp = test_client.put(
+        f"/api/object/{ids['obj_exop']}/night/{ids['night1']}/review", json={"exop": "REJECTED"}
+    )
+    assert resp.status_code == 200
+    assert search(needs_review="true") == awaiting - {ids["obj_exop"]}
+    assert search(user_reviewed="true") == {ids["obj_exop"]}
+    assert search(user_reviewed="false") == everything - {ids["obj_exop"]}
+
+    rows = test_client.get("/api/search", params={"user_reviewed": "true"}).json()["rows"]
+    assert (rows[0]["n_review_pending"], rows[0]["n_nights_reviewed"]) == (0, 1)
+    csv_header = test_client.get("/api/search.csv").text.splitlines()[0].split(",")
+    assert "n_review_pending" in csv_header
+    assert "n_nights_reviewed" in csv_header
+
+
+def test_patch_detection_rejected_refreshes_the_object_flags(client) -> None:
+    test_client, ids = client
+    obj = f"/api/object/{ids['obj_both']}"  # two transit events, no literature entry
+
+    def state() -> tuple:
+        o = test_client.get(obj).json()["object"]
+        return o["is_exop"], o["class"], o["n_review_pending"], o["n_nights_reviewed"]
+
+    resp = test_client.patch(f"/api/detection/{ids['det_a']}", json={"status": "REJECTED"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "REJECTED"
+    assert state() == (True, "EXOP", 1, 1)  # the other event still stands
+
+    test_client.patch(f"/api/detection/{ids['det_b']}", json={"status": "REJECTED"})
+    assert state() == (False, "UNC", 0, 2)
+
+    test_client.patch(f"/api/detection/{ids['det_b']}", json={"status": "UNCONFIRMED"})
+    assert state() == (True, "EXOP", 1, 1)
+
+    # a notes-only edit changes no evidence
+    assert test_client.patch(
+        f"/api/detection/{ids['det_b']}", json={"notes": "check"}
+    ).status_code == 200
+    assert state() == (True, "EXOP", 1, 1)
+
+
+def test_web_role_can_write_reviews_but_not_move_them_and_ro_cannot_write(
+    client, test_conn
+) -> None:
+    test_client, ids = client
+    obj_id, night1 = ids["obj_unc"], ids["night1"]
+    test_client.put(f"/api/object/{obj_id}/night/{night1}/review", json={"exop": "CONFIRMED"})
+
+    rw_dsn = _role_dsn(_test_dsn(), "relphot_web", "RELPHOT_WEB_PASSWORD")
+    with psycopg.connect(rw_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.user_night_review SET var_verdict = 'REJECTED', note = 'n' "
+            "WHERE obj_id = %s",
+            (obj_id,),
+        )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "UPDATE relphot.user_night_review SET night_id = %s WHERE obj_id = %s",
+                (ids["night2"], obj_id),
+            )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "UPDATE relphot.user_night_review SET obj_id = %s WHERE obj_id = %s",
+                (ids["obj_var"], obj_id),
+            )
+    assert _review_rows(test_conn, obj_id) == [(night1, "CONFIRMED", "REJECTED", "n")]
+
+    ro_dsn = _role_dsn(_test_dsn(), "relphot_ro", "RELPHOT_RO_PASSWORD")
+    for sql in (
+        "INSERT INTO relphot.user_night_review (obj_id, night_id, exop_verdict) "
+        "VALUES (%(o)s, %(n)s, 'CONFIRMED')",
+        "UPDATE relphot.user_night_review SET note = 'x'",
+        "DELETE FROM relphot.user_night_review",
+    ):
+        with (
+            psycopg.connect(ro_dsn, autocommit=True) as conn,
+            conn.cursor() as cur,
+            pytest.raises(psycopg.errors.InsufficientPrivilege),
+        ):
+            cur.execute(sql, {"o": ids["obj_var"], "n": night1})
 
 
 def test_patch_manual_period_clears_period_error(client) -> None:
@@ -858,3 +1140,559 @@ def test_period_verification_status_and_note_in_detail_search_and_csv(client) ->
     assert "period_verify_status" in header.split(",")
     assert "period_verify_note" in header.split(",")
     assert "lit_period_outside_grid" in line
+
+
+# --------------------------------------------------------------------------
+# user-guided reprocessing: queue insert (relphot_web), history, adopt-as-period
+# --------------------------------------------------------------------------
+
+
+def _requests(test_conn) -> list[tuple]:
+    test_conn.rollback()
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT obj_id, kind, period_guess, tc_guess, width_guess_h, night_id, note, status "
+            "FROM relphot.reprocess_request ORDER BY req_id"
+        )
+        return cur.fetchall()
+
+
+def _var_entry(night=None, period=1.25, all_nights=False):
+    """Helper to create a VAR entry dict."""
+    return {
+        "night_id": night,
+        "exop": None,
+        "var": {"period_guess": period, "all_nights": all_nights},
+    }
+
+
+def _exop_entry(night, tc, width):
+    """Helper to create an EXOP entry dict."""
+    return {
+        "night_id": night,
+        "exop": {"tc_guess": tc, "width_guess_h": width},
+        "var": None,
+    }
+
+
+def test_post_reprocess_queues_a_variable_request_through_the_web_role(client, test_conn) -> None:
+    test_client, ids = client
+    # night-only
+    entry = _var_entry(night=ids["night1"], period=1.25, all_nights=False)
+    resp = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess",
+        json={"entries": [entry], "note": "looks like an EB"},
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(resp.json()["requests"]) == 1
+    req = resp.json()["requests"][0]
+    assert req["kind"] == "variable" and req["night_id"] == ids["night1"]
+    rows = _requests(test_conn)
+    expected = [
+        (ids["obj_var"], "variable", 1.25, None, None, ids["night1"],
+         "looks like an EB", "queued"),
+    ]
+    assert rows == expected
+
+    # all_nights true -> night_id None
+    test_conn.execute("DELETE FROM relphot.reprocess_request")
+    test_conn.commit()
+    entry_all = _var_entry(night=ids["night1"], period=1.25, all_nights=True)
+    resp = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess",
+        json={"entries": [entry_all], "note": "all"},
+    )
+    assert resp.status_code == 201, resp.text
+    rows = _requests(test_conn)
+    assert rows == [(ids["obj_var"], "variable", 1.25, None, None, None, "all", "queued")]
+
+
+def test_post_reprocess_transit_uses_the_chosen_night(client, test_conn) -> None:
+    test_client, ids = client
+    tc = 2460310.5106  # inside both nights
+    resp = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess",
+        json={"entries": [_exop_entry(ids["night1"], tc, 2.0)]},
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(resp.json()["requests"]) == 1
+    rows = _requests(test_conn)
+    assert len(rows) == 1
+    assert rows[0][:6] == (ids["obj_var"], "transit", None, tc, 2.0, ids["night1"])
+
+
+def test_post_reprocess_both_and_several_entries_queue_atomically(client, test_conn) -> None:
+    test_client, ids = client
+    tc = 2460310.5106
+    # One entry EXOP+VAR -> 2 rows
+    resp = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess",
+        json={
+            "entries": [{
+                "night_id": ids["night1"],
+                "exop": {"tc_guess": tc, "width_guess_h": 2.0},
+                "var": {"period_guess": 1.25, "all_nights": False},
+            }],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(resp.json()["requests"]) == 2
+    rows = _requests(test_conn)
+    assert len(rows) == 2
+    kinds = {r[1] for r in rows}
+    assert kinds == {"transit", "variable"}
+
+    # Two entries -> 2 rows (not 4; each entry generates 1 request per kind combo)
+    test_conn.execute("DELETE FROM relphot.reprocess_request")
+    test_conn.commit()
+    resp = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess",
+        json={
+            "entries": [
+                _exop_entry(ids["night1"], tc, 2.0),
+                _exop_entry(ids["night2"], tc, 3.0),
+            ],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(resp.json()["requests"]) == 2
+    rows = _requests(test_conn)
+    assert len(rows) == 2
+
+
+@pytest.mark.parametrize(
+    "body_fn,expected_status,expected_substring",
+    [
+        # entry with neither exop nor var
+        (
+            lambda _: {"entries": [{"night_id": None, "exop": None, "var": None}]},
+            400,
+            "tick EXOP and/or VAR",
+        ),
+        # var without period
+        (
+            lambda ids: {"entries": [_var_entry(night=ids["night1"], period=None)]},
+            400,
+            "period_guess",
+        ),
+        # var period 0
+        (
+            lambda ids: {"entries": [_var_entry(night=ids["night1"], period=0)]},
+            400,
+            "period_guess",
+        ),
+        # var period -2
+        (
+            lambda ids: {"entries": [_var_entry(night=ids["night1"], period=-2)]},
+            400,
+            "period_guess",
+        ),
+        # var period 1e9
+        (
+            lambda ids: {"entries": [_var_entry(night=ids["night1"], period=1e9)]},
+            400,
+            "period_guess",
+        ),
+        # var night None, all_nights False
+        (
+            lambda _: {"entries": [_var_entry(night=None, period=1.25, all_nights=False)]},
+            400,
+            "needs a night",
+        ),
+        # var night 99999
+        (
+            lambda _: {
+                "entries": [_var_entry(night=99999, period=1.25, all_nights=False)]
+            },
+            400,
+            "night 99999 has no light curve",
+        ),
+        # exop with tc but width None
+        (
+            lambda _: {
+                "entries": [
+                    {
+                        "night_id": None,
+                        "exop": {"tc_guess": 2460310.51, "width_guess_h": None},
+                        "var": None,
+                    }
+                ]
+            },
+            400,
+            "tc_guess and width_guess_h",
+        ),
+        # exop width 0.05 (too small)
+        (
+            lambda ids: {"entries": [_exop_entry(ids["night1"], 2460310.51, 0.05)]},
+            400,
+            "between 0.1 and 12",
+        ),
+        # exop width 13 (too large)
+        (
+            lambda ids: {"entries": [_exop_entry(ids["night1"], 2460310.51, 13.0)]},
+            400,
+            "between 0.1 and 12",
+        ),
+        # exop valid tc/width but night None
+        (
+            lambda _: {"entries": [_exop_entry(None, 2460310.51, 2.0)]},
+            400,
+            "EXOP needs a night",
+        ),
+        # exop night1 tc 2450000 (outside night)
+        (
+            lambda ids: {"entries": [_exop_entry(ids["night1"], 2450000.0, 2.0)]},
+            400,
+            "not inside night",
+        ),
+        # exop night 99999
+        (
+            lambda _: {"entries": [_exop_entry(99999, 2460310.51, 2.0)]},
+            400,
+            "night 99999 has no light curve",
+        ),
+        # two var entries on night1
+        (
+            lambda ids: {
+                "entries": [
+                    _var_entry(ids["night1"], 1.25, False),
+                    _var_entry(ids["night1"], 1.3, False),
+                ]
+            },
+            400,
+            "repeats",
+        ),
+        # two all-nights var entries
+        (
+            lambda _: {
+                "entries": [
+                    _var_entry(None, 1.25, True),
+                    _var_entry(None, 1.3, True),
+                ]
+            },
+            400,
+            "repeats",
+        ),
+        # valid entry 1 + invalid entry 2
+        (
+            lambda ids: {
+                "entries": [
+                    _var_entry(ids["night1"], 1.25, False),
+                    _exop_entry(99999, 2460310.51, 2.0),
+                ]
+            },
+            400,
+            "entry 2:",
+        ),
+    ],
+    ids=[
+        "neither_exop_nor_var",
+        "var_period_none",
+        "var_period_0",
+        "var_period_negative",
+        "var_period_toolarge",
+        "var_night_none",
+        "var_night_missing",
+        "exop_width_none",
+        "exop_width_too_small",
+        "exop_width_too_large",
+        "exop_night_none",
+        "exop_tc_outside_night",
+        "exop_night_missing",
+        "two_var_same_night",
+        "two_var_allnights",
+        "valid_and_invalid",
+    ],
+)
+def test_post_reprocess_validates_its_input(
+    client, test_conn, body_fn, expected_status, expected_substring
+) -> None:
+    test_client, ids = client
+    body = body_fn(ids)
+    test_conn.execute("DELETE FROM relphot.reprocess_request")
+    test_conn.commit()
+    resp = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess", json=body
+    )
+    assert resp.status_code == expected_status, (
+        f"Body {body}: expected {expected_status}, "
+        f"got {resp.status_code} - {resp.text}"
+    )
+    if expected_status == 400:
+        assert expected_substring in resp.json()["detail"]
+    assert _requests(test_conn) == []
+
+
+def test_post_reprocess_rejects_empty_list_too_many_and_unknown_object(
+    client,
+) -> None:
+    test_client, ids = client
+    n1, n2 = ids["night1"], ids["night2"]
+    # Empty list
+    resp = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess", json={"entries": []}
+    )
+    assert resp.status_code == 422
+    # Too many (>20)
+    entries = [
+        _var_entry(n1 if i % 2 == 0 else n2, 1.25 + i * 0.01, False)
+        for i in range(21)
+    ]
+    resp = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess", json={"entries": entries}
+    )
+    assert resp.status_code == 422
+    # Unknown object
+    resp = test_client.post(
+        "/api/object/999999/reprocess", json={"entries": [_var_entry(n1)]}
+    )
+    assert resp.status_code == 404
+
+
+def test_web_role_can_insert_requests_but_not_set_their_status(client) -> None:
+    _test_client, ids = client
+    rw_dsn = _role_dsn(_test_dsn(), "relphot_web", "RELPHOT_WEB_PASSWORD")
+    with psycopg.connect(rw_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "INSERT INTO relphot.reprocess_request (obj_id, kind, period_guess, status) "
+                "VALUES (%s, 'variable', 1.0, 'done')",
+                (ids["obj_var"],),
+            )
+        cur.execute(
+            "INSERT INTO relphot.reprocess_request (obj_id, kind, period_guess) "
+            "VALUES (%s, 'variable', 1.0) RETURNING req_id",
+            (ids["obj_var"],),
+        )
+        (req_id,) = cur.fetchone()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "UPDATE relphot.reprocess_request SET status = 'done' WHERE req_id = %s", (req_id,)
+            )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute("DELETE FROM relphot.reprocess_request")
+
+
+def test_get_reprocess_lists_the_history_and_queue_depth(client, test_conn) -> None:
+    test_client, ids = client
+    resp1 = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess",
+        json={"entries": [_var_entry(ids["night1"], 1.1)]},
+    )
+    first = resp1.json()["requests"][0]["req_id"]
+
+    test_client.post(
+        f"/api/object/{ids['obj_var2']}/reprocess",
+        json={"entries": [_var_entry(ids["night1"], 0.5)]},
+    )
+
+    resp2 = test_client.post(
+        f"/api/object/{ids['obj_var']}/reprocess",
+        json={"entries": [_var_entry(ids["night1"], 1.3)]},
+    )
+    second = resp2.json()["requests"][0]["req_id"]
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.reprocess_request SET status = 'done', finished_at = now(), "
+            "result = '{\"found\": true}' WHERE req_id = %s",
+            (first,),
+        )
+    test_conn.commit()
+
+    data = test_client.get(f"/api/object/{ids['obj_var']}/reprocess").json()
+    assert [r["req_id"] for r in data["requests"]] == [second, first]
+    by_id = {r["req_id"]: r for r in data["requests"]}
+    assert by_id[first]["status"] == "done" and by_id[first]["result"] == {"found": True}
+    assert by_id[first]["requests_ahead"] is None
+    assert by_id[first]["night_label"] is not None  # should have night_label
+    assert by_id[second]["status"] == "queued" and by_id[second]["requests_ahead"] == 1
+    assert data["queue"] == {"queued": 2, "running": 0}
+    assert test_client.get("/api/object/999999/reprocess").status_code == 404
+
+
+def test_nothing_is_queued_by_edits_or_reads(client, test_conn) -> None:
+    test_client, ids = client
+    # GETs should not queue
+    test_client.get(f"/api/object/{ids['obj_var']}")
+    test_client.get(f"/api/object/{ids['obj_var']}/reprocess")
+    # PATCH object should not queue
+    test_client.patch(f"/api/object/{ids['obj_var']}", json={"is_exop": True})
+    # PATCH detection should not queue
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT det_id FROM relphot.detection LIMIT 1")
+        det_id_row = cur.fetchone()
+    if det_id_row:
+        test_client.patch(f"/api/detection/{det_id_row[0]}", json={"status": "CONFIRMED"})
+    # adopt_period should not queue
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT est_id FROM relphot.period_estimate LIMIT 1")
+        est_row = cur.fetchone()
+    if est_row:
+        test_client.post(f"/api/object/{ids['obj_var']}/adopt_period", json={"est_id": est_row[0]})
+
+    test_conn.rollback()
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM relphot.reprocess_request")
+        count = cur.fetchone()[0]
+    assert count == 0
+
+
+def _insert_guided_estimate(test_conn, obj_id: int, **kw) -> int:
+    values = {
+        "method": "LS-guided", "input": "tied", "night_ids": [1, 2], "n_nights": 2,
+        "period": 1.2007, "period_err": 0.0015, "guess": 1.2, "verify_status": "no_literature",
+    }
+    values.update(kw)
+    cols = ["obj_id", *values]
+    with test_conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO relphot.period_estimate ({', '.join(cols)}) "
+            f"VALUES ({', '.join(['%s'] * len(cols))}) RETURNING est_id",
+            [obj_id, *values.values()],
+        )
+        est_id = cur.fetchone()[0]
+    test_conn.commit()
+    return est_id
+
+
+def test_adopt_period_sets_a_manual_period_with_its_error(client, test_conn) -> None:
+    test_client, ids = client
+    est_id = _insert_guided_estimate(test_conn, ids["obj_var2"])
+    resp = test_client.post(
+        f"/api/object/{ids['obj_var2']}/adopt_period", json={"est_id": est_id}
+    )
+    assert resp.status_code == 200, resp.text
+    obj = resp.json()
+    assert obj["period"] == 1.2007 and obj["period_err"] == 0.0015
+    assert obj["period_source"] == "manual" and obj["period_n_nights"] == 2
+
+    # a manual period survives the pipeline's refresh ...
+    from relphot.db.refresh import refresh_objects
+
+    refresh_objects(test_conn, [ids["obj_var2"]])
+    test_conn.commit()
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT period, period_source FROM relphot.object WHERE obj_id = %s", (ids["obj_var2"],)
+        )
+        assert cur.fetchone() == (1.2007, "manual")
+    # ... and "reset to auto" hands it back
+    resp = test_client.patch(
+        f"/api/object/{ids['obj_var2']}", json={"period_source": "auto"}
+    )
+    assert resp.status_code == 200 and resp.json()["period_source"] == "auto"
+
+
+def test_adopt_period_refuses_unusable_or_foreign_estimates(client, test_conn) -> None:
+    test_client, ids = client
+    flagged = _insert_guided_estimate(
+        test_conn, ids["obj_var2"], night_ids=[7], verify_status="long_period_needs_tie"
+    )
+    empty = _insert_guided_estimate(test_conn, ids["obj_var2"], night_ids=[8], period=None)
+    foreign = _insert_guided_estimate(test_conn, ids["obj_var"], night_ids=[9])
+    url = f"/api/object/{ids['obj_var2']}/adopt_period"
+    resp = test_client.post(url, json={"est_id": flagged})
+    assert resp.status_code == 400
+    assert "long period needs a multi-night tie" in resp.json()["detail"]
+    assert test_client.post(url, json={"est_id": empty}).status_code == 400
+    assert test_client.post(url, json={"est_id": foreign}).status_code == 404
+    assert test_client.post(url, json={"est_id": 424242}).status_code == 404
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT period_source FROM relphot.object WHERE obj_id = %s", (ids["obj_var2"],)
+        )
+        assert cur.fetchone() != ("manual",)
+
+
+# --------------------------------------------------------------------------
+# phase diagram payload
+# --------------------------------------------------------------------------
+
+
+def test_phase_payload_is_tied_for_a_tied_object_and_labelled_untied_otherwise(client) -> None:
+    test_client, ids = client
+    tied = test_client.get(f"/api/object/{ids['obj_var']}/phase").json()
+    assert tied["tied"] is True and tied["mode"] == "tied-mag"
+    assert "tie-calibrated" in tied["label"]
+    assert len(tied["bjd_tdb"]) == len(tied["value"]) == len(tied["value_err"]) == 6
+    assert all(13.0 < v < 15.0 for v in tied["value"])
+    # tied error bars include the night's 0.01 mag tie error in quadrature
+    assert all(e > 0.0107 for e in tied["value_err"])
+    assert sorted(set(tied["night_label"])) == ["20250101", "20250102"]
+    keys = [c["key"] for c in tied["period_candidates"]]
+    # PERIOD 1.2 (catalog), the fixture's latest LS estimate (0.7 d) and the literature period
+    assert keys == ["period", "estimate", "literature"]
+    assert tied["period"] == 1.2 and tied["t_first"] == min(tied["bjd_tdb"])
+    assert 0.0 < tied["phase_coverage"] <= 1.0 and tied["n_cycles"] > 0
+
+    untied = test_client.get(f"/api/object/{ids['obj_var2']}/phase").json()
+    assert untied["tied"] is False and untied["mode"] == "night-normalised"
+    assert "untied" in untied["label"]
+    assert all(0.8 < v < 1.2 for v in untied["value"])
+    assert untied["period_candidates"] == [] and untied["period"] is None
+    assert untied["model"] is None and untied["phase_coverage"] is None
+
+
+def test_phase_payload_period_model_candidates_and_aliases(client, test_conn) -> None:
+    test_client, ids = client
+    obj = ids["obj_var2"]
+    _insert_guided_estimate(test_conn, obj, night_ids=[1, 2], period=1.5, guess=1.4)
+    _insert_guided_estimate(
+        test_conn, obj, method="LS", night_ids=[3, 4], n_nights=2, period=1.6, period_err=0.02,
+        alias_periods=[0.61, 2.7], alias_powers=[0.4, 0.2],
+    )
+    data = test_client.get(f"/api/object/{obj}/phase").json()
+    assert [c["key"] for c in data["period_candidates"]] == ["estimate", "guided"]
+    assert data["period"] == 1.6  # the first candidate
+    assert data["aliases"] == [{"period": 0.61, "power": 0.4}, {"period": 2.7, "power": 0.2}]
+
+    # an explicit period: the model and the coverage are computed there
+    # (6 points: a period beyond a night is fitted with one offset, so the fit has 1 dof)
+    tied = test_client.get(f"/api/object/{ids['obj_var']}/phase", params={"period": 2.0}).json()
+    assert tied["period"] == 2.0
+    assert tied["model"] is not None and len(tied["model"]["coef"]) == 4
+    assert tied["model"]["period"] == 2.0 and tied["model"]["t_zero"] is not None
+    assert test_client.get(f"/api/object/{obj}/phase", params={"period": 0}).status_code == 422
+    assert test_client.get("/api/object/999999/phase").status_code == 404
+
+
+def test_object_detail_carries_the_guided_and_inflation_fields(client, test_conn) -> None:
+    test_client, ids = client
+    est_id = _insert_guided_estimate(
+        test_conn, ids["obj_var"], phase_coverage=0.4, n_cycles=1.3,
+        alias_periods=[0.7], alias_powers=[0.3],
+    )
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.star_night SET err_scale = 3.5, blended = true "
+            "WHERE obj_id = %s AND night_id = %s",
+            (ids["obj_var"], ids["night1"]),
+        )
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind, tc_bjd_tdb, duration_h, "
+            "flags, origin) VALUES (%s, %s, 'transit', 2460310.51, 2.0, 'USER', 'user')",
+            (ids["obj_var"], ids["night1"]),
+        )
+    test_conn.commit()
+    data = test_client.get(f"/api/object/{ids['obj_var']}").json()
+    est = next(e for e in data["period_estimates"] if e["est_id"] == est_id)
+    assert (est["method"], est["guess"], est["phase_coverage"], est["n_cycles"]) == (
+        "LS-guided", 1.2, pytest.approx(0.4), pytest.approx(1.3)
+    )
+    assert est["alias_periods"] == [0.7]
+    night1 = next(n for n in data["nights"] if n["night_id"] == ids["night1"])
+    assert (night1["err_scale"], night1["blended"]) == (pytest.approx(3.5), True)
+    assert {d["origin"] for d in data["detections"] if d["kind"] == "transit"} == {"user"}
+    assert [e["origin"] for e in data["transit_events"]] == ["user"]
+
+
+def test_search_period_verification_ignores_guided_rows(client, test_conn) -> None:
+    test_client, ids = client
+    _insert_guided_estimate(
+        test_conn, ids["obj_both"], night_ids=[5, 6], lit_period=4.0, period=3.0,
+        delta=-1.0, delta_err=0.1, last_night="2030-01-01",
+    )
+    rows = test_client.get("/api/search", params={"name": "BOTH01"}).json()["rows"]
+    # the fixture's latest re-observation has delta 0.001; the later guided row (-1.0) is not one
+    assert rows[0]["period_delta"] == pytest.approx(0.001)

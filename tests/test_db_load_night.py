@@ -20,6 +20,7 @@ import pytest
 from relphot.config import DbSettings, SearchSettings, Settings
 from relphot.db.connect import resolve_dsn
 from relphot.db.load_night import _format_dec_dms, _format_ra_hms, load_night
+from relphot.db.refresh import refresh_objects
 from relphot.db.schema import init_schema
 from relphot.exceptions import ConfigError, NightLoadError
 
@@ -549,6 +550,224 @@ def test_reload_spares_orphan_objects_a_person_has_touched(test_conn, tmp_path) 
         cur.execute("SELECT name FROM relphot.object WHERE dec = 50.0 ORDER BY name")
         kept = [r[0] for r in cur.fetchall()]
     assert kept == ["confirmed", "has_notes", "manual_exop", "manual_period", "manual_var"]
+
+
+def _add_transit(root: Path, star_id: int, tc: float) -> None:
+    """Make ``star_id`` a transit candidate of the night's search metrics."""
+
+    def edit(sm: pd.DataFrame) -> None:
+        i = sm.index[sm["star_id"] == star_id][0]
+        sm.loc[i, "transit_candidate"] = True
+        sm.loc[i, "transit_snr"] = 8.5
+        sm.loc[i, "transit_depth"] = 0.02
+        sm.loc[i, "transit_tc_bjd_tdb"] = tc
+        sm.loc[i, "transit_duration_hours"] = 1.5
+        sm.loc[i, "transit_tier"] = 1
+        sm.loc[i, "transit_flags_str"] = "OK"
+
+    _edit_metrics(root, edit)
+
+
+def _object_at(test_conn, ra: float, dec: float) -> int:
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT obj_id FROM relphot.object WHERE ra = %s AND dec = %s", (ra, dec))
+        (obj_id,) = cur.fetchone()
+    return obj_id
+
+
+def _state(test_conn, obj_id: int) -> tuple:
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT is_exop, exop_source, class, n_review_pending, n_nights_reviewed "
+            "FROM relphot.object WHERE obj_id = %s",
+            (obj_id,),
+        )
+        return cur.fetchone()
+
+
+def test_a_night_verdict_survives_and_a_new_night_is_evaluated_automatically(
+    test_conn, tmp_path
+) -> None:
+    root1 = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root1)
+    _add_transit(root1, 0, 2460000.55)  # night 1 star0 is obj1 (ra=10.0, dec=-20.0)
+    report1 = load_night(test_conn, root1, settings=_SETTINGS)
+    obj1 = _object_at(test_conn, 10.0, -20.0)
+    assert _state(test_conn, obj1) == (True, "auto", "EXOP", 1, 0)
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.user_night_review (obj_id, night_id, exop_verdict) "
+            "VALUES (%s, %s, 'REJECTED')",
+            (obj1, report1.night_id),
+        )
+    test_conn.commit()
+    refresh_objects(test_conn, [obj1])
+    test_conn.commit()
+    assert _state(test_conn, obj1) == (False, "manual", "UNC", 0, 1)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT * FROM relphot.user_night_review")
+        review_row = cur.fetchall()
+
+    # night 2 sees the same star (night 2 star1) with a transit of its own
+    root2 = tmp_path / "T80S_reduced" / "20250102" / "relphot"
+    _write_night2(root2)
+    _add_transit(root2, 1, 2460001.52)
+    report2 = load_night(test_conn, root2, settings=_SETTINGS)
+
+    assert report2.night_id != report1.night_id
+    assert _state(test_conn, obj1) == (True, "manual", "EXOP", 1, 1)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT * FROM relphot.user_night_review")
+        assert cur.fetchall() == review_row  # night 1's decision is unchanged
+
+
+def test_reload_keeps_the_review_rows_and_their_effect(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    _add_transit(root, 0, 2460000.55)
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    obj1 = _object_at(test_conn, 10.0, -20.0)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.user_night_review (obj_id, night_id, exop_verdict, note) "
+            "VALUES (%s, %s, 'REJECTED', 'systematic')",
+            (obj1, report.night_id),
+        )
+        cur.execute("SELECT * FROM relphot.user_night_review")
+        review_row = cur.fetchall()
+    test_conn.commit()
+
+    again = load_night(test_conn, root, settings=_SETTINGS)
+
+    assert again.night_id == report.night_id  # the reload reuses the night, so the FK row stays
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT * FROM relphot.user_night_review")
+        assert cur.fetchall() == review_row  # including updated_at
+        cur.execute("SELECT count(*) FROM relphot.star_night WHERE obj_id = %s", (obj1,))
+        assert cur.fetchone() == (1,)
+    assert _state(test_conn, obj1) == (False, "manual", "UNC", 0, 1)
+
+
+def test_reload_spares_an_orphan_object_that_only_has_a_review_row(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        for i, name in enumerate(("reviewed_only", "plain")):
+            cur.execute(
+                "INSERT INTO relphot.object (name, ra, dec) VALUES (%s, %s, 50.0) "
+                "RETURNING obj_id",
+                (name, 100.0 + i),
+            )
+            (obj_id,) = cur.fetchone()
+            if name == "reviewed_only":
+                cur.execute(
+                    "INSERT INTO relphot.user_night_review (obj_id, night_id, var_verdict) "
+                    "VALUES (%s, %s, 'CONFIRMED')",
+                    (obj_id, report.night_id),
+                )
+    test_conn.commit()
+
+    load_night(test_conn, root, settings=_SETTINGS)  # a reload deletes star_night-less objects
+
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT name FROM relphot.object WHERE dec = 50.0 ORDER BY name")
+        assert [r[0] for r in cur.fetchall()] == ["reviewed_only"]
+
+
+def test_reload_keeps_user_detections_and_the_objects_they_touch(test_conn, tmp_path) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT obj_id, det_id FROM relphot.detection WHERE kind = 'transit'")
+        obj_id, search_det = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind, depth, tc_bjd_tdb, "
+            "duration_h, flags, origin) VALUES (%s, %s, 'transit', 0.02, 2460000.55, 1.5, "
+            "'USER', 'user') RETURNING det_id",
+            (obj_id, report.night_id),
+        )
+        (user_det,) = cur.fetchone()
+        # objects with no star_night: one holding a user detection, one holding only a
+        # reprocess request, one plain (an ordinary orphan, dropped by a reload)
+        ids = {}
+        for i, name in enumerate(("has_user_detection", "has_request", "plain_orphan")):
+            cur.execute(
+                "INSERT INTO relphot.object (name, ra, dec) VALUES (%s, %s, 50.0) "
+                "RETURNING obj_id",
+                (name, 100.0 + i),
+            )
+            ids[name] = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind, flags, origin) "
+            "VALUES (%s, %s, 'transit', 'USER', 'user')",
+            (ids["has_user_detection"], report.night_id),
+        )
+        cur.execute(
+            "INSERT INTO relphot.reprocess_request (obj_id, kind, period_guess) "
+            "VALUES (%s, 'variable', 1.5)",
+            (ids["has_request"],),
+        )
+    test_conn.commit()
+
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM relphot.reprocess_request")
+        req_count_before = cur.fetchone()[0]
+        cur.execute(
+            "SELECT obj_id, kind, period_guess FROM relphot.reprocess_request ORDER BY req_id"
+        )
+        req_rows_before = cur.fetchall()
+
+    load_night(test_conn, root, settings=_SETTINGS)
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT origin, det_id FROM relphot.detection WHERE obj_id = %s ORDER BY 1", (obj_id,)
+        )
+        rows = cur.fetchall()
+        cur.execute("SELECT name FROM relphot.object WHERE dec = 50.0 ORDER BY name")
+        kept = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT COUNT(*) FROM relphot.reprocess_request")
+        req_count_after = cur.fetchone()[0]
+        cur.execute(
+            "SELECT obj_id, kind, period_guess FROM relphot.reprocess_request ORDER BY req_id"
+        )
+        req_rows_after = cur.fetchall()
+    # the search detection was re-created (new id), the user's is the very same row
+    assert [r[0] for r in rows] == ["search", "user"]
+    assert dict(rows)["user"] == user_det
+    assert dict(rows)["search"] != search_det
+    assert kept == ["has_request", "has_user_detection"]
+    # reprocess_request rows unchanged by reload
+    assert req_count_before == req_count_after == 1
+    assert req_rows_before == req_rows_after
+
+
+def test_load_night_stores_err_scale_and_blended_and_old_products_load_null(
+    test_conn, tmp_path
+) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)  # a starstats table written before error inflation existed
+    load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT err_scale, blended FROM relphot.star_night")
+        old = cur.fetchall()
+    assert old and all(row == (None, None) for row in old)
+
+    path = root / "lc" / "night_lc_starstats.parquet"
+    df = pd.read_parquet(path)
+    df["err_scale"] = [1.0, 3.5, 1.0, 1.0, 2.0, 1.0]
+    df["blended"] = [False, True, False, False, False, False]
+    df.to_parquet(path)
+    load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT star_id, err_scale, blended FROM relphot.star_night ORDER BY star_id")
+        rows = cur.fetchall()
+    assert rows == [
+        (0, 1.0, False), (1, 3.5, True), (2, 1.0, False), (3, 1.0, False), (4, 2.0, False),
+    ]
 
 
 def test_load_night_reload_cascades_transit_rows(test_conn, tmp_path) -> None:

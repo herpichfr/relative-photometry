@@ -94,7 +94,11 @@ class FrameSelection:
 
 
 def select_candidates(
-    night: MatchedNight, variable_mask: np.ndarray, settings: Settings, aper: int
+    night: MatchedNight,
+    variable_mask: np.ndarray,
+    settings: Settings,
+    aper: int,
+    star_eligible: np.ndarray | None = None,
 ) -> np.ndarray:
     """Boolean mask, ``(n_stars,)``, of stars usable as reference candidates.
 
@@ -102,12 +106,37 @@ def select_candidates(
     == 0`` in every frame it is present in; a NaN-aware median SNR >=
     ``settings.reference.min_snr``; no other master star within
     ``settings.reference.isolation_radius_arcsec``; is not flagged in
-    ``variable_mask``; and finite, positive flux at aperture ``aper``
-    wherever present.
+    ``variable_mask``; finite, positive flux at aperture ``aper``
+    wherever present; and passes ``star_eligible`` filter.
+
+    Parameters
+    ----------
+    night : MatchedNight
+        The night
+    variable_mask : np.ndarray
+        (n_stars,) bool mask of known variables
+    settings : Settings
+        Relphot settings
+    aper : int
+        Aperture index
+    star_eligible : np.ndarray | None, optional
+        (n_stars,) bool mask of eligible stars (border and tail cuts).
+        If None, computes from star_eligibility(night, settings).eligible.
+        Raises ValueError if shape mismatch.
     """
     catalog = settings.catalog
     ref = settings.reference
     n = night.n_stars
+
+    if star_eligible is None:
+        from relphot.eligibility import star_eligibility
+        star_eligible = star_eligibility(night, settings).eligible
+    else:
+        star_eligible = np.asarray(star_eligible, dtype=bool)
+        if star_eligible.shape != (n,):
+            raise ValueError(
+                f"star_eligible shape {star_eligible.shape} != ({n},)"
+            )
 
     presence_ok = night.presence >= catalog.min_presence
 
@@ -139,10 +168,18 @@ def select_candidates(
     flux_ok = np.all(np.where(present, np.isfinite(flux_a) & (flux_a > 0), True), axis=1)
 
     not_variable = ~np.asarray(variable_mask, dtype=bool)
+    border_ok = np.asarray(star_eligible, dtype=bool)
 
-    candidate_mask = presence_ok & flags_ok & snr_ok & isolated & not_variable & flux_ok
+    candidate_mask = (
+        presence_ok & flags_ok & snr_ok & isolated & not_variable & flux_ok & border_ok
+    )
+    n_removed_border = int((~border_ok).sum())
     logger.info(
-        "reference candidates: %d/%d stars (aperture %d)", int(candidate_mask.sum()), n, aper
+        "reference candidates: %d/%d stars (aperture %d)%s",
+        int(candidate_mask.sum()),
+        n,
+        aper,
+        (f"; {n_removed_border} removed by border/tail cut" if n_removed_border > 0 else ""),
     )
     return candidate_mask
 

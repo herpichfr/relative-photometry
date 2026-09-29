@@ -9,11 +9,19 @@ See docs/DB_PLAN.md for the schema and the noise cut this implements.
 ``catalog_match``, matching stars to existing ``relphot.object`` rows (or
 creating new ones) by position. Everything happens in one transaction.
 
-A reload deletes the night's detections, but a person's ``status``/``notes`` on them
-are saved first and re-attached to the matching new detection (or, when none
-matches, kept in ``relphot.detection_review_orphan``); an object a person touched is
-never dropped as an orphan. A transit detection whose flags include EDGE or PARTIAL
-is stored with ``duration_lower_limit`` set (its duration is only a minimum).
+A reload of the same night keeps its ``user_night_review`` rows (per-night user verdicts
+survive the reload); a new night is always evaluated automatically. The night's
+detections are deleted, but a person's ``status``/``notes`` on them are saved first and
+re-attached to the matching new detection (or, when none matches, kept in
+``relphot.detection_review_orphan``); an object with user_night_review rows is never
+dropped as an orphan. A transit detection whose flags include EDGE or PARTIAL is stored
+with ``duration_lower_limit`` set (its duration is only a minimum). Only ``origin = 'search'``
+detections are deleted and re-created: a detection a person created by reprocessing
+(``origin = 'user'``, see :mod:`relphot.db.reprocess`) survives a reload.
+
+``star_night.err_scale`` / ``blended`` come from ``*_starstats.parquet`` (the factor
+``lc_err`` was inflated by and the neighbour-flag verdict); a product written before error
+inflation existed has neither column and loads them as NULL (read as a factor of 1).
 """
 
 from __future__ import annotations
@@ -183,7 +191,7 @@ def _restore_detection_reviews(
     """
     cur.execute(
         "SELECT det_id, obj_id, kind, tc_bjd_tdb, duration_h FROM relphot.detection "
-        "WHERE night_id = %s ORDER BY det_id",
+        "WHERE night_id = %s AND origin = 'search' ORDER BY det_id",
         (night_id,),
     )
     candidates: dict[tuple[int, str], list[tuple[int, float | None, float | None]]] = {}
@@ -487,12 +495,16 @@ def load_night(
             # a person's status/notes on a detection are saved first and re-attached below
             cur.execute(
                 "SELECT obj_id, kind, tc_bjd_tdb, duration_h, status, notes "
-                "FROM relphot.detection WHERE night_id = %s "
+                "FROM relphot.detection WHERE night_id = %s AND origin = 'search' "
                 "AND (status IS DISTINCT FROM 'UNCONFIRMED' OR notes IS NOT NULL)",
                 (night_id,),
             )
             saved_reviews = cur.fetchall()
-            cur.execute("DELETE FROM relphot.detection WHERE night_id = %s", (night_id,))
+            # a user's own detections (origin = 'user') are never reloaded away
+            cur.execute(
+                "DELETE FROM relphot.detection WHERE night_id = %s AND origin = 'search'",
+                (night_id,),
+            )
             cur.execute("DELETE FROM relphot.star_night WHERE night_id = %s", (night_id,))
             cur.execute("DELETE FROM relphot.frame WHERE night_id = %s", (night_id,))
 
@@ -591,15 +603,19 @@ def load_night(
             with cur.copy(
                 "COPY relphot.star_night "
                 "(obj_id, night_id, star_id, tile, mag, best_aperture, rms, "
-                "expected_noise, chi2_reduced, n_epochs, is_comparison) FROM STDIN"
+                "expected_noise, chi2_reduced, n_epochs, is_comparison, err_scale, blended) "
+                "FROM STDIN"
             ) as copy:
                 for row in df_store.itertuples(index=False):
+                    blended = getattr(row, "blended", None)
                     copy.write_row(
                         (
                             star_to_obj[row.star_id], night_id, int(row.star_id), int(row.tile),
                             _nan_to_none(row.mag), int(row.best_aperture), _nan_to_none(row.rms),
                             _nan_to_none(row.expected_noise), _nan_to_none(row.chi2_reduced),
                             int(row.n_epochs), bool(row.is_comparison),
+                            _optional_col(row, "err_scale"),
+                            None if blended is None or pd.isna(blended) else bool(blended),
                         )
                     )
 
@@ -785,7 +801,8 @@ def load_night(
                 _restore_detection_reviews(cur, night_id, saved_reviews)
 
             # --- drop objects this reload (or a prior one) left with no star_night, except
-            # those a person has touched: any manual flag or period, a status, or notes ---
+            # those a person has touched: any manual flag or period, a status, notes, a
+            # detection of their own (origin 'user') or a reprocess request ---
             cur.execute(
                 """
                 DELETE FROM relphot.object o
@@ -797,6 +814,16 @@ def load_night(
                     AND o.notes IS NULL
                     AND NOT EXISTS (
                         SELECT 1 FROM relphot.star_night sn WHERE sn.obj_id = o.obj_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM relphot.detection d
+                        WHERE d.obj_id = o.obj_id AND d.origin = 'user'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM relphot.reprocess_request r WHERE r.obj_id = o.obj_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM relphot.user_night_review r WHERE r.obj_id = o.obj_id
                     )
                 """
             )

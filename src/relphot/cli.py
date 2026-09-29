@@ -28,6 +28,7 @@ from relphot.catalogs import (
 from relphot.comparison import select_comparison_stars
 from relphot.config import Settings, load_settings
 from relphot.cotrend import compute_cbvs, detect_systematic_frames, select_star_epochs
+from relphot.eligibility import star_eligibility
 from relphot.exceptions import ComparisonError, RelphotError
 from relphot.ingest import read_catalogs
 from relphot.io import (
@@ -251,7 +252,10 @@ def _run_reference(args: argparse.Namespace) -> int:
     t1 = time.monotonic()
     logger.info("variables: %.2f s (%d flagged)", t1 - t0, int(variable_mask.sum()))
 
-    candidates = select_candidates(night, variable_mask, settings, aper)
+    eligibility = star_eligibility(night, settings)
+    candidates = select_candidates(
+        night, variable_mask, settings, aper, star_eligible=eligibility.eligible
+    )
 
     try:
         tilemap = build_tilemap(night, candidates, settings)
@@ -292,6 +296,10 @@ def _run_reference(args: argparse.Namespace) -> int:
     print(f"stars: {night.n_stars}, tiles: {tilemap.n_tiles}, aperture: {aper}")
     print(f"candidates: {int(candidates.sum())}")
     print(f"frames kept: {n_kept}/{n_total}")
+    n_border_ineligible = int((~eligibility.border.eligible).sum())
+    print(f"border-ineligible stars: {n_border_ineligible}")
+    print(f"tailed stars (excluded from reference and comparison): "
+          f"{int(eligibility.tails.tailed.sum())}")
     print(f"wrote {out_path}")
     print(f"wrote {tiles_csv}")
     print(f"wrote {reference_csv}")
@@ -366,6 +374,12 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
             lightcurve=replace(settings.lightcurve, make_plot=False),
         )
 
+    if getattr(args, "inflate_errors", None):
+        settings = replace(
+            settings,
+            lightcurve=replace(settings.lightcurve, inflate_errors=args.inflate_errors),
+        )
+
     t0 = time.monotonic()
 
     # Variable mask
@@ -377,10 +391,14 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
     t1 = time.monotonic()
     logger.info("variables: %.2f s (%d flagged)", t1 - t0, int(variable_mask.sum()))
 
+    # Border and tail eligibility (the same night-level mask _run_reference applied)
+    eligibility = star_eligibility(night, settings)
+
     # Comparison stars
     try:
         comparison_result = select_comparison_stars(
-            night, tilemap, reference_result, variable_mask, settings
+            night, tilemap, reference_result, variable_mask, settings,
+            star_eligible=eligibility.eligible,
         )
     except ComparisonError:
         logger.exception("comparison star selection failed")
@@ -389,12 +407,20 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
     logger.info("comparison: %.2f s", t2 - t1)
 
     # Light curves
-    lc_result = compute_light_curves(night, tilemap, reference_result, comparison_result, settings)
+    try:
+        lc_result = compute_light_curves(
+            night, tilemap, reference_result, comparison_result, settings
+        )
+    except RelphotError:
+        logger.exception("light curve extraction failed")
+        return 1
     t3 = time.monotonic()
     logger.info("light curves: %.2f s", t3 - t2)
 
     # Star statistics
-    star_stats = compute_star_stats(lc_result)
+    star_stats = compute_star_stats(
+        lc_result, near_edge=~eligibility.border.eligible, tailed=eligibility.tails.tailed
+    )
     t4 = time.monotonic()
     logger.info("star stats: %.2f s", t4 - t3)
 
@@ -529,6 +555,14 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
     print(f"comparison count range: {int(n_comp_min)}-{int(n_comp_max)}")
     print(f"best aperture histogram: {best_hist}")
     print(f"bright-star floor: {bright_floor_str}")
+    if lc_result.err_scale is not None:
+        scaled = lc_result.err_scale[np.arange(night.n_stars), np.maximum(star_best_aper, 0)]
+        scaled = scaled[(star_best_aper >= 0) & (scaled > 1.0)]
+        print(
+            f"error inflation ({settings.lightcurve.inflate_errors}): {scaled.size} stars scaled"
+            + (f", median factor {float(np.median(scaled)):.2f}" if scaled.size else "")
+            + f", {int(lc_result.blended.sum())} blended"
+        )
     print(f"wrote {out_path}")
     print(f"wrote {lc_table_path}")
     print(f"wrote {starstats_path}")
@@ -1386,6 +1420,58 @@ def _run_db_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_db_reprocess(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect, reprocess
+        from relphot.db.connect import resolve_dsn
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    import signal
+    import threading
+
+    import psycopg
+
+    stop = threading.Event()
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, lambda _signum, _frame: stop.set())
+
+    try:
+        conn = connect(args.dsn)
+        listen_conn = (
+            psycopg.connect(resolve_dsn(args.dsn), autocommit=True) if args.watch else None
+        )
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    try:
+        report = reprocess(
+            conn, settings=settings, watch=args.watch, listen_conn=listen_conn,
+            poll_seconds=args.poll_seconds, stop=stop,
+        )
+    finally:
+        conn.close()
+        if listen_conn is not None:
+            listen_conn.close()
+
+    print(
+        f"requests done={report.n_done} failed={report.n_failed} elapsed={report.elapsed_s:.1f}s"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="relphot")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1459,6 +1545,14 @@ def build_parser() -> argparse.ArgumentParser:
     lightcurves.add_argument(
         "--no-decorrelation", action="store_true",
         help="disable decorrelation (output lc = lc_raw)",
+    )
+    lightcurves.add_argument(
+        "--inflate-errors", choices=["none", "blended", "excess", "all"], default=None,
+        help=(
+            "multiply lc_err by the measured point-to-point excess scatter for: no star, "
+            "blended stars, blended stars and any star with a significant excess, or every "
+            "star (default: the [lightcurve] inflate_errors setting, 'excess')"
+        ),
     )
     lightcurves.set_defaults(func=_run_lightcurves)
 
@@ -1607,6 +1701,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="TOML settings file (settings.db drives the period grids and thresholds)",
     )
     db_analyze.set_defaults(func=_run_db_analyze)
+
+    db_reprocess = db_subparsers.add_parser(
+        "reprocess",
+        help="work off the web's user-guided reprocess requests (period / transit guesses)",
+    )
+    mode = db_reprocess.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--once", action="store_true",
+        help="work off the queued requests and exit (the default)",
+    )
+    mode.add_argument(
+        "--watch", action="store_true",
+        help=(
+            "keep running: wait for new requests (LISTEN relphot_reprocess, with a "
+            "--poll-seconds fallback) until SIGTERM / SIGINT"
+        ),
+    )
+    db_reprocess.add_argument(
+        "--poll-seconds", type=float, default=60.0,
+        help="--watch: poll the queue at least this often, in seconds (default: 60)",
+    )
+    db_reprocess.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_reprocess.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.db drives the period grids and windows)",
+    )
+    db_reprocess.set_defaults(func=_run_db_reprocess)
 
     db_load_multinight = db_subparsers.add_parser(
         "load-multinight",

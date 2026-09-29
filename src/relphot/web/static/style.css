@@ -8,6 +8,10 @@ body {
     line-height: 1.4;
 }
 
+[hidden] {
+    display: none !important;
+}
+
 .app-header {
     padding: 1rem 0;
     border-bottom: 1px solid #ddd;
@@ -191,6 +195,33 @@ tbody tr:nth-child(even) {
     margin-top: 0.4rem;
 }
 
+.warn {
+    color: #b00020;
+    font-weight: bold;
+}
+
+.rerun-entry label, #rerun-toggle {
+    display: inline-flex;
+    gap: 0.3rem;
+    align-items: center;
+}
+
+.rerun-entry {
+    border: 1px solid #ccc;
+    padding: 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+}
+
+.rerun-entry.active {
+    border-color: #06c;
+}
+
+#phase-aliases {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+
 input,
 select,
 textarea {
@@ -205,4 +236,18 @@ input:focus,
 select:focus,
 textarea:focus {
     border-color: #007bff;
+}
+
+/* a night with an automatic event still awaiting the person's verdict */
+tbody tr.needs-review {
+    background: #fff4d6;
+}
+
+tbody tr.needs-review:hover {
+    background: #ffecb3;
+}
+
+#detail-night-reviews input[type="text"] {
+    width: 16rem;
+    max-width: 100%;
 }

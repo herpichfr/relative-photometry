@@ -31,8 +31,14 @@ For each object needing analysis, :func:`analyze` deletes its existing
   the catalogued period is still compared with it; an object with a literature
   period gets a row even when it cannot be verified, with a ``verify_status``
   (``verified``, ``no_literature``, ``lit_period_outside_grid``,
-  ``no_peak_in_window``, ``insufficient_data``) and a ``verify_note`` saying why.
-  No free trend is fitted to a star's own light curve.
+  ``no_peak_in_window``, ``insufficient_data``, ``long_period_needs_tie``) and a
+  ``verify_note`` saying why. No free trend is fitted to a star's own light curve.
+  A period longer than ``db.long_period_days`` is analysed on tie-calibrated magnitudes
+  with no per-night offsets (both per-night normalisation and free offsets would absorb
+  it) and needs a tie covering >= 2 nights; every row also stores the phase coverage,
+  the cycles spanned and, for >= 2 nights, the alias / next-peak candidate periods.
+  The same code makes the user-guided ``'LS-guided'`` estimates of
+  :mod:`relphot.db.reprocess`.
 
 Every periodogram's frequency grid is uniform (``f_k = fmin + k*df``,
 cycles/day); a grid that would exceed ``max_periodogram_points`` has its
@@ -401,6 +407,59 @@ def _concat_night_normalised_flux(
     return t_all, y_all, dy_all, span, n_all
 
 
+def _tied_series(
+    task: _ObjTask, tie: dict[int, tuple[float, float]]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, float, np.ndarray] | None:
+    """Tie-calibrated magnitudes of every night ``tie`` (night_id -> (mag, mag_err)) covers.
+
+    Each night's flux is normalised to its own median and placed on the night's tied
+    magnitude, so the night-to-night differences the tie measured are kept; the error of an
+    epoch adds the night's tie error to its photometric error. The last element of the
+    result is each point's ``night_id``. ``None`` when fewer than ``_MIN_NIGHT_POINTS``
+    points, or no time span, remain.
+    """
+    ts: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    dys: list[np.ndarray] = []
+    ns: list[np.ndarray] = []
+    for nd in task.nights:
+        tie_entry = tie.get(nd.night_id)
+        if tie_entry is None or tie_entry[0] is None:
+            continue
+        mag_night, mag_err_night = tie_entry
+        got = _good_night_flux(nd)
+        if got is None:
+            continue
+        tt, yy, _ = got
+        # the fractional flux error, from the same "good" epochs _good_night_flux used
+        t_raw, f_raw, e_raw = nd.bjd, nd.flux, nd.flux_err
+        good = (
+            np.isfinite(t_raw) & np.isfinite(f_raw) & np.isfinite(e_raw)
+            & (e_raw > 0) & (f_raw > 0)
+        )
+        frac_err = e_raw[good] / f_raw[good]
+        mag_epoch = mag_night - 2.5 * np.log10(yy)
+        mag_err_epoch = np.hypot(float(mag_err_night or 0.0), _MAG_PER_LN10 * frac_err)
+        ts.append(tt)
+        ys.append(mag_epoch)
+        dys.append(mag_err_epoch)
+        ns.append(np.full(tt.size, nd.night_id, dtype=np.int64))
+    if not ts:
+        return None
+    t_all = np.concatenate(ts)
+    y_all = np.concatenate(ys)
+    dy_all = np.concatenate(dys)
+    n_all = np.concatenate(ns)
+    order = np.argsort(t_all)
+    t_all, y_all, dy_all, n_all = t_all[order], y_all[order], dy_all[order], n_all[order]
+    if t_all.size < _MIN_NIGHT_POINTS:
+        return None
+    span = float(t_all.max() - t_all.min())
+    if span <= 0:
+        return None
+    return t_all, y_all, dy_all, "tied-mag", span, n_all
+
+
 def _combined_series(
     task: _ObjTask,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, float, np.ndarray] | None:
@@ -409,49 +468,33 @@ def _combined_series(
     The last element is each point's ``night_id``.
     """
     if task.tie is not None:
-        ts: list[np.ndarray] = []
-        ys: list[np.ndarray] = []
-        dys: list[np.ndarray] = []
-        ns: list[np.ndarray] = []
-        for nd in task.nights:
-            tie_entry = task.tie.get(nd.night_id)
-            if tie_entry is None:
-                continue
-            mag_night, mag_err_night = tie_entry
-            got = _good_night_flux(nd)
-            if got is None:
-                continue
-            tt, yy, _ = got
-            # the fractional flux error, from the same "good" epochs _good_night_flux used
-            t_raw, f_raw, e_raw = nd.bjd, nd.flux, nd.flux_err
-            good = (
-                np.isfinite(t_raw) & np.isfinite(f_raw) & np.isfinite(e_raw)
-                & (e_raw > 0) & (f_raw > 0)
-            )
-            frac_err = e_raw[good] / f_raw[good]
-            mag_epoch = mag_night - 2.5 * np.log10(yy)
-            mag_err_epoch = np.hypot(float(mag_err_night), _MAG_PER_LN10 * frac_err)
-            ts.append(tt)
-            ys.append(mag_epoch)
-            dys.append(mag_err_epoch)
-            ns.append(np.full(tt.size, nd.night_id, dtype=np.int64))
-        if ts:
-            t_all = np.concatenate(ts)
-            y_all = np.concatenate(ys)
-            dy_all = np.concatenate(dys)
-            n_all = np.concatenate(ns)
-            order = np.argsort(t_all)
-            t_all, y_all, dy_all, n_all = t_all[order], y_all[order], dy_all[order], n_all[order]
-            if t_all.size >= _MIN_NIGHT_POINTS:
-                span = float(t_all.max() - t_all.min())
-                if span > 0:
-                    return t_all, y_all, dy_all, "tied-mag", span, n_all
+        tied = _tied_series(task, task.tie)
+        if tied is not None:
+            return tied
 
     fallback = _concat_night_normalised_flux(task)
     if fallback is None:
         return None
     t_all, y_all, dy_all, span, n_all = fallback
     return t_all, y_all, dy_all, "night-normalised", span, n_all
+
+
+def _estimate_series(
+    task: _ObjTask,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, float, np.ndarray] | None:
+    """The period-estimate input: tie-calibrated magnitudes when a tie covers >= 2 nights.
+
+    A tie that covers at least two of the object's nights defines the data (only the nights
+    it covers can be calibrated); tied magnitudes keep the night-to-night changes that a
+    period longer than a night lives in. Otherwise the per-night-normalised flux of every
+    night (:func:`_combined_series`), which cannot carry such a period.
+    """
+    covered = [nd for nd in task.nights if nd.night_id in task.night_ties]
+    if len(covered) >= 2:
+        tied = _tied_series(task, task.night_ties)
+        if tied is not None:
+            return tied
+    return _combined_series(task)
 
 
 def _ls_periodogram(
@@ -881,8 +924,120 @@ def _transit_shapes(task: _ObjTask) -> list[dict]:
     return shapes
 
 
+_SHAPE_INSERT_SQL = """
+    INSERT INTO relphot.transit_shape
+        (det_id, obj_id, tc, tc_err, depth, depth_err, t14_h, t14_err,
+         t14_lower_limit, incomplete_reason, ingress_frac, ingress_err,
+         chi2_red, n_points, input, converged, computed_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+"""
+
+_MATCH_INSERT_SQL = """
+    INSERT INTO relphot.transit_match
+        (det_a, det_b, obj_id, dt_days, depth_z, t14_z, ingress_z, chi2,
+         dof, p_match, same_telescope, commensurate_periods, computed_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+"""
+
+_ESTIMATE_INSERT_SQL = """
+    INSERT INTO relphot.period_estimate
+        (obj_id, method, input, night_ids, n_nights, last_night,
+         baseline_days, period, period_err, power, fap, lit_period,
+         lit_period_err, lit_catalog, harmonic, delta, delta_err,
+         delta_z, verify_status, verify_note, guess, phase_coverage, n_cycles,
+         alias_periods, alias_powers, computed_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+    ON CONFLICT (obj_id, method, night_ids) DO UPDATE SET
+        computed_at = now(), input = EXCLUDED.input,
+        n_nights = EXCLUDED.n_nights, last_night = EXCLUDED.last_night,
+        baseline_days = EXCLUDED.baseline_days,
+        period = EXCLUDED.period, period_err = EXCLUDED.period_err,
+        power = EXCLUDED.power, fap = EXCLUDED.fap,
+        lit_period = EXCLUDED.lit_period,
+        lit_period_err = EXCLUDED.lit_period_err,
+        lit_catalog = EXCLUDED.lit_catalog,
+        harmonic = EXCLUDED.harmonic, delta = EXCLUDED.delta,
+        delta_err = EXCLUDED.delta_err, delta_z = EXCLUDED.delta_z,
+        verify_status = EXCLUDED.verify_status,
+        verify_note = EXCLUDED.verify_note, guess = EXCLUDED.guess,
+        phase_coverage = EXCLUDED.phase_coverage, n_cycles = EXCLUDED.n_cycles,
+        alias_periods = EXCLUDED.alias_periods, alias_powers = EXCLUDED.alias_powers
+    RETURNING est_id
+"""
+
+
+def _shape_values(obj_id: int, sh: dict) -> tuple:
+    """The :data:`_SHAPE_INSERT_SQL` parameters of one :func:`_fit_transit_shape` result."""
+    return (
+        sh["det_id"], obj_id, sh["tc"], sh["tc_err"], sh["depth"], sh["depth_err"],
+        sh["t14_h"], sh["t14_err"], sh["t14_lower_limit"], sh["incomplete_reason"],
+        sh["ingress_frac"], sh["ingress_err"], sh["chi2_red"], sh["n_points"], sh["input"],
+        sh["converged"],
+    )
+
+
+def _match_values(obj_id: int, m: dict) -> tuple:
+    """The :data:`_MATCH_INSERT_SQL` parameters of one :func:`_match_pairs` row."""
+    return (
+        m["det_a"], m["det_b"], obj_id, m["dt_days"], m["depth_z"], m["t14_z"],
+        m["ingress_z"], m["chi2"], m["dof"], m["p_match"], m["same_telescope"],
+        m["commensurate_periods"],
+    )
+
+
+def _estimate_values(obj_id: int, est: dict) -> tuple:
+    """The :data:`_ESTIMATE_INSERT_SQL` parameters of one :func:`_period_estimate` row."""
+    return (
+        obj_id, est["method"], est["input"], est["night_ids"], est["n_nights"],
+        est["last_night"], est["baseline_days"], est["period"], est["period_err"],
+        est["power"], est["fap"], est["lit_period"], est["lit_period_err"],
+        est["lit_catalog"], est["harmonic"], est["delta"], est["delta_err"],
+        est["delta_z"], est["verify_status"], est["verify_note"], est["guess"],
+        est["phase_coverage"], est["n_cycles"], est["alias_periods"], est["alias_powers"],
+    )
+
+
+def recompute_matches(conn: psycopg.Connection, obj_id: int, settings: DbSettings) -> int:
+    """Rebuild one object's ``relphot.transit_match`` rows from its stored transit shapes.
+
+    Used after a shape was added outside :func:`analyze` (a user's reprocess request): the
+    pairs of every converged stored shape are compared exactly as :func:`analyze` does, and
+    the object's earlier match rows are replaced. Does not commit. Returns the number of pairs.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ts.det_id, ts.tc, ts.depth, ts.depth_err, ts.t14_h, ts.t14_err,
+                   ts.t14_lower_limit, ts.ingress_frac, ts.ingress_err, ts.converged, n.telescope
+            FROM relphot.transit_shape ts
+            JOIN relphot.detection d ON d.det_id = ts.det_id
+            LEFT JOIN relphot.night n ON n.night_id = d.night_id
+            WHERE ts.obj_id = %s
+            """,
+            (obj_id,),
+        )
+        shapes = []
+        telescope_of: dict[int, str | None] = {}
+        for (
+            det_id, tc, depth, depth_err, t14_h, t14_err, t14_low, ing, ing_err, converged, tele,
+        ) in cur.fetchall():
+            shapes.append({
+                "det_id": det_id, "tc": tc, "depth": depth, "depth_err": depth_err,
+                "t14_h": t14_h, "t14_err": t14_err, "t14_lower_limit": bool(t14_low),
+                "ingress_frac": ing, "ingress_err": ing_err, "converged": bool(converged),
+            })
+            telescope_of[det_id] = tele
+        matches = _match_pairs(shapes, telescope_of, settings)
+        cur.execute("DELETE FROM relphot.transit_match WHERE obj_id = %s", (obj_id,))
+        if matches:
+            cur.executemany(_MATCH_INSERT_SQL, [_match_values(obj_id, m) for m in matches])
+    return len(matches)
+
+
 def _refine_fourier(
-    t: np.ndarray, y: np.ndarray, dy: np.ndarray, night_idx: np.ndarray, f0: float, span: float
+    t: np.ndarray, y: np.ndarray, dy: np.ndarray, night_idx: np.ndarray, f0: float, span: float,
+    *, per_night_offsets: bool = True,
 ) -> tuple[float, float] | None:
     """Refine frequency ``f0`` with a 2-harmonic Fourier series + one offset per night.
 
@@ -890,18 +1045,26 @@ def _refine_fourier(
     ``f`` bounded to ``f0 +/- 0.5/span``. Returns ``(f, sigma_f)``, ``sigma_f``
     from ``(J^T J)^-1`` scaled by ``max(1, sqrt(chi2_red))``; ``None`` when the
     fit is under-determined or fails.
+
+    With ``per_night_offsets=False`` a single offset is fitted instead of one per night. A
+    free offset per night absorbs any variability slower than a night, so this is what a
+    period longer than a night needs (on tie-calibrated magnitudes: the tie's own zero
+    points and their errors are already in ``dy``).
     """
     from scipy.optimize import least_squares
 
-    _, inv = np.unique(night_idx, return_inverse=True)
-    n_nights = int(inv.max()) + 1
+    if per_night_offsets:
+        _, inv = np.unique(night_idx, return_inverse=True)
+    else:
+        inv = np.zeros(t.size, dtype=np.int64)
+    n_offsets = int(inv.max()) + 1
     n = t.size
-    n_par = 5 + n_nights
+    n_par = 5 + n_offsets
     if n - n_par < 1:
         return None
     tt = t - float(np.mean(t))
     w = 1.0 / dy
-    offsets = np.zeros((n, n_nights))
+    offsets = np.zeros((n, n_offsets))
     offsets[np.arange(n), inv] = 1.0
 
     def design(f: float) -> np.ndarray:
@@ -947,10 +1110,12 @@ _NO_LITERATURE = "no_literature"
 _OUTSIDE_GRID = "lit_period_outside_grid"
 _NO_PEAK = "no_peak_in_window"
 _INSUFFICIENT = "insufficient_data"
+_LONG_NEEDS_TIE = "long_period_needs_tie"
 
 
 def _verification_windows(
-    freq: np.ndarray, power: np.ndarray, lit: float, window_frac: float
+    freq: np.ndarray, power: np.ndarray, lit: float, window_frac: float,
+    long_period_days: float = math.inf,
 ) -> tuple[tuple[float, int, float] | None, str, str | None]:
     """Best LS peak among the literature-period windows ``lit * h * (1 +/- window_frac)``.
 
@@ -959,6 +1124,9 @@ def _verification_windows(
     or ``None``. ``status`` is ``'verified'`` with a best peak, ``'lit_period_outside_grid'``
     when no window overlaps the LS frequency grid (the note says how the literature
     period compares with the grid's period range), else ``'no_peak_in_window'``.
+    For a window centred on a period longer than ``long_period_days`` the peak must also be
+    interior to the frequency grid: a maximum on its very first or last point is the grid's
+    edge, not a resolved peak.
     """
     best: tuple[float, int, float] | None = None
     any_in_grid = False
@@ -973,6 +1141,8 @@ def _verification_windows(
         idx = np.flatnonzero(in_window)
         kk = int(idx[np.nanargmax(power[idx])]) if np.any(np.isfinite(power[idx])) else -1
         if kk < 0 or not np.isfinite(power[kk]):
+            continue
+        if centre > long_period_days and (kk == 0 or kk == power.size - 1):
             continue
         left = power[kk - 1] if kk > 0 else -np.inf
         right = power[kk + 1] if kk + 1 < power.size else -np.inf
@@ -995,7 +1165,89 @@ def _verification_windows(
     )
 
 
-def _period_estimate(task: _ObjTask) -> dict | None:
+def _delta_vs_lit(
+    period: float, period_err: float | None, harmonic: float, lit: float, lit_err: float | None
+) -> tuple[float, float | None, float | None]:
+    """``(delta, delta_err, delta_z)`` with ``delta = period / harmonic - lit``."""
+    delta = period / harmonic - lit
+    delta_err = delta_z = None
+    if period_err is not None:
+        delta_err = math.hypot(period_err / harmonic, lit_err or 0.0)
+        if delta_err > 0:
+            delta_z = delta / delta_err
+    return delta, delta_err, delta_z
+
+
+def _phase_stats(t: np.ndarray, period: float, n_bins: int) -> tuple[float, float]:
+    """``(phase_coverage, n_cycles)`` of the epochs ``t`` folded at ``period``.
+
+    ``phase_coverage`` is the fraction of ``n_bins`` equal phase bins holding at least one
+    point; ``n_cycles`` is the baseline in periods (``(t.max() - t.min()) / period``).
+    """
+    phase = ((t - float(t.min())) / period) % 1.0
+    bins = np.minimum((phase * n_bins).astype(np.int64), n_bins - 1)
+    coverage = float(np.unique(bins).size) / n_bins
+    return coverage, float(t.max() - t.min()) / period
+
+
+def _alias_candidates(
+    ls, freq: np.ndarray, power: np.ndarray, k: int, span: float, s: DbSettings
+) -> tuple[list[float], list[float | None]]:
+    """Alias and next-peak candidate periods for the peak at ``freq[k]``, with LS powers.
+
+    The one-day aliases ``|f0 +/- 1 d^-1|`` of a multi-night baseline are always listed (even
+    when the baseline is too short to resolve them from the peak); the two-day aliases
+    ``|f0 +/- 2|`` and the next-highest local LS maxima (at least ``1/span`` from every period
+    already listed) fill up to ``s.max_alias_candidates``, in order of power. Returned in
+    decreasing power.
+    """
+    f0 = float(freq[k])
+    f_lo, f_hi = float(freq[0]), float(freq[-1])
+    width = 1.0 / span
+    listed: list[float] = [f0]
+
+    def new(f: float, min_sep: float) -> bool:
+        return f_lo <= f <= f_hi and all(abs(f - g) > min_sep for g in listed)
+
+    mandatory: list[float] = []
+    for sign in (1.0, -1.0):
+        f = abs(f0 + sign)
+        if new(f, 1e-9):
+            mandatory.append(f)
+            listed.append(f)
+    optional: list[float] = []
+    for sign in (1.0, -1.0):
+        f = abs(f0 + 2.0 * sign)
+        if new(f, 1e-9):
+            optional.append(f)
+            listed.append(f)
+
+    interior = (power[1:-1] > power[:-2]) & (power[1:-1] >= power[2:]) & np.isfinite(power[1:-1])
+    peak_idx = np.flatnonzero(interior) + 1
+    peak_freqs: list[float] = []
+    room = s.max_alias_candidates - len(mandatory)
+    for kk in peak_idx[np.argsort(power[peak_idx])[::-1]][: max(room, 0) + 200]:
+        if len(peak_freqs) >= max(room, 0):
+            break
+        f = float(freq[kk])
+        if new(f, width):
+            peak_freqs.append(f)
+            listed.append(f)
+
+    cand = np.asarray([*mandatory, *optional, *peak_freqs], dtype=np.float64)
+    if cand.size == 0:
+        return [], []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        cand_power = np.asarray(ls.power(cand), dtype=np.float64)
+    order = list(range(len(mandatory)))
+    rest = np.argsort(-np.nan_to_num(cand_power[len(mandatory):], nan=-1.0)) + len(mandatory)
+    order += [int(i) for i in rest[: max(room, 0)]]
+    order.sort(key=lambda i: -np.nan_to_num(cand_power[i], nan=-1.0))
+    return [float(1.0 / cand[i]) for i in order], [_real_safe(cand_power[i]) for i in order]
+
+
+def _period_estimate(task: _ObjTask, guess: float | None = None) -> dict | None:
     """Combined-LS period of a variable, refined, and verified against its literature period.
 
     Runs for a variable (``is_var``) or an object with a literature variable
@@ -1006,15 +1258,34 @@ def _period_estimate(task: _ObjTask) -> dict | None:
     for every set of nights even when it cannot be verified; ``verify_status`` says
     which case (``verified``, ``no_literature`` for a variable without a literature
     period, ``lit_period_outside_grid``, ``no_peak_in_window``, ``insufficient_data``
-    when there is too little data for any LS) and ``verify_note`` why. Without
-    a verified peak the period is the global LS peak and harmonic/delta are NULL.
+    when there is too little data for any LS, ``long_period_needs_tie``) and ``verify_note``
+    why. Without a verified peak the period is the global LS peak and harmonic/delta are NULL.
+
+    Long periods (the chosen peak beyond ``db.long_period_days``): a free offset per night, and
+    per-night-normalised flux, both absorb variability slower than a night. So the data are
+    tie-calibrated magnitudes (:func:`_estimate_series`) and the Fourier refinement has a single
+    offset (the tie's own zero points and errors are in the error budget). Without a tie that
+    covers >= 2 of the nights the row is stored with ``verify_status = 'long_period_needs_tie'``,
+    no period error and no verification. The note also says when the baseline covers fewer than
+    two cycles (the period is then only bounded from below, not measured).
+
+    Every row carries ``phase_coverage`` (fraction of ``db.phase_coverage_bins`` phase bins with
+    a point), ``n_cycles`` (baseline / period) and, for two or more nights, the alias and
+    next-peak candidate periods with their LS powers.
+
+    ``guess`` makes this a user-guided estimate (``method = 'LS-guided'``, ``guess`` stored): the
+    peak is the highest one in the windows ``guess * h * (1 +/- db.guided_period_window_frac)``
+    for h in (0.5, 1, 2) (no such peak: ``no_peak_in_window`` and no period), and the refined
+    period is then checked against the literature period as usual.
     """
     s = task.settings
     lit = task.lit_period
     if lit is not None and not (math.isfinite(lit) and lit > 0):
         lit = None
-    if not (task.is_var or lit is not None):
+    guided = guess is not None and math.isfinite(guess) and guess > 0
+    if not (guided or task.is_var or lit is not None):
         return None
+    lit_err = task.lit_period_err if lit is not None else None
 
     date_of = {nd.night_id: nd.night_date for nd in task.nights}
 
@@ -1023,24 +1294,27 @@ def _period_estimate(task: _ObjTask) -> dict | None:
         note: str | None, **fit: object,
     ) -> dict:
         out = {
-            "method": "LS", "input": input_label, "night_ids": night_ids,
-            "n_nights": len(night_ids), "last_night": max(date_of[n] for n in night_ids),
+            "method": "LS-guided" if guided else "LS", "input": input_label,
+            "night_ids": night_ids, "n_nights": len(night_ids),
+            "last_night": max(date_of[n] for n in night_ids),
             "baseline_days": span, "period": None, "period_err": None, "power": None,
-            "fap": None, "lit_period": lit,
-            "lit_period_err": task.lit_period_err if lit is not None else None,
+            "fap": None, "lit_period": lit, "lit_period_err": lit_err,
             "lit_catalog": task.lit_catalog if lit is not None else None,
             "harmonic": None, "delta": None, "delta_err": None, "delta_z": None,
             "verify_status": status, "verify_note": note,
+            "guess": float(guess) if guided else None,
+            "phase_coverage": None, "n_cycles": None, "alias_periods": None,
+            "alias_powers": None,
         }
         out.update(fit)
         return out
 
-    series = _combined_series(task)
+    series = _estimate_series(task)
     grid = None
     if series is not None:
         grid = _ls_periodogram(series[0], series[1], series[2], series[4], s)
     if series is None or grid is None or not np.any(np.isfinite(grid[2])):
-        if lit is None:
+        if lit is None and not guided:
             return None
         usable = [nd for nd in task.nights if _good_night_flux(nd) is not None]
         if not usable:
@@ -1053,41 +1327,93 @@ def _period_estimate(task: _ObjTask) -> dict | None:
         )
     t, y, dy, label, span, night_idx = series
     ls, freq, power, _df, _coarsened = grid
-    input_label = "tied" if label == "tied-mag" else "night"
+    tied = label == "tied-mag"
+    input_label = "tied" if tied else "night"
     night_ids = sorted(int(n) for n in np.unique(night_idx))
 
     k = int(np.nanargmax(power))
     harmonic: float | None = None
-    if lit is None:
-        status, note = _NO_LITERATURE, None
-    else:
-        best, status, note = _verification_windows(freq, power, lit, s.lit_period_window_frac)
+    status, note = _NO_LITERATURE, None
+    if guided:
+        best, status, note = _verification_windows(
+            freq, power, float(guess), s.guided_period_window_frac, s.long_period_days
+        )
+        if best is None:
+            return row(night_ids, float(span), input_label, status, note)
+        k = best[1]
+    elif lit is not None:
+        best, status, note = _verification_windows(
+            freq, power, lit, s.lit_period_window_frac, s.long_period_days
+        )
         if best is not None:
             k, harmonic = best[1], best[2]
 
     peak_power = float(power[k])
-    fap = _ls_fap(ls, peak_power, freq, s)
     period = float(1.0 / freq[k])
+    long_period = period > s.long_period_days
+
+    extra: dict = {}
+    if len(night_ids) >= 2:
+        extra["alias_periods"], extra["alias_powers"] = _alias_candidates(
+            ls, freq, power, k, float(span), s
+        )
+    if long_period and not tied:
+        cover, n_cycles = _phase_stats(t, period, s.phase_coverage_bins)
+        return row(
+            night_ids, float(span), input_label, _LONG_NEEDS_TIE,
+            (
+                f"long period needs a multi-night tie: P = {period:.4g} d > "
+                f"{s.long_period_days:g} d cannot be measured on per-night-normalised flux "
+                "(no tie covers >= 2 of the nights)"
+            ),
+            period=period, power=_real_safe(peak_power), phase_coverage=cover,
+            n_cycles=_real_safe(n_cycles), **extra,
+        )
+
+    fap = _ls_fap(ls, peak_power, freq, s)
     period_err: float | None = None
-    refined = _refine_fourier(t, y, dy, night_idx, float(freq[k]), span)
+    refined = _refine_fourier(
+        t, y, dy, night_idx, float(freq[k]), span, per_night_offsets=not long_period
+    )
     if refined is not None:
         f_fit, f_err = refined
         period = 1.0 / f_fit
         period_err = f_err / f_fit**2
+    cover, n_cycles = _phase_stats(t, period, s.phase_coverage_bins)
 
+    notes: list[str] = []
     delta = delta_err = delta_z = None
+    if guided and lit is not None:
+        ratios = np.asarray(_HARMONICS)
+        rel = np.abs(period / ratios - lit) / lit
+        i = int(np.argmin(rel))
+        if rel[i] <= s.lit_period_window_frac:
+            harmonic = float(ratios[i])
+            status = _VERIFIED
+        else:
+            pct = s.lit_period_window_frac * 100.0
+            status = _NO_PEAK
+            notes.append(
+                f"period {period:.6g} d is not within +/-{pct:g}% of P_lit {lit:g} d x 0.5, 1 or 2"
+            )
+    elif guided:
+        status = _NO_LITERATURE
+    elif note:
+        notes.append(note)
     if lit is not None and harmonic is not None:
-        delta = period / harmonic - lit
-        if period_err is not None:
-            delta_err = math.hypot(period_err / harmonic, task.lit_period_err or 0.0)
-            if delta_err > 0:
-                delta_z = delta / delta_err
+        delta, delta_err, delta_z = _delta_vs_lit(period, period_err, harmonic, lit, lit_err)
+    if long_period and n_cycles < 2.0:
+        notes.append(
+            f"baseline covers {n_cycles:.2f} cycles (< 2): period unconstrained beyond the "
+            "lower bound"
+        )
 
     return row(
-        night_ids, float(span), input_label, status, note,
+        night_ids, float(span), input_label, status, "; ".join(notes) if notes else None,
         period=period, period_err=period_err, power=_real_safe(peak_power),
         fap=_real_safe(fap), harmonic=harmonic, delta=delta, delta_err=delta_err,
         delta_z=_real_safe(delta_z) if delta_z is not None else None,
+        phase_coverage=cover, n_cycles=_real_safe(n_cycles), **extra,
     )
 
 
@@ -1214,37 +1540,14 @@ def analyze(
                     estimate_rows = []
                     lower_limit_rows: list[tuple[bool, int]] = []
                     for obj_id, result in zip(tasks.keys(), results, strict=True):
-                        shape_rows.extend(
-                            (
-                                sh["det_id"], obj_id, sh["tc"], sh["tc_err"], sh["depth"],
-                                sh["depth_err"], sh["t14_h"], sh["t14_err"],
-                                sh["t14_lower_limit"], sh["incomplete_reason"],
-                                sh["ingress_frac"], sh["ingress_err"], sh["chi2_red"],
-                                sh["n_points"], sh["input"], sh["converged"],
-                            )
-                            for sh in result.shapes
-                        )
+                        shape_rows.extend(_shape_values(obj_id, sh) for sh in result.shapes)
                         lower_limit_rows.extend(
                             (bool(sh["t14_lower_limit"]), sh["det_id"]) for sh in result.shapes
                         )
-                        match_rows.extend(
-                            (
-                                m["det_a"], m["det_b"], obj_id, m["dt_days"], m["depth_z"],
-                                m["t14_z"], m["ingress_z"], m["chi2"], m["dof"], m["p_match"],
-                                m["same_telescope"], m["commensurate_periods"],
-                            )
-                            for m in result.matches
-                        )
+                        match_rows.extend(_match_values(obj_id, m) for m in result.matches)
                         est = result.estimate
                         if est is not None:
-                            estimate_rows.append((
-                                obj_id, est["method"], est["input"], est["night_ids"],
-                                est["n_nights"], est["last_night"], est["baseline_days"],
-                                est["period"], est["period_err"], est["power"], est["fap"],
-                                est["lit_period"], est["lit_period_err"], est["lit_catalog"],
-                                est["harmonic"], est["delta"], est["delta_err"],
-                                est["delta_z"], est["verify_status"], est["verify_note"],
-                            ))
+                            estimate_rows.append(_estimate_values(obj_id, est))
                         for (
                             method, scope, fmin, df, n, power, peak_period, peak_power,
                             fap, coarsened, input_label, extra,
@@ -1273,17 +1576,7 @@ def analyze(
                             insert_rows,
                         )
                     if shape_rows:
-                        cur.executemany(
-                            """
-                            INSERT INTO relphot.transit_shape
-                                (det_id, obj_id, tc, tc_err, depth, depth_err, t14_h, t14_err,
-                                 t14_lower_limit, incomplete_reason, ingress_frac, ingress_err,
-                                 chi2_red, n_points, input, converged, computed_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                    %s, now())
-                            """,
-                            shape_rows,
-                        )
+                        cur.executemany(_SHAPE_INSERT_SQL, shape_rows)
                         n_shapes += len(shape_rows)
                     if lower_limit_rows:
                         # the recomputed verdict (search flags OR what the fit window shows)
@@ -1294,42 +1587,10 @@ def analyze(
                             lower_limit_rows,
                         )
                     if match_rows:
-                        cur.executemany(
-                            """
-                            INSERT INTO relphot.transit_match
-                                (det_a, det_b, obj_id, dt_days, depth_z, t14_z, ingress_z, chi2,
-                                 dof, p_match, same_telescope, commensurate_periods, computed_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                            """,
-                            match_rows,
-                        )
+                        cur.executemany(_MATCH_INSERT_SQL, match_rows)
                         n_matches += len(match_rows)
                     if estimate_rows:
-                        cur.executemany(
-                            """
-                            INSERT INTO relphot.period_estimate
-                                (obj_id, method, input, night_ids, n_nights, last_night,
-                                 baseline_days, period, period_err, power, fap, lit_period,
-                                 lit_period_err, lit_catalog, harmonic, delta, delta_err,
-                                 delta_z, verify_status, verify_note, computed_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                    %s, %s, %s, %s, %s, now())
-                            ON CONFLICT (obj_id, method, night_ids) DO UPDATE SET
-                                computed_at = now(), input = EXCLUDED.input,
-                                n_nights = EXCLUDED.n_nights, last_night = EXCLUDED.last_night,
-                                baseline_days = EXCLUDED.baseline_days,
-                                period = EXCLUDED.period, period_err = EXCLUDED.period_err,
-                                power = EXCLUDED.power, fap = EXCLUDED.fap,
-                                lit_period = EXCLUDED.lit_period,
-                                lit_period_err = EXCLUDED.lit_period_err,
-                                lit_catalog = EXCLUDED.lit_catalog,
-                                harmonic = EXCLUDED.harmonic, delta = EXCLUDED.delta,
-                                delta_err = EXCLUDED.delta_err, delta_z = EXCLUDED.delta_z,
-                                verify_status = EXCLUDED.verify_status,
-                                verify_note = EXCLUDED.verify_note
-                            """,
-                            estimate_rows,
-                        )
+                        cur.executemany(_ESTIMATE_INSERT_SQL, estimate_rows)
                         n_estimates += len(estimate_rows)
                     refresh_objects(
                         conn, obj_id_list,
