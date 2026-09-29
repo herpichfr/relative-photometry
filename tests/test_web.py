@@ -1773,6 +1773,56 @@ def test_apparent_mean_mag_uses_the_gaia_zero_point_of_calibrated_nights(client,
     assert values == sorted(values)
 
 
+def test_apparent_mean_mag_source_is_the_common_source_else_mixed(client, test_conn) -> None:
+    test_client, ids = client
+    mean_mag, _ = _mean_star_mag(test_conn, ids["obj_var"])
+
+    def detail_of(key: str) -> dict:
+        return test_client.get(f"/api/object/{ids[key]}").json()["object"]
+
+    def row_of(key: str) -> dict:
+        rows = test_client.get("/api/search").json()["rows"]
+        return {r["obj_id"]: r for r in rows}[ids[key]]
+
+    # every night measured: the measured source, with its shared zero point in the detail
+    _set_night_zp(test_conn, ids["night1"], 27.85, "measured")
+    _set_night_zp(test_conn, ids["night2"], 27.85, "measured")
+    var = row_of("obj_var")
+    assert var["mag_zp_source"] == "measured"
+    assert var["mean_mag_app"] == pytest.approx(mean_mag + 27.85, abs=1e-3)
+    detail = detail_of("obj_var")
+    assert detail["mag_zp_source"] == "measured" and detail["mag_zp"] == pytest.approx(27.85)
+
+    # measured + assumed, and measured + Gaia: mixed, no single zero point
+    _set_night_zp(test_conn, ids["night2"], 20.0, "assumed")
+    assert row_of("obj_var")["mag_zp_source"] == "mixed"
+    detail = detail_of("obj_var")
+    assert detail["mag_zp_source"] == "mixed" and detail["mag_zp"] is None
+    _set_night_zp(test_conn, ids["night2"], 24.5, "gaia")
+    assert row_of("obj_var")["mag_zp_source"] == "mixed"
+
+    # an object seen on night 1 only rests on that night's source alone
+    assert row_of("obj_unc")["mag_zp_source"] == "measured"
+    assert detail_of("obj_unc")["mag_zp"] == pytest.approx(27.85)
+
+    # every night Gaia-calibrated, with different zero points: still Gaia, no single value
+    _set_night_zp(test_conn, ids["night1"], 24.0, "gaia")
+    assert row_of("obj_var")["mag_zp_source"] == "gaia"
+    assert detail_of("obj_var")["mag_zp"] is None
+
+    # the light-curve payloads carry the source of the night(s) they use
+    _set_night_zp(test_conn, ids["night1"], 27.85, "measured")
+    lc = test_client.get(
+        f"/api/object/{ids['obj_var']}/lc", params={"night_id": ids["night1"]}
+    ).json()
+    assert lc["zp"] == pytest.approx(27.85) and lc["zp_source"] == "measured"
+    untied = test_client.get(f"/api/object/{ids['obj_var2']}/lc/combined").json()
+    assert untied["zp_source"] == "mixed"
+    _set_night_zp(test_conn, ids["night2"], 27.85, "measured")
+    untied = test_client.get(f"/api/object/{ids['obj_var2']}/lc/combined").json()
+    assert untied["zp_source"] == "measured"
+
+
 def test_lc_payloads_carry_the_zero_point_for_magnitudes(client, test_conn) -> None:
     test_client, ids = client
     _set_night_zp(test_conn, ids["night1"], 24.5, "gaia")
@@ -1816,6 +1866,9 @@ def test_front_end_names_the_apparent_magnitude_and_its_zero_point() -> None:
     html = (static / "index.html").read_text()
     for name in ("mean_mag_app", "mag_zp_source", "zpText", "lc-unit-select"):
         assert name in js or name in html
+    # one label per zero-point source
+    for text in ("Gaia ZP", "measured (Gaia-matched)", "assumed", "mixed ZP"):
+        assert text in js
 
 
 def test_adopt_period_sets_a_manual_period_with_its_error(client, test_conn) -> None:

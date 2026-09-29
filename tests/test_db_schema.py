@@ -147,8 +147,8 @@ def test_migration_004_from_v3_maps_class_to_flags(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [4, 5, 6, 7]
-    assert current_version(test_conn) == 7
+    assert init_schema(test_conn) == [4, 5, 6, 7, 8]
+    assert current_version(test_conn) == 8
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -282,7 +282,7 @@ def test_migration_005_verify_status_backfill_and_check(test_conn) -> None:
             )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [5, 6, 7]
+    assert init_schema(test_conn) == [5, 6, 7, 8]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -305,7 +305,7 @@ def test_migration_007_night_zero_point_defaults_existing_nights_to_assumed(test
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [7]
+    assert init_schema(test_conn) == [7, 8]
 
     with test_conn.cursor() as cur:
         cur.execute("SELECT zp, zp_source FROM relphot.night")
@@ -314,6 +314,39 @@ def test_migration_007_night_zero_point_defaults_existing_nights_to_assumed(test
             "INSERT INTO relphot.night (telescope, night_date, label, source_dir, zp, zp_source) "
             "VALUES ('T80S', '2025-01-02', 'm', '/tmp/m', 24.5, 'gaia')"
         )
+    test_conn.commit()
+    with pytest.raises(psycopg.errors.CheckViolation), test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.night SET zp_source = 'bogus'")
+    test_conn.rollback()
+
+
+def test_migration_008_night_zero_point_source_accepts_measured(test_conn) -> None:
+    _apply_up_to(test_conn, 7)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+            "VALUES ('T80S', '2025-01-01', 'n', '/tmp/n')"
+        )
+    test_conn.commit()
+    with pytest.raises(psycopg.errors.CheckViolation), test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.night SET zp_source = 'measured'")
+    test_conn.rollback()
+
+    assert init_schema(test_conn) == [8]
+    assert init_schema(test_conn) == []
+
+    with test_conn.cursor() as cur:
+        # the existing night is untouched; the backfill of deploy/README.md rewrites it
+        cur.execute("SELECT zp, zp_source FROM relphot.night")
+        assert cur.fetchall() == [(20.0, "assumed")]
+        cur.execute(
+            "UPDATE relphot.night SET zp = 27.85, zp_source = 'measured' "
+            "WHERE telescope = 'T80S' AND zp_source = 'assumed'"
+        )
+        cur.execute("SELECT zp, zp_source FROM relphot.night")
+        assert cur.fetchall() == [(pytest.approx(27.85), "measured")]
+        for source in ("gaia", "assumed"):
+            cur.execute("UPDATE relphot.night SET zp_source = %s", (source,))
     test_conn.commit()
     with pytest.raises(psycopg.errors.CheckViolation), test_conn.cursor() as cur:
         cur.execute("UPDATE relphot.night SET zp_source = 'bogus'")
@@ -347,8 +380,8 @@ def test_migration_006_guided_reprocessing_schema_from_v5(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7]
-    assert current_version(test_conn) == 7
+    assert init_schema(test_conn) == [6, 7, 8]
+    assert current_version(test_conn) == 8
 
     with test_conn.cursor() as cur:
         # existing rows: searches' detections, no inflation information, no new estimate info
@@ -442,7 +475,7 @@ def test_migration_006_user_night_review_from_v5_backfills_object_level_flags(te
                 )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7]
+    assert init_schema(test_conn) == [6, 7, 8]
 
     with test_conn.cursor() as cur:
         cur.execute(

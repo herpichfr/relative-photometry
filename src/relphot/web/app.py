@@ -96,14 +96,17 @@ _SEARCH_COLUMNS = [
 ]
 
 
-def _app_mag_sql(obj_ref: str) -> tuple[str, str]:
-    """Correlated subqueries for an object's apparent mean magnitude and where it comes from.
+def _app_mag_sql(obj_ref: str) -> tuple[str, str, str]:
+    """Correlated subqueries for an object's apparent mean magnitude, where it comes from and
+    the zero point it rests on.
 
     relphot's instrumental magnitude plus the night's zero point (``night.zp``: the Gaia
-    calibration of the frame headers where they carry one, else the assumed 20 mag), averaged
-    over the object's nights like ``object.mean_mag``. The source is ``'gaia'``,
-    ``'assumed'`` or ``'mixed'`` (nights of both kinds). ``obj_ref`` is ``o.obj_id`` or a
-    ``%s`` placeholder.
+    calibration of the frame headers where they carry one, else the telescope's measured
+    zero point, else the assumed 20 mag), averaged over the object's nights like
+    ``object.mean_mag``. The source is the ``zp_source`` all the object's nights share
+    (``'gaia'``, ``'measured'`` or ``'assumed'``), else ``'mixed'``; the zero point is the
+    value they share, NULL when the nights differ. ``obj_ref`` is ``o.obj_id`` or a ``%s``
+    placeholder.
     """
     body = (
         "FROM relphot.star_night zs JOIN relphot.night zn ON zn.night_id = zs.night_id "
@@ -111,14 +114,14 @@ def _app_mag_sql(obj_ref: str) -> tuple[str, str]:
     )
     mean = f"(SELECT avg(zs.mag + zn.zp) {body}"
     source = (
-        "(SELECT CASE WHEN bool_and(zn.zp_source = 'gaia') THEN 'gaia' "
-        "WHEN bool_or(zn.zp_source = 'gaia') THEN 'mixed' "
-        f"WHEN count(*) > 0 THEN 'assumed' END {body}"
+        "(SELECT CASE WHEN count(DISTINCT zn.zp_source) = 1 THEN min(zn.zp_source) "
+        f"WHEN count(*) > 0 THEN 'mixed' END {body}"
     )
-    return mean, source
+    zp = f"(SELECT CASE WHEN min(zn.zp) = max(zn.zp) THEN min(zn.zp) END {body}"
+    return mean, source, zp
 
 
-_MEAN_MAG_APP_SQL, _MAG_ZP_SOURCE_SQL = _app_mag_sql("o.obj_id")
+_MEAN_MAG_APP_SQL, _MAG_ZP_SOURCE_SQL, _ = _app_mag_sql("o.obj_id")
 
 #: Result columns computed per object: transit-event count, best "matching transits"
 #: probability, the latest period verification (delta = P_obs/harmonic - P_lit, with
@@ -492,9 +495,12 @@ def object_detail(obj_id: int):
             obj["duration_display"] = _fmt_duration(
                 obj["duration_h"], obj["duration_lower_limit"]
             )
-            mean_app_sql, zp_source_sql = _app_mag_sql("%s")
-            cur.execute(f"SELECT {mean_app_sql}, {zp_source_sql}", (obj_id, obj_id))
-            obj["mean_mag_app"], obj["mag_zp_source"] = cur.fetchone()
+            mean_app_sql, zp_source_sql, zp_sql = _app_mag_sql("%s")
+            cur.execute(
+                f"SELECT {mean_app_sql}, {zp_source_sql}, {zp_sql}", (obj_id, obj_id, obj_id)
+            )
+            obj["mean_mag_app"], obj["mag_zp_source"], mag_zp = cur.fetchone()
+            obj["mag_zp"] = None if mag_zp is None else round(mag_zp, 4)
 
             cur.execute(
                 "SELECT catalog, name, type, period, period_err, sep_arcsec, reference "

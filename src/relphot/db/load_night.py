@@ -19,6 +19,12 @@ with ``duration_lower_limit`` set (its duration is only a minimum). Only ``origi
 detections are deleted and re-created: a detection a person created by reprocessing
 (``origin = 'user'``, see :mod:`relphot.db.reprocess`) survives a reload.
 
+``night.zp`` / ``zp_source``: the median Gaia ``ZPABS`` of the kept frames (``'gaia'``); without
+one, the telescope's measured zero point in ``settings.db.telescope_zp`` (``'measured'``; the
+T80S 27.85 mag is the median of Gaia DR3 G minus relphot magnitude over 200 bright isolated
+stars, MAD-sigma 0.12, at the best aperture and without aperture correction); else
+``settings.db.assumed_zp`` (``'assumed'``, 20 mag).
+
 ``star_night.err_scale`` / ``blended`` come from ``*_starstats.parquet`` (the factor
 ``lc_err`` was inflated by and the neighbour-flag verdict); a product written before error
 inflation existed has neither column and loads them as NULL (read as a factor of 1).
@@ -41,7 +47,7 @@ import pandas as pd
 import psycopg
 from psycopg.types.json import Jsonb
 
-from relphot.config import Settings
+from relphot.config import DbSettings, Settings
 from relphot.db.refresh import refresh_objects
 from relphot.exceptions import NightLoadError
 
@@ -140,21 +146,23 @@ def _night_date_from_label(label: str, frame_meta: list[dict]) -> date:
     return datetime.fromisoformat(frame_meta[0]["date_obs"]).date()
 
 
-#: Zero point (mag) of a night whose frames carry no valid Gaia calibration: robo43's
-#: ``instrumental_zp``, "a good approximation overall".
-_ASSUMED_ZP = 20.0
-
-
-def _night_zero_point(frame_meta: list[dict], frame_kept: np.ndarray) -> tuple[float, str]:
+def _night_zero_point(
+    frame_meta: list[dict], frame_kept: np.ndarray, telescope: str, settings: DbSettings
+) -> tuple[float, str]:
     """(zp, source) of a night: the median Gaia ``zp`` of its kept frames when at least half of
-    them carry one (``'gaia'``), else the assumed 20 mag (``'assumed'``)."""
+    them carry one (``'gaia'``); else the telescope's measured zero point from
+    ``settings.telescope_zp`` (``'measured'``: T80S 27.85, Gaia DR3 G minus relphot magnitude
+    of 200 bright isolated stars, see :class:`~relphot.config.DbSettings`); else
+    ``settings.assumed_zp`` (``'assumed'``, robo43's ``instrumental_zp`` of 20 mag)."""
     zps = np.array(
         [np.nan if m.get("zp") is None else float(m["zp"]) for m in frame_meta], dtype=float
     )
     good = np.isfinite(zps) & frame_kept
     if good.any() and 2 * int(good.sum()) >= int(frame_kept.sum()):
         return float(np.median(zps[good])), "gaia"
-    return _ASSUMED_ZP, "assumed"
+    if telescope in settings.telescope_zp:
+        return float(settings.telescope_zp[telescope]), "measured"
+    return float(settings.assumed_zp), "assumed"
 
 
 def _mode(values: list[str]) -> str | None:
@@ -403,7 +411,9 @@ def load_night(
         )
         raise NightLoadError(msg)
     n_kept = int(frame_kept.sum())
-    night_zp, night_zp_source = _night_zero_point(frame_meta, frame_kept)
+    night_zp, night_zp_source = _night_zero_point(
+        frame_meta, frame_kept, resolved_telescope, settings.db
+    )
 
     night_date = _night_date_from_label(resolved_label, frame_meta)
     object_name = _mode([m["object"] for m in frame_meta])

@@ -201,3 +201,38 @@ def test_tails_unknown_key_raises(tmp_path) -> None:
     cfg.write_text("[tails]\nunknown_field = true\n")
     with pytest.raises(ConfigError):
         load_settings(cfg)
+
+
+def test_db_zero_point_defaults_and_toml_override(tmp_path) -> None:
+    """assumed_zp 20 and the measured T80S zero point, both overridable and round-trippable."""
+    d = Settings().db
+    assert d.assumed_zp == 20.0
+    assert d.telescope_zp == {"T80S": 27.85}
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text("[db]\nassumed_zp = 21\n[db.telescope_zp]\nT80S = 27.9\nROBO43 = 22.5\n")
+    s = load_settings(cfg)
+    assert s.db.assumed_zp == 21
+    assert s.db.telescope_zp == {"T80S": 27.9, "ROBO43": 22.5}
+    assert settings_from_dict(settings_to_dict(s)).db == s.db
+    assert Settings().db.telescope_zp == {"T80S": 27.85}  # the default table is not shared
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "assumed_zp = nan",
+        "assumed_zp = inf",
+        "assumed_zp = true",
+        'assumed_zp = "20"',
+        "telescope_zp = {T80S = nan}",
+        "telescope_zp = {T80S = -inf}",
+        'telescope_zp = {T80S = "27.85"}',
+        "telescope_zp = {T80S = true}",
+        "telescope_zp = [27.85]",
+    ],
+)
+def test_db_zero_point_must_be_a_finite_number(tmp_path, body) -> None:
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text(f"[db]\n{body}\n")
+    with pytest.raises(ConfigError):
+        load_settings(cfg)

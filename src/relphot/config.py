@@ -303,7 +303,8 @@ class DbSettings:
     finite, it passes the night's epoch cut, and its predicted per-point
     noise at the best aperture is at most ``max_expected_noise`` -- unless
     it is a transit or variability candidate of that night's search, which
-    is always stored when ``keep_candidates`` is true.
+    is always stored when ``keep_candidates`` is true. ``assumed_zp`` and
+    ``telescope_zp`` give the zero point of a night without a Gaia calibration.
     """
 
     #: Maximum predicted per-point noise (fractional) at the best aperture
@@ -372,6 +373,32 @@ class DbSettings:
     phase_coverage_bins: int = 20
     #: Most alias / next-peak candidate periods stored per period estimate.
     max_alias_candidates: int = 5
+    #: Zero point (mag) of a night whose kept frames mostly lack a Gaia calibration and whose
+    #: telescope is not in ``telescope_zp``: robo43's ``instrumental_zp``. Stored as
+    #: ``night.zp`` with ``zp_source = 'assumed'`` when the night is loaded.
+    assumed_zp: float = 20.0
+    #: Measured zero point (mag) per telescope, used instead of ``assumed_zp`` for a night with
+    #: no Gaia calibration (``zp_source = 'measured'``). Keys are ``night.telescope`` exactly as
+    #: stored (``'T80S'``, ``'ROBO43'``). T80S 27.85: median of Gaia DR3 G minus relphot
+    #: magnitude for 200 bright isolated T80S stars (MAD-sigma 0.12); relphot magnitudes are per
+    #: 90 s exposure in the R band, matched to G at the star's best aperture with no aperture
+    #: correction. A ``telescope_zp`` in a settings file replaces this table as a whole.
+    telescope_zp: dict[str, float] = field(default_factory=lambda: {"T80S": 27.85})
+    def __post_init__(self) -> None:
+        if not isinstance(self.telescope_zp, dict) or not all(
+            isinstance(k, str) for k in self.telescope_zp
+        ):
+            msg = "db.telescope_zp must be a table of telescope name -> zero point"
+            raise ConfigError(msg)
+        zps = {"assumed_zp": self.assumed_zp}
+        zps.update({f"telescope_zp[{k!r}]": v for k, v in self.telescope_zp.items()})
+        for name, value in zps.items():
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                msg = f"db.{name} must be a finite number, got {value!r}"
+                raise ConfigError(msg)
+            if not math.isfinite(value):
+                msg = f"db.{name} must be a finite number, got {value!r}"
+                raise ConfigError(msg)
 
 
 @dataclass(frozen=True, slots=True)

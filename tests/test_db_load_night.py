@@ -308,11 +308,32 @@ def _night_zp(conn, night_id: int) -> tuple:
         return cur.fetchone()
 
 
-def test_load_night_zero_point_is_assumed_without_a_calibration(test_conn, tmp_path) -> None:
+def test_load_night_zero_point_is_the_telescope_measurement_without_a_calibration(
+    test_conn, tmp_path
+) -> None:
     root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
     _write_night1(root)
     report = load_night(test_conn, root, settings=_SETTINGS)
+    assert _night_zp(test_conn, report.night_id) == (pytest.approx(27.85), "measured")
+
+
+def test_load_night_zero_point_is_assumed_for_a_telescope_without_a_measurement(
+    test_conn, tmp_path
+) -> None:
+    root = tmp_path / "ROBO43_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    report = load_night(test_conn, root, settings=_SETTINGS)
     assert _night_zp(test_conn, report.night_id) == (20.0, "assumed")
+
+    # both fallbacks come from the settings
+    tuned = replace(
+        _SETTINGS,
+        db=replace(_SETTINGS.db, assumed_zp=21.5, telescope_zp={"ROBO43": 22.25}),
+    )
+    report = load_night(test_conn, root, settings=tuned)
+    assert _night_zp(test_conn, report.night_id) == (22.25, "measured")
+    report = load_night(test_conn, root, telescope="OTHER", settings=tuned)
+    assert _night_zp(test_conn, report.night_id) == (21.5, "assumed")
 
 
 def test_load_night_zero_point_is_the_median_of_the_calibrated_kept_frames(
@@ -325,10 +346,16 @@ def test_load_night_zero_point_is_the_median_of_the_calibrated_kept_frames(
     report = load_night(test_conn, root, settings=_SETTINGS)
     assert _night_zp(test_conn, report.night_id) == (pytest.approx(24.2), "gaia")
 
-    # a reload re-reads the frames: too few calibrated (1 of 4 kept) -> assumed again
+    # a reload re-reads the frames: too few calibrated (1 of 4 kept) -> the T80S measurement
     _set_frame_zps(root, [24.1, None, None, None, 24.9])
     report = load_night(test_conn, root, settings=_SETTINGS)
-    assert _night_zp(test_conn, report.night_id) == (20.0, "assumed")
+    assert _night_zp(test_conn, report.night_id) == (pytest.approx(27.85), "measured")
+
+    # ... and a Gaia calibration wins over a telescope measurement, and over the assumed value
+    _set_frame_zps(root, [24.1, 24.3, 24.2, None, 24.9])
+    for tel in ("T80S", "ROBO43"):
+        report = load_night(test_conn, root, telescope=tel, settings=_SETTINGS)
+        assert _night_zp(test_conn, report.night_id) == (pytest.approx(24.2), "gaia")
 
 
 def test_load_night_frames(test_conn, tmp_path) -> None:

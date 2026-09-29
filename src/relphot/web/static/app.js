@@ -352,21 +352,32 @@ const META_FIELDS = [
   ["n_nights_reviewed", "nights reviewed"], ["notes", "notes"],
 ];
 
-// "16.32 (Gaia ZP)" or "≈ 17.10 (ZP=20 assumed)": the apparent mean magnitude (the
-// instrumental one plus the night zero points) and which zero point it rests on
+// a zero point as written in a label: 27.85, 20 (no trailing zeros)
+function zpNum(zp) {
+  return String(Number(Number(zp).toFixed(2)));
+}
+
+// "16.32 (Gaia ZP)", "≈ 17.19 (ZP 27.85, measured)" or "≈ 17.10 (ZP=20 assumed)": the apparent
+// mean magnitude (the instrumental one plus the night zero points) and which zero point it rests on
 function appMagText(obj) {
   if (obj.mean_mag_app === null || obj.mean_mag_app === undefined) return "";
   const m = Number(obj.mean_mag_app).toFixed(2);
+  const hasZp = obj.mag_zp !== null && obj.mag_zp !== undefined;
   if (obj.mag_zp_source === "gaia") return `${m} (Gaia ZP)`;
-  if (obj.mag_zp_source === "mixed") return `≈ ${m} (mixed: Gaia ZP and ZP=20 assumed)`;
-  return `≈ ${m} (ZP=20 assumed)`;
+  if (obj.mag_zp_source === "mixed") return `≈ ${m} (mixed ZP)`;
+  if (obj.mag_zp_source === "measured") {
+    return `≈ ${m} (${hasZp ? "ZP " + zpNum(obj.mag_zp) + ", " : ""}measured)`;
+  }
+  return `≈ ${m} (ZP=${hasZp ? zpNum(obj.mag_zp) : "20"} assumed)`;
 }
 
 // the zero point of a light-curve axis
 function zpText(source, zp) {
-  if (source === "gaia") return "Gaia ZP" + (zp === null || zp === undefined ? "" : " " + Number(zp).toFixed(2));
-  if (source === "mixed") return "mixed ZPs";
-  return "ZP=20 assumed";
+  const known = zp !== null && zp !== undefined;
+  if (source === "gaia") return "Gaia ZP" + (known ? " " + Number(zp).toFixed(2) : "");
+  if (source === "mixed") return "mixed ZP";
+  if (source === "measured") return (known ? `ZP=${zpNum(zp)} ` : "") + "measured (Gaia-matched)";
+  return `ZP=${known ? zpNum(zp) : "20"} assumed`;
 }
 
 function renderMeta(obj) {
