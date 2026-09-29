@@ -11,7 +11,7 @@ things are shaped this way; this file is *how to run it*.
 | Component | Where | Image | Port | Notes |
 |---|---|---|---|---|
 | `relphotdb-db` | podman container (rootless) | `localhost/relphotdb-db:latest` (PostgreSQL 17 + q3c) | `127.0.0.1:5433` -> 5432 | data in `/ssdsto1/data/relphotDB/pgdata` |
-| `relphotdb-web` | podman container (rootless) | `localhost/relphotdb-web:latest` (FastAPI + Jinja2 + Plotly.js, vendored) | `127.0.0.1:8050` | stateless; talks to `relphotdb-db` over the `relphotdb.network` podman network |
+| `relphotdb-web` | podman container (rootless) | `localhost/relphotdb-web:latest` (FastAPI + Jinja2 + Plotly.js, vendored) | `127.0.0.1:8080` -> 8050 (host port configurable, see "Web usage") | stateless; talks to `relphotdb-db` over the `relphotdb.network` podman network |
 | loader (`relphot db ...`) | host, plain CLI | -- | -- | connects to the DB over `127.0.0.1:5433`, same as any other client |
 | `relphotdb-worker` (`relphot db reprocess --watch`) | host, systemd user unit | -- | -- | works off the web's RERUN queue (owner role, like the loader); see "User-guided reprocessing" |
 
@@ -154,18 +154,20 @@ Pending RERUNs are visible without opening the object: the results table marks e
 
 ## Web usage
 
-Open <http://127.0.0.1:8050> on the host running the containers. From elsewhere, tunnel it first:
+Open <http://127.0.0.1:8080> on the host running the containers. From elsewhere, tunnel it first:
 
 ```
-ssh -L 8050:127.0.0.1:8050 <host>
+ssh -L 8080:127.0.0.1:8080 <host>
 ```
 
-then open <http://127.0.0.1:8050> locally as usual.
+then open <http://127.0.0.1:8080> locally as usual.
+
+The host port defaults to 8080 and is always bound to 127.0.0.1 only (the container listens on 8050 inside). To use another one, put `RELPHOT_WEB_PORT=<port>` in `~/.config/relphot/relphotdb.env` (or export it for one run) and re-run `bash deploy/install.sh web`, which writes the port into the installed quadlet unit and waits on it.
 
 The query window filters on CLASS, KNOWN, SOURCE_DB, status, cone search (RA/Dec/radius), magnitude, period, SNR, depth, tier, n_nights, night date range, telescope, and name/Gaia ID substring, plus a **detection kind** filter (`transit`/`variable`/`internight`/`ls_periodic`/`bls`/`recurrent`, multi-select) with a **scope** of `any`/`night`/`multinight` -- this is how to find the multi-night `bls`/`ls_periodic`/`internight` candidates that (by default) no longer set CLASS, e.g. to review them by hand. The same filters are exposed on the API directly:
 
 ```
-curl 'http://127.0.0.1:8050/api/search?detection_kind=bls&detection_scope=multinight&limit=25'
+curl 'http://127.0.0.1:8080/api/search?detection_kind=bls&detection_scope=multinight&limit=25'
 ```
 
 The query window also filters on the two independent flags (exoplanet host / variable, each yes/no/any), the combined class `EXOP+VAR`, and a minimum transit-match probability (objects with any pair of transit events matching with `p >= x`). Two review filters (`needs_review`, `user_reviewed`, each yes/no/any) find the objects with a night or multi-night event still awaiting your verdict (`n_review_pending > 0`) and the objects on which you have set a verdict, note or event status on at least one night (`n_nights_reviewed > 0`). Result columns add `is_exop`, `is_var`, `period_err`, `n_transit_events`, `max_p_match` and, for literature variables, the latest `period_delta` +/- `period_delta_err`; the CSV export includes them.

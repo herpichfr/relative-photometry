@@ -12,6 +12,21 @@ ENV_FILE="${CONFIG_DIR}/relphotdb.env"
 QUADLET_DIR="${HOME}/.config/containers/systemd"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 
+# Host port of the web front end (always bound to 127.0.0.1; the container listens on 8050 inside).
+# Precedence: RELPHOT_WEB_PORT in the environment > RELPHOT_WEB_PORT= line in ${ENV_FILE} > 8080.
+web_port() {
+    local port="${RELPHOT_WEB_PORT:-}"
+    if [[ -z "${port}" && -f "${ENV_FILE}" ]]; then
+        port="$(sed -n 's/^RELPHOT_WEB_PORT=//p' "${ENV_FILE}" | tail -n 1)"
+    fi
+    port="${port:-8080}"
+    if ! [[ "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        echo "invalid RELPHOT_WEB_PORT: ${port}" >&2
+        return 1
+    fi
+    echo "${port}"
+}
+
 gen_secret() {
     python3 -c 'import secrets; print(secrets.token_hex(24))'
 }
@@ -72,18 +87,22 @@ install_web() {
         return 1
     fi
 
+    local port
+    port="$(web_port)"
+
     podman build -t localhost/relphotdb-web:latest -f "${REPO_DIR}/deploy/web/Containerfile" "${REPO_DIR}"
 
     mkdir -p "${QUADLET_DIR}"
-    cp "${REPO_DIR}/deploy/quadlet/relphotdb-web.container" "${QUADLET_DIR}/relphotdb-web.container"
+    sed "s#__WEB_PORT__#${port}#g" "${REPO_DIR}/deploy/quadlet/relphotdb-web.container" \
+        > "${QUADLET_DIR}/relphotdb-web.container"
 
     systemctl --user daemon-reload
     systemctl --user restart relphotdb-web.service
 
     echo "waiting for relphotdb-web to answer requests..."
     for _ in $(seq 1 60); do
-        if curl -fsS "http://127.0.0.1:8050/api/search?limit=1" >/dev/null 2>&1; then
-            echo "relphotdb-web is ready"
+        if curl -fsS "http://127.0.0.1:${port}/api/search?limit=1" >/dev/null 2>&1; then
+            echo "relphotdb-web is ready on http://127.0.0.1:${port}"
             return 0
         fi
         sleep 1
