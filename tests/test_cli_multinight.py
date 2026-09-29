@@ -13,6 +13,8 @@ literally identical data).
 
 from __future__ import annotations
 
+import numpy as np
+
 from relphot.cli import main
 
 
@@ -120,3 +122,44 @@ def test_multisearch_smoke(fits_files, tmp_path) -> None:
     assert "internight_chi2" in table.colnames
     assert "bls_candidate" in table.colnames
     assert len(table) == 232
+
+
+def test_multinight_loose_night_smoke_and_option_errors(fits_files, tmp_path) -> None:
+    """`--loose` ties the last night loosely; multisearch reads the flag from the npz."""
+    dirs = [tmp_path / f"2025010{i}" / "relphot" for i in (1, 2, 3)]
+    for d in dirs:
+        _build_night(fits_files, d)
+    night_dirs = [str(d) for d in dirs]
+
+    config = tmp_path / "multinight.toml"
+    config.write_text("[multinight]\nmin_tie_stars = 5\nfloor_min_bin_stars = 5\n")
+    (tmp_path / "mn").mkdir()
+    out_stem = tmp_path / "mn" / "mn_loose"
+
+    rc = main([
+        "multinight", *night_dirs, "--out", str(out_stem), "--config", str(config),
+        "--format", "fits", "--no-plot", "--loose", "20250103",
+    ])
+    assert rc == 0
+
+    from relphot.multinight import load_multinight
+
+    xmatch, tie, mlc, _info, _settings = load_multinight(out_stem.with_suffix(".npz"))
+    assert xmatch.labels == ("20250101", "20250102", "20250103")
+    assert list(tie.loose) == [False, False, True]
+    assert tie.coef.shape[0] == 3 and mlc.night_mean_mag.shape[0] == 3
+    assert np.isfinite(tie.zp[2]).any()
+
+    rc = main([
+        "multisearch", str(out_stem.with_suffix(".npz")), "--out-dir", str(tmp_path / "search"),
+        "--no-plot",
+    ])
+    assert rc == 0
+
+    # an unknown loose label, or the anchor given as loose, is an error, not a traceback
+    for extra in (["--loose", "nope"], ["--loose", "20250102", "--anchor", "20250102"]):
+        rc = main([
+            "multinight", *night_dirs, "--out", str(tmp_path / "mn" / "bad"),
+            "--config", str(config), "--format", "fits", "--no-plot", *extra,
+        ])
+        assert rc == 1

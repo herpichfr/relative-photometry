@@ -8,8 +8,10 @@ __all__ = [
     "IngestError",
     "MatchError",
     "MultiNightError",
+    "NightLoadError",
     "ReferenceFrameError",
     "RelphotError",
+    "ReprocessError",
     "TilingError",
 ]
 
@@ -45,3 +47,11 @@ class TilingError(RelphotError):
 
 class ComparisonError(RelphotError):
     """Raised when a tile's comparison pool is smaller than min_comparison_stars."""
+
+
+class ReprocessError(RelphotError):
+    """A user's reprocess request cannot be carried out (no usable data, no such night, ...)."""
+
+
+class NightLoadError(RelphotError):
+    """Raised when a night's relphot output directory cannot be loaded into the results database."""

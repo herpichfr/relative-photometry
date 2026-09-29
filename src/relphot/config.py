@@ -19,9 +19,11 @@ from typing import Any
 from relphot.exceptions import ConfigError
 
 __all__ = [
+    "BorderSettings",
     "CatalogSettings",
     "ColumnMap",
     "ComparisonSettings",
+    "DbSettings",
     "DecorrelationSettings",
     "LightcurveSettings",
     "MultiNightSettings",
@@ -29,6 +31,7 @@ __all__ = [
     "SearchSettings",
     "Settings",
     "SiteSettings",
+    "TailSettings",
     "TileSettings",
     "VariableSettings",
     "load_settings",
@@ -200,12 +203,37 @@ class MultiNightSettings:
     #: used with >= 3 nights.
     seeing_crowding_degree: int = 1
 
+    # --- loose nights (relphot.multinight.tie_loose_nights) ---
+    #: Labels of nights tied "loosely", e.g. a cloudy night that would distort the tie of
+    #: the good ones. The other (core) nights are tied by exactly the same code as without
+    #: this setting -- run on the core subset, so their zero points, calibration floors,
+    #: mean magnitudes and aperture choice are bit-identical to a run without the loose
+    #: nights. Each loose night is then fit only to that fixed core frame (the core nights'
+    #: calibrated weighted mean) with a low-order surface (the two degrees below, at most
+    #: ``spatial_degree``/``mag_degree``; no seeing term) and gets its own calibration floor
+    #: measured against the frame, which inflates its errors everywhere the floor is used.
+    #: A loose night takes part in the variability tests (inter-night chi2, Lomb-Scargle,
+    #: per-night verdict recurrence) but never in the transit ones (BLS, period
+    #: compatibility, per-night transit events): see :mod:`relphot.multinight_search`.
+    loose_nights: tuple[str, ...] = ()
+    #: Degree of the tangent-plane polynomial of a loose night's zero-point surface.
+    loose_spatial_degree: int = 1
+    #: Degree of the magnitude polynomial of a loose night's zero-point surface.
+    loose_mag_degree: int = 1
+
     # --- Unit B: cross-night search (relphot.multinight_search) ---
     #: Inter-night (long-term) variability chi2 p-value threshold.
     internight_p_threshold: float = 1e-4
     #: Minimum max-min nightly-mean spread (mag) also required for an
     #: inter-night variability candidate.
     internight_min_amplitude_mag: float = 0.005
+    #: A loose night alone never makes an inter-night candidate. A star with a loose
+    #: night among its nights is a candidate only if the test on all its nights passes
+    #: (``internight_p_threshold``, ``internight_min_amplitude_mag``) AND the same chi2
+    #: test on its core nights alone (loose night dropped) has p below this; a star with
+    #: fewer than 2 core nights is then never a candidate. Stars without a loose night
+    #: are unaffected.
+    loose_internight_support_p: float = 1e-2
     #: Which stars get the combined Lomb-Scargle periodogram (B4)/BLS search
     #: (B6): "candidates" (union of variability/transit-flagged stars) or "all".
     periodogram_stars: str = "candidates"
@@ -240,6 +268,32 @@ class MultiNightSettings:
     #: NaN/False LS and BLS columns; skipped stars are logged once, not
     #: per star.
     min_nights_periodic: int = 3
+
+    def __post_init__(self) -> None:
+        if len(set(self.loose_nights)) != len(self.loose_nights):
+            msg = f"multinight.loose_nights has duplicate labels: {self.loose_nights!r}"
+            raise ConfigError(msg)
+        if self.anchor in self.loose_nights:
+            msg = f"multinight.anchor {self.anchor!r} cannot be a loose night"
+            raise ConfigError(msg)
+        for name, cap_name in (
+            ("loose_spatial_degree", "spatial_degree"), ("loose_mag_degree", "mag_degree"),
+        ):
+            value = getattr(self, name)
+            cap = getattr(self, cap_name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= cap:
+                msg = (
+                    f"multinight.{name} must be an integer in [0, {cap_name}={cap}], "
+                    f"got {value!r}"
+                )
+                raise ConfigError(msg)
+        value = self.loose_internight_support_p
+        if (
+            isinstance(value, bool) or not isinstance(value, int | float)
+            or not 0.0 < value <= 1.0
+        ):
+            msg = f"multinight.loose_internight_support_p must be in (0, 1], got {value!r}"
+            raise ConfigError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +347,158 @@ class ComparisonSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class DbSettings:
+    """Results-database noise cut and cross-match (see docs/DB_PLAN.md).
+
+    A star of a night is stored in the results database iff its rms is
+    finite, it passes the night's epoch cut, and its predicted per-point
+    noise at the best aperture is at most ``max_expected_noise`` -- unless
+    it is a transit or variability candidate of that night's search, which
+    is always stored when ``keep_candidates`` is true. ``assumed_zp`` and
+    ``telescope_zp`` give the zero point of a night without a Gaia calibration.
+    """
+
+    #: Maximum predicted per-point noise (fractional) at the best aperture
+    #: for a non-candidate star to be stored.
+    max_expected_noise: float = 0.05
+    #: Always store a night's transit/variability search candidates, even
+    #: when they fail the noise cut.
+    keep_candidates: bool = True
+    #: Cross-match radius, in arcsec, used to link a star to an existing
+    #: ``object`` row when loading a night.
+    match_radius_arcsec: float = 1.0
+    #: Lomb-Scargle period-grid floor (days) for ``relphot db analyze``.
+    ls_min_period_days: float = 0.02
+    #: Lomb-Scargle period-grid ceiling (days); capped by the data's own time span.
+    ls_max_period_days: float = 100.0
+    #: Frequency-grid oversampling factor for both the LS and BLS grids
+    #: (same convention as ``MultiNightSettings.periodogram_samples_per_peak``).
+    ls_samples_per_peak: int = 10
+    #: Frequency-grid size above which a periodogram's ``df`` is coarsened
+    #: (increased) to fit, and ``periodogram.coarsened`` is set.
+    max_periodogram_points: int = 200000
+    #: False-alarm-probability threshold for a combined Lomb-Scargle PERIOD (VAR).
+    ls_fap_threshold: float = 0.01
+    #: BLS period-grid floor (days).
+    bls_min_period_days: float = 0.2
+    #: BLS period-grid ceiling (days); also capped by combined_span / 1.5.
+    bls_max_period_days: float = 30.0
+    #: Trial transit durations for the combined BLS search; a duration not
+    #: shorter than ``bls_min_period_days`` is dropped.
+    bls_durations_hours: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0, 5.0)
+    #: Minimum BLS depth SNR (``periodogram.extra['depth_snr']``) for a
+    #: combined BLS PERIOD (EXOP).
+    bls_min_snr: float = 7.0
+    #: Multi-night detection kinds that count towards CLASS; 'bls',
+    #: 'ls_periodic', 'internight' are stored and queryable but excluded
+    #: until their thresholds are calibrated.
+    class_multinight_kinds: tuple[str, ...] = ("recurrent",)
+    #: Systematic floor on the transit-depth difference of a matching-transit
+    #: pair, as a fraction of the pair's mean depth.
+    match_depth_sys_frac: float = 0.05
+    #: Extra depth-difference floor (fraction of mean depth) added when the two
+    #: events were observed with different telescopes (dilution, pixel scale).
+    match_depth_sys_frac_cross_telescope: float = 0.15
+    #: Systematic floor on the T14 difference, as a fraction of the mean T14.
+    match_t14_sys_frac: float = 0.0
+    #: Systematic floor on the ingress-fraction (T12/T14) difference (absolute).
+    match_ingress_sys: float = 0.0
+    #: Smallest commensurate period (days) listed for a matching-transit pair
+    #: (same as ``MultiNightSettings.period_min_days``).
+    match_period_min_days: float = 0.2
+    #: Most commensurate periods stored per matching-transit pair.
+    match_max_commensurate: int = 50
+    #: Half-width, as a fraction of ``lit_period * harmonic``, of the window in
+    #: which a literature period is verified against the data.
+    lit_period_window_frac: float = 0.05
+    #: Periods longer than this (days) cannot be measured on per-night-normalised
+    #: flux, nor with a free offset per night: both absorb variability slower than
+    #: a night. Their period analysis uses tie-calibrated magnitudes and no
+    #: per-night offsets, and needs a multi-night tie covering >= 2 nights.
+    long_period_days: float = 1.0
+    #: Half-width, as a fraction of ``period_guess * harmonic``, of the windows a
+    #: user-guided period search (``relphot db reprocess``) looks in (harmonics 0.5, 1, 2).
+    guided_period_window_frac: float = 0.2
+    #: Number of phase bins used for ``period_estimate.phase_coverage`` (the
+    #: fraction of them holding at least one point).
+    phase_coverage_bins: int = 20
+    #: Most alias / next-peak candidate periods stored per period estimate.
+    max_alias_candidates: int = 5
+    #: Zero point (mag) of a night whose kept frames mostly lack a Gaia calibration and whose
+    #: telescope is not in ``telescope_zp``: robo43's ``instrumental_zp``. Stored as
+    #: ``night.zp`` with ``zp_source = 'assumed'`` when the night is loaded.
+    assumed_zp: float = 20.0
+    #: Measured zero point (mag) per telescope, used instead of ``assumed_zp`` for a night with
+    #: no Gaia calibration (``zp_source = 'measured'``). Keys are ``night.telescope`` exactly as
+    #: stored (``'T80S'``, ``'ROBO43'``). T80S 27.85: median of Gaia DR3 G minus relphot
+    #: magnitude for 200 bright isolated T80S stars (MAD-sigma 0.12); relphot magnitudes are per
+    #: 90 s exposure in the R band, matched to G at the star's best aperture with no aperture
+    #: correction. A ``telescope_zp`` in a settings file replaces this table as a whole.
+    telescope_zp: dict[str, float] = field(default_factory=lambda: {"T80S": 27.85})
+    #: Cross-candidate check of one night's transit events (``relphot db analyze``): time window
+    #: of a pair of events, as a fraction of the shorter T14 (the window is the largest of this,
+    #: ``coincidence_tc_nsigma`` combined centre-time errors and one cadence of the night).
+    coincidence_tc_frac: float = 0.1
+    #: Time window of a pair of events, in combined 1-sigma centre-time errors.
+    coincidence_tc_nsigma: float = 2.0
+    #: Two events have a similar T14 when their durations differ by less than this factor (a
+    #: duration that is only a lower limit is similar to any duration up to this factor shorter).
+    coincidence_t14_ratio: float = 1.5
+    #: Two events have a similar depth when their depths differ by less than this factor.
+    coincidence_depth_ratio: float = 2.0
+    #: An event is auto-rejected only if at least this many other events of its night coincide
+    #: with it (same centre time within the window, similar T14 and depth) ...
+    coincidence_min_similar: int = 3
+    #: ... and the binomial probability of that many coincidences by chance (events spread
+    #: uniformly over the night) is below this.
+    coincidence_max_p: float = 1e-3
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.telescope_zp, dict) or not all(
+            isinstance(k, str) for k in self.telescope_zp
+        ):
+            msg = "db.telescope_zp must be a table of telescope name -> zero point"
+            raise ConfigError(msg)
+        zps = {"assumed_zp": self.assumed_zp}
+        zps.update({f"telescope_zp[{k!r}]": v for k, v in self.telescope_zp.items()})
+        for name, value in zps.items():
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                msg = f"db.{name} must be a finite number, got {value!r}"
+                raise ConfigError(msg)
+            if not math.isfinite(value):
+                msg = f"db.{name} must be a finite number, got {value!r}"
+                raise ConfigError(msg)
+        for name in ("coincidence_t14_ratio", "coincidence_depth_ratio"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool) or not isinstance(value, int | float)
+                or not (math.isfinite(value) and value > 1)
+            ):
+                msg = f"db.{name} must be a number > 1, got {value!r}"
+                raise ConfigError(msg)
+        for name in (
+            "coincidence_tc_frac", "coincidence_tc_nsigma", "coincidence_max_p",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool) or not isinstance(value, int | float)
+                or not (math.isfinite(value) and value > 0)
+            ):
+                msg = f"db.{name} must be a positive number, got {value!r}"
+                raise ConfigError(msg)
+        if self.coincidence_max_p > 1:
+            msg = f"db.coincidence_max_p must be in (0, 1], got {self.coincidence_max_p!r}"
+            raise ConfigError(msg)
+        if self.coincidence_tc_frac > 1:
+            msg = f"db.coincidence_tc_frac must be in (0, 1], got {self.coincidence_tc_frac!r}"
+            raise ConfigError(msg)
+        value = self.coincidence_min_similar
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            msg = f"db.coincidence_min_similar must be an integer >= 1, got {value!r}"
+            raise ConfigError(msg)
+
+
+@dataclass(frozen=True, slots=True)
 class LightcurveSettings:
     """Stage-5 light curves, statistics, and best-aperture selection."""
 
@@ -301,6 +507,23 @@ class LightcurveSettings:
     keep_all_apertures_in_table: bool = False
     output_format: str = "auto"
     make_plot: bool = True
+    #: Which stars get ``lc_err`` inflated by their point-to-point excess scatter
+    #: (``err_scale = max(1, sigma_p2p / median(lc_err))``, see
+    #: :func:`relphot.lightcurve.error_inflation`): ``"none"``; ``"blended"`` (stars whose
+    #: SExtractor neighbour/blend flags are set in at least ``blend_min_frame_fraction`` of
+    #: the kept frames); ``"excess"`` (blended stars, plus any star whose measured
+    #: ``err_scale`` is at least ``err_scale_excess_min`` -- the excess is a bright-star
+    #: noise floor the formal errors lack, whether or not the star is blended); ``"all"``.
+    inflate_errors: str = "excess"
+    #: Fraction of a star's kept frames with a neighbour/blend FLAGS bit (1 or 2) at which
+    #: it counts as blended.
+    blend_min_frame_fraction: float = 0.05
+    #: ``inflate_errors = "excess"``: smallest measured ``err_scale`` that is inflated
+    #: for a star that is not blended.
+    err_scale_excess_min: float = 1.5
+    #: Fewest consecutive-epoch differences a star/aperture needs for a point-to-point
+    #: estimate; below it ``err_scale`` is 1.
+    p2p_min_pairs: int = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,7 +665,8 @@ class SearchSettings:
     cache_dir: str = "~/.cache/relphot/search"
     #: Catalogue variability-type substrings (case-insensitive, matched
     #: against each ``|``-separated token of the catalogue's own type
-    #: string) that disqualify a star from transit candidacy outright.
+    #: string) that list a star as a variable. Its transit events stay
+    #: candidates and only carry the informational ON_VARIABLE flag.
     #: A generic/weak automated classification (e.g. Gaia's own
     #: "SOLAR_LIKE" or "ROT") is deliberately absent -- low-amplitude
     #: rotational modulation does not preclude a real transiting planet,
@@ -455,6 +679,59 @@ class SearchSettings:
     def effective_min_epochs(self, n_kept: int) -> int:
         """Good-epoch cut for a night with ``n_kept`` kept frames (see ``min_epoch_fraction``)."""
         return max(int(self.min_epochs), math.ceil(self.min_epoch_fraction * n_kept), 1)
+
+
+@dataclass(frozen=True, slots=True)
+class BorderSettings:
+    """Night-level border-eligibility cut for reference and comparison stars.
+
+    Comparison and reference stars must never come from near the detector border.
+    Margins are computed per night from the measured per-night drift and telescope-
+    specific extra margins. The T80S 20 rows at top and bottom are per the user's
+    statement, not reproduced from the reduced SCI planes.
+
+    ``telescope_extra_px``: per-telescope extra margins [left, right, bottom, top] (px),
+    keys are upper-cased TELESCOP header values. List order and JSON round trip.
+    ``edge_buffer_px`` covers the largest aperture (8 px) + background mesh + rotation.
+    """
+
+    enabled: bool = True
+    edge_buffer_px: float = 30.0
+    drift_min_common_stars: int = 20
+    telescope_extra_px: dict[str, list[float]] = field(default_factory=lambda: {
+        "T80": [0.0, 0.0, 20.0, 20.0], "T80S": [0.0, 0.0, 20.0, 20.0]})
+
+
+@dataclass(frozen=True, slots=True)
+class TailSettings:
+    """Night-level isolated-dip ("tail") cut for reference and comparison stars.
+
+    A star with at least ``min_low`` epochs below ``-k_sigma`` (and ``asym_ratio`` times
+    as many below as above ``+k_sigma``) in its residual against the local median of its
+    ``n_neighbours`` nearest bright stars is withdrawn from the reference and the
+    comparison pool for the whole night; it keeps its light curve and is still searched.
+    Residuals are detrended with a running median over ``window`` epochs (an odd number;
+    a transit longer than ``window // 2`` epochs is not touched), divided by the star's
+    point-to-point sigma and by a per-frame noise factor (cloud).
+
+    ``aperture``: aperture index the screen is computed at; -1 means the default
+    aperture (1 if the night has at least two apertures, else 0). One aperture serves
+    the reference and every comparison pool, so the same stars are removed from both.
+    ``pool_min_snr``: median SNR a neighbour star needs (it must also have FLAGS == 0
+    wherever present). ``min_snr``: median SNR a star needs to be evaluated.
+    ``min_epochs``: valid epochs a star needs to be evaluated.
+    """
+
+    enabled: bool = True
+    aperture: int = -1
+    k_sigma: float = 5.0
+    min_low: int = 3
+    asym_ratio: float = 3.0
+    window: int = 7
+    n_neighbours: int = 25
+    pool_min_snr: float = 15.0
+    min_snr: float = 5.0
+    min_epochs: int = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,6 +748,9 @@ class Settings:
     decorrelation: DecorrelationSettings = field(default_factory=DecorrelationSettings)
     search: SearchSettings = field(default_factory=SearchSettings)
     multinight: MultiNightSettings = field(default_factory=MultiNightSettings)
+    db: DbSettings = field(default_factory=DbSettings)
+    border: BorderSettings = field(default_factory=BorderSettings)
+    tails: TailSettings = field(default_factory=TailSettings)
 
 
 def _build(cls: type, data: dict[str, Any], origin: str, path: str) -> Any:

@@ -1,0 +1,18 @@
+[Unit]
+Description=relphot results-database web API and front end
+After=network-online.target relphotdb-db.service
+Requires=relphotdb-db.service
+
+[Container]
+Image=localhost/relphotdb-web:latest
+ContainerName=relphotdb-web
+Network=relphotdb.network
+PublishPort=127.0.0.1:__WEB_PORT__:8050
+EnvironmentFile=%h/.config/relphot/relphotdb.env
+Environment=RELPHOT_DB_HOST=relphotdb-db RELPHOT_DB_PORT=5432
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

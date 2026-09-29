@@ -25,6 +25,16 @@ and the plain ``night_info`` metadata list. Four largely independent pieces:
   `~numpy.searchsorted` over each other night's sorted epochs (a Python loop
   over the -- few -- other nights is fine; the period axis never is).
 
+A tie can carry *loose* nights (:attr:`~relphot.multinight.NightTie.loose`, see
+:func:`~relphot.multinight.tie_loose_nights`): they are fit only to a fixed core frame
+and their offsets and errors are less trustworthy. They take part in the variability
+work -- the inter-night chi2 (with the support rule of
+:func:`compute_internight_variability`), the Lomb-Scargle periodogram, the recurrence
+of per-night variability verdicts -- but never in a transit test: :func:`bls_search`
+ignores their epochs (``epoch_mask``), :func:`cross_reference_nights` drops their
+per-night transit events (``skip_transit_nights``) and so does
+:func:`period_compatibility`'s input in :func:`run_multisearch`.
+
 :func:`relphot.cli` wires these into ``relphot multisearch``.
 """
 
@@ -68,7 +78,8 @@ __all__ = [
 
 
 def compute_internight_variability(
-    mlc: MultiNightLightCurves, settings: MultiNightSettings
+    mlc: MultiNightLightCurves, settings: MultiNightSettings,
+    loose_nights: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """B2: inter-night (long-term) variability chi2 test on nightly means.
 
@@ -79,8 +90,18 @@ def compute_internight_variability(
     the max-min spread of its nightly means. ``candidate`` requires ``p <
     internight_p_threshold`` and ``amplitude >= internight_min_amplitude_mag``.
 
+    ``loose_nights`` (bool per night of ``mlc``, e.g. ``tie.loose``) marks nights tied
+    loosely. They count in all of the above, but a star with a loose night among its
+    valid nights is a candidate only if, in addition, the same chi2 test on its core
+    nights alone (loose nights dropped) has ``p_core <
+    settings.loose_internight_support_p`` -- so a loose night alone never creates a
+    candidate, and a star with fewer than 2 core nights is never one. Stars without a
+    loose night are unaffected.
+
     Returns a dict of ``(n_global,)`` arrays: ``chi2, p, amplitude,
-    weighted_mean, eligible, candidate``.
+    weighted_mean, eligible, candidate``, and ``p_core`` (core-nights-only p-value;
+    NaN without a loose night or with fewer than 2 core nights) and ``loose_gated``
+    (would be a candidate but for the core-support rule).
     """
     night_mean_mag = mlc.night_mean_mag
     night_mean_err = mlc.night_mean_err
@@ -121,6 +142,33 @@ def compute_internight_variability(
         & np.isfinite(amplitude)
         & (amplitude >= settings.internight_min_amplitude_mag)
     )
+    p_core = np.full(n_global, np.nan)
+    loose_gated = np.zeros(n_global, dtype=bool)
+    if loose_nights is not None and np.any(loose_nights):
+        loose_col = np.asarray(loose_nights, dtype=bool)[:, None]
+        core_valid = valid & ~loose_col
+        w_core = np.where(loose_col, 0.0, w)
+        wtot_core = w_core.sum(axis=0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean_core = np.where(
+                wtot_core > 0,
+                (w_core * np.where(core_valid, night_mean_mag, 0.0)).sum(axis=0) / wtot_core,
+                np.nan,
+            )
+            chi2_core = np.nansum(
+                np.where(
+                    core_valid, ((night_mean_mag - mean_core[None, :]) / night_mean_err) ** 2, 0.0
+                ),
+                axis=0,
+            )
+        n_core_nights = core_valid.sum(axis=0)
+        enough = n_core_nights >= 2
+        if np.any(enough):
+            p_core[enough] = scipy_stats.chi2.sf(chi2_core[enough], n_core_nights[enough] - 1)
+        has_loose = (valid & loose_col).any(axis=0)
+        supported = np.isfinite(p_core) & (p_core < settings.loose_internight_support_p)
+        loose_gated = candidate & has_loose & ~supported
+        candidate = candidate & ~loose_gated
     return {
         "chi2": chi2,
         "p": p,
@@ -128,6 +176,8 @@ def compute_internight_variability(
         "weighted_mean": weighted_mean,
         "eligible": eligible,
         "candidate": candidate,
+        "p_core": p_core,
+        "loose_gated": loose_gated,
     }
 
 
@@ -168,10 +218,13 @@ def _local_column(
 
 def cross_reference_nights(
     night_info: list[dict], xmatch: NightCrossMatch,
+    skip_transit_nights: np.ndarray | None = None,
 ) -> CrossReference:
     """Read each night's per-night search metrics (if present) back onto the global list.
 
     Reads ``lc/night_lc_search_metrics.parquet`` under each night's directory.
+    ``skip_transit_nights`` (bool per night, e.g. ``tie.loose``) drops those nights'
+    per-night transit events from ``events``; their variability verdicts still count.
 
     A missing or unreadable file logs a warning and leaves that night out
     (its columns stay NaN/empty everywhere) -- the rest still runs.
@@ -259,7 +312,8 @@ def cross_reference_nights(
                 gaia_id[g] = gaia_id[g] or gaia_local[local]
 
         transit_here = np.zeros(n_global, dtype=bool)
-        transit_here[present] = transit_cand_local[local_present]
+        if skip_transit_nights is None or not skip_transit_nights[n]:
+            transit_here[present] = transit_cand_local[local_present]
         for g in np.nonzero(transit_here)[0]:
             local = idx_n[g]
             depth = float(depth_local[local])
@@ -644,8 +698,14 @@ def commensurate_periods(
 
 def bls_search(
     mlc: MultiNightLightCurves, star_ids: np.ndarray, settings: MultiNightSettings,
+    epoch_mask: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """B6: astropy BoxLeastSquares on ``flux_norm`` for each star in ``star_ids``.
+
+    ``epoch_mask`` (bool per epoch of ``mlc``) keeps epochs out of the search entirely
+    -- the loose nights' (see the module docstring); the night-span cap, the
+    ``min_nights_periodic`` requirement and ``nights_in_transit`` then count the
+    remaining nights only.
 
     No per-star free detrending before the search (this project's
     transit-safe rule): only the per-night median normalisation already in
@@ -671,7 +731,10 @@ def bls_search(
     night_ids_all = np.unique(mlc.night_of_frame)
     night_spans = []
     for nid in night_ids_all:
-        t_n = mlc.bjd_tdb[mlc.night_of_frame == nid]
+        in_night = mlc.night_of_frame == nid
+        if epoch_mask is not None:
+            in_night = in_night & epoch_mask
+        t_n = mlc.bjd_tdb[in_night]
         if t_n.size >= 2:
             night_spans.append(float(t_n.max() - t_n.min()))
     median_night_span = float(np.median(night_spans)) if night_spans else np.nan
@@ -705,7 +768,14 @@ def bls_search(
         e = mlc.flux_norm_err[g].astype(np.float64)
         t_arr = mlc.bjd_tdb
         good = np.isfinite(t_arr) & np.isfinite(y) & np.isfinite(e) & (e > 0)
+        if epoch_mask is not None:
+            good &= epoch_mask
         if np.count_nonzero(good) < 20:
+            continue
+        if (
+            epoch_mask is not None
+            and np.unique(mlc.night_of_frame[good]).size < settings.min_nights_periodic
+        ):
             continue
         tt, yy, ee = t_arr[good], y[good], e[good]
         baseline = float(tt.max() - tt.min())
@@ -1099,9 +1169,16 @@ def run_multisearch(
     xmatch: NightCrossMatch, tie: NightTie, mlc: MultiNightLightCurves, night_info: list[dict],
     settings: MultiNightSettings,
 ) -> dict:
-    """B2-B6, assembled: the whole cross-night search pipeline on one already-tied ``.npz``."""
-    internight = compute_internight_variability(mlc, settings)
-    cross_ref = cross_reference_nights(night_info, xmatch)
+    """B2-B6, assembled: the whole cross-night search pipeline on one already-tied ``.npz``.
+
+    Nights ``tie.loose`` marks stay out of every transit test (BLS, per-night transit
+    events, period compatibility) and take part in the variability ones; see the
+    module docstring.
+    """
+    loose = np.asarray(tie.loose, dtype=bool)
+    transit_epoch = ~loose[mlc.night_of_frame] if np.any(loose) else None
+    internight = compute_internight_variability(mlc, settings, loose)
+    cross_ref = cross_reference_nights(night_info, xmatch, loose)
 
     star_mask = select_periodogram_stars(mlc, internight, cross_ref, settings)
     star_ids = np.nonzero(star_mask)[0]
@@ -1111,7 +1188,7 @@ def run_multisearch(
     )
 
     ls_result = combined_periodogram(tie, mlc, star_ids, settings)
-    bls_result = bls_search(mlc, star_ids, settings)
+    bls_result = bls_search(mlc, star_ids, settings, transit_epoch)
 
     n_global = xmatch.ra.shape[0]
 
@@ -1137,7 +1214,8 @@ def run_multisearch(
         "candidate": _scatter(bls_result["candidate"], fill=False, dtype=bool),
     }
 
-    finite_bjd = mlc.bjd_tdb[np.isfinite(mlc.bjd_tdb)]
+    t_transit = mlc.bjd_tdb if transit_epoch is None else mlc.bjd_tdb[transit_epoch]
+    finite_bjd = t_transit[np.isfinite(t_transit)]
     baseline_days = float(finite_bjd.max() - finite_bjd.min()) if finite_bjd.size else np.nan
 
     period_compat: dict[int, PeriodCompatibility] = {}
@@ -1160,8 +1238,12 @@ def run_multisearch(
         periods = _period_grid_for_event(duration_ref_days, baseline_days, settings)
         flux_g = mlc.flux_norm[g].astype(np.float64)
         err_g = mlc.flux_norm_err[g].astype(np.float64)
+        night_pc = mlc.night_of_frame
+        if transit_epoch is not None:
+            flux_g, err_g = flux_g[transit_epoch], err_g[transit_epoch]
+            night_pc = night_pc[transit_epoch]
         pc = period_compatibility(
-            mlc.bjd_tdb, flux_g, err_g, mlc.night_of_frame,
+            t_transit, flux_g, err_g, night_pc,
             t0_ref, depth_ref, sigma_depth_ref, duration_ref_days, periods, settings,
         )
         period_compat[int(g)] = pc

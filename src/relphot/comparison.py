@@ -71,7 +71,11 @@ class ComparisonResult:
 
 
 def select_comparison_pool(
-    night: MatchedNight, variable_mask: np.ndarray, settings: Settings, aper: int
+    night: MatchedNight,
+    variable_mask: np.ndarray,
+    settings: Settings,
+    aper: int,
+    star_eligible: np.ndarray | None = None,
 ) -> np.ndarray:
     """Boolean mask, ``(n_stars,)``, of stars usable as comparison candidates.
 
@@ -79,11 +83,37 @@ def select_comparison_pool(
     in every frame it is present in; a NaN-aware median SNR >=
     ``settings.comparison.min_snr``; (optionally) no other master star within
     ``settings.comparison.isolation_radius_arcsec``; is not flagged in
-    ``variable_mask``; and finite, positive flux at aperture ``aper`` wherever present.
+    ``variable_mask``; finite, positive flux at aperture ``aper`` wherever present;
+    and passes ``star_eligible`` filter.
+
+    Parameters
+    ----------
+    night : MatchedNight
+        The night
+    variable_mask : np.ndarray
+        (n_stars,) bool mask of known variables
+    settings : Settings
+        Relphot settings
+    aper : int
+        Aperture index
+    star_eligible : np.ndarray | None, optional
+        (n_stars,) bool mask of eligible stars (border and tail cuts).
+        If None, computes from star_eligibility(night, settings).eligible.
+        Raises ValueError if shape mismatch.
     """
     catalog = settings.catalog
     comp = settings.comparison
     n = night.n_stars
+
+    if star_eligible is None:
+        from relphot.eligibility import star_eligibility
+        star_eligible = star_eligibility(night, settings).eligible
+    else:
+        star_eligible = np.asarray(star_eligible, dtype=bool)
+        if star_eligible.shape != (n,):
+            raise ValueError(
+                f"star_eligible shape {star_eligible.shape} != ({n},)"
+            )
 
     presence_ok = night.presence >= catalog.min_presence
 
@@ -116,10 +146,18 @@ def select_comparison_pool(
     flux_ok = np.all(np.where(present, np.isfinite(flux_a) & (flux_a > 0), True), axis=1)
 
     not_variable = ~np.asarray(variable_mask, dtype=bool)
+    border_ok = np.asarray(star_eligible, dtype=bool)
 
-    pool_mask = presence_ok & flags_ok & snr_ok & isolated & not_variable & flux_ok
+    pool_mask = (
+        presence_ok & flags_ok & snr_ok & isolated & not_variable & flux_ok & border_ok
+    )
+    n_removed_border = int((~border_ok).sum())
     logger.info(
-        "comparison pool: %d/%d stars (aperture %d)", int(pool_mask.sum()), n, aper
+        "comparison pool: %d/%d stars (aperture %d)%s",
+        int(pool_mask.sum()),
+        n,
+        aper,
+        (f"; {n_removed_border} removed by border/tail cut" if n_removed_border > 0 else ""),
     )
     return pool_mask
 
@@ -130,12 +168,29 @@ def select_comparison_stars(
     reference_result: ReferenceResult,
     variable_mask: np.ndarray,
     settings: Settings,
+    star_eligible: np.ndarray | None = None,
 ) -> ComparisonResult:
     """Per-tile comparison-star selection and ensemble construction.
 
     For each (tile, aperture) pair, builds an ensemble from comparison stars
     selected via iterative relaxation. Returns a ComparisonResult with per-tile
     ensembles, per-star scatter, and selection masks.
+
+    Parameters
+    ----------
+    night : MatchedNight
+        The night
+    tilemap : TileMap
+        Tile map
+    reference_result : ReferenceResult
+        Reference result
+    variable_mask : np.ndarray
+        (n_stars,) bool mask of known variables
+    settings : Settings
+        Relphot settings
+    star_eligible : np.ndarray | None, optional
+        (n_stars,) bool mask of eligible stars; if None, computed once
+        from star_eligibility (border and tail cuts); passed to all pool selections.
     """
     comp = settings.comparison
     method = comp.ensemble_statistic
@@ -149,6 +204,11 @@ def select_comparison_stars(
     n_stars = night.n_stars
     n_aper = night.n_aper
 
+    # Compute star_eligible once if None (border and tail cuts)
+    if star_eligible is None:
+        from relphot.eligibility import star_eligibility
+        star_eligible = star_eligibility(night, settings).eligible
+
     # Outputs
     mask = np.zeros((n_stars, n_aper), dtype=bool)
     ensemble = np.full((n_tiles, n_frames, n_aper), np.nan)
@@ -160,7 +220,7 @@ def select_comparison_stars(
 
     # Process per aperture, compute pool once
     for a in range(n_aper):
-        pool_global = select_comparison_pool(night, variable_mask, settings, a)
+        pool_global = select_comparison_pool(night, variable_mask, settings, a, star_eligible)
 
         # Process per tile
         for t in range(n_tiles):

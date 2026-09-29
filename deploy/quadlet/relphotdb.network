@@ -1,0 +1,7 @@
+[Unit]
+Description=relphot results-database network
+
+[Network]
+
+[Install]
+WantedBy=default.target

@@ -28,6 +28,7 @@ from relphot.catalogs import (
 from relphot.comparison import select_comparison_stars
 from relphot.config import Settings, load_settings
 from relphot.cotrend import compute_cbvs, detect_systematic_frames, select_star_epochs
+from relphot.eligibility import star_eligibility
 from relphot.exceptions import ComparisonError, RelphotError
 from relphot.ingest import read_catalogs
 from relphot.io import (
@@ -46,6 +47,7 @@ from relphot.match import match_night
 from relphot.multinight import (
     build_multinight_lightcurves,
     check_compatible,
+    core_crossmatch,
     crossmatch_nights,
     load_multinight,
     load_night_products,
@@ -55,6 +57,8 @@ from relphot.multinight import (
     save_multinight,
     save_multinight_tables,
     save_tie_report,
+    split_loose_nights,
+    tie_loose_nights,
     tie_nights,
 )
 from relphot.multinight_search import (
@@ -80,6 +84,7 @@ from relphot.transit_search import (
     FLAG_NEIGHBOUR_BLEND,
     FLAG_TOO_DEEP,
     fit_nuisance_model,
+    flag_on_variable,
     flags_to_string,
     plot_transit_candidate,
     search_one_star,
@@ -250,7 +255,10 @@ def _run_reference(args: argparse.Namespace) -> int:
     t1 = time.monotonic()
     logger.info("variables: %.2f s (%d flagged)", t1 - t0, int(variable_mask.sum()))
 
-    candidates = select_candidates(night, variable_mask, settings, aper)
+    eligibility = star_eligibility(night, settings)
+    candidates = select_candidates(
+        night, variable_mask, settings, aper, star_eligible=eligibility.eligible
+    )
 
     try:
         tilemap = build_tilemap(night, candidates, settings)
@@ -291,6 +299,10 @@ def _run_reference(args: argparse.Namespace) -> int:
     print(f"stars: {night.n_stars}, tiles: {tilemap.n_tiles}, aperture: {aper}")
     print(f"candidates: {int(candidates.sum())}")
     print(f"frames kept: {n_kept}/{n_total}")
+    n_border_ineligible = int((~eligibility.border.eligible).sum())
+    print(f"border-ineligible stars: {n_border_ineligible}")
+    print(f"tailed stars (excluded from reference and comparison): "
+          f"{int(eligibility.tails.tailed.sum())}")
     print(f"wrote {out_path}")
     print(f"wrote {tiles_csv}")
     print(f"wrote {reference_csv}")
@@ -365,6 +377,12 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
             lightcurve=replace(settings.lightcurve, make_plot=False),
         )
 
+    if getattr(args, "inflate_errors", None):
+        settings = replace(
+            settings,
+            lightcurve=replace(settings.lightcurve, inflate_errors=args.inflate_errors),
+        )
+
     t0 = time.monotonic()
 
     # Variable mask
@@ -376,10 +394,14 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
     t1 = time.monotonic()
     logger.info("variables: %.2f s (%d flagged)", t1 - t0, int(variable_mask.sum()))
 
+    # Border and tail eligibility (the same night-level mask _run_reference applied)
+    eligibility = star_eligibility(night, settings)
+
     # Comparison stars
     try:
         comparison_result = select_comparison_stars(
-            night, tilemap, reference_result, variable_mask, settings
+            night, tilemap, reference_result, variable_mask, settings,
+            star_eligible=eligibility.eligible,
         )
     except ComparisonError:
         logger.exception("comparison star selection failed")
@@ -388,12 +410,20 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
     logger.info("comparison: %.2f s", t2 - t1)
 
     # Light curves
-    lc_result = compute_light_curves(night, tilemap, reference_result, comparison_result, settings)
+    try:
+        lc_result = compute_light_curves(
+            night, tilemap, reference_result, comparison_result, settings
+        )
+    except RelphotError:
+        logger.exception("light curve extraction failed")
+        return 1
     t3 = time.monotonic()
     logger.info("light curves: %.2f s", t3 - t2)
 
     # Star statistics
-    star_stats = compute_star_stats(lc_result)
+    star_stats = compute_star_stats(
+        lc_result, near_edge=~eligibility.border.eligible, tailed=eligibility.tails.tailed
+    )
     t4 = time.monotonic()
     logger.info("star stats: %.2f s", t4 - t3)
 
@@ -528,6 +558,14 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
     print(f"comparison count range: {int(n_comp_min)}-{int(n_comp_max)}")
     print(f"best aperture histogram: {best_hist}")
     print(f"bright-star floor: {bright_floor_str}")
+    if lc_result.err_scale is not None:
+        scaled = lc_result.err_scale[np.arange(night.n_stars), np.maximum(star_best_aper, 0)]
+        scaled = scaled[(star_best_aper >= 0) & (scaled > 1.0)]
+        print(
+            f"error inflation ({settings.lightcurve.inflate_errors}): {scaled.size} stars scaled"
+            + (f", median factor {float(np.median(scaled)):.2f}" if scaled.size else "")
+            + f", {int(lc_result.blended.sum())} blended"
+        )
     print(f"wrote {out_path}")
     print(f"wrote {lc_table_path}")
     print(f"wrote {starstats_path}")
@@ -767,12 +805,12 @@ def _run_search(args: argparse.Namespace) -> int:
     )
     transit_result.flags[blend] |= FLAG_NEIGHBOUR_BLEND
 
-    # Route TOO_DEEP transit events to variables (as eclipsing), and exclude
-    # any star the variability search independently calls variable -- or that
-    # a catalogue already lists as a known variable, whether or not this
-    # night's own statistics reach significance for it -- from the transit
-    # candidate list. A real periodic/eclipsing variable is not a
-    # single-event transit, whichever check happened to catch it.
+    # Route TOO_DEEP transit events to variables (as eclipsing). A star the
+    # variability search independently calls variable -- or that a catalogue
+    # already lists as a known variable of a disqualifying type -- is also
+    # listed as a variable, but it stays a transit candidate: a planet host can
+    # be variable too, and a multi-planet system can show events of different
+    # depth. Its transit events only carry the informational ON_VARIABLE flag.
     variable_candidate = variability_result.variable_candidate.copy()
     variable_class = list(variability_result.variable_class)
     too_deep = (transit_result.flags & FLAG_TOO_DEEP).astype(bool) & transit_result.searched
@@ -793,7 +831,7 @@ def _run_search(args: argparse.Namespace) -> int:
     for i in np.nonzero(known_only)[0]:
         variable_class[i] = "known (catalogue only)"
 
-    final_transit_candidate = transit_result.candidate & ~variable_candidate
+    flag_on_variable(transit_result.flags, transit_result.candidate, variable_candidate)
 
     min_ep = settings.search.effective_min_epochs(int(np.count_nonzero(frame_kept)))
 
@@ -806,7 +844,7 @@ def _run_search(args: argparse.Namespace) -> int:
 
     # --- transit candidates ---
     transit_rows = []
-    cand_idx = np.nonzero(final_transit_candidate)[0]
+    cand_idx = np.nonzero(transit_result.candidate)[0]
     for i in cand_idx:
         t_tile = int(tilemap.core_tile[i])
         pool = np.nonzero(
@@ -1030,10 +1068,23 @@ def _run_multinight(args: argparse.Namespace) -> int:
         logger.exception("failed to load config %s", args.config)
         return 1
 
-    if args.aper is not None:
-        settings = replace(settings, multinight=replace(settings.multinight, aperture=args.aper))
-    if args.anchor is not None:
-        settings = replace(settings, multinight=replace(settings.multinight, anchor=args.anchor))
+    try:
+        if args.aper is not None:
+            settings = replace(
+                settings, multinight=replace(settings.multinight, aperture=args.aper)
+            )
+        if args.anchor is not None:
+            settings = replace(
+                settings, multinight=replace(settings.multinight, anchor=args.anchor)
+            )
+        if args.loose is not None:
+            loose_labels = tuple(s for s in args.loose.split(",") if s)
+            settings = replace(
+                settings, multinight=replace(settings.multinight, loose_nights=loose_labels)
+            )
+    except RelphotError:
+        logger.exception("invalid multinight option")
+        return 1
 
     if args.labels is not None:
         labels: list[str | None] = args.labels.split(",")
@@ -1053,9 +1104,17 @@ def _run_multinight(args: argparse.Namespace) -> int:
             for d, lbl in zip(args.night_dirs, labels, strict=True)
         ]
         nights = check_compatible(nights)
-        anchor_index = resolve_anchor_index(nights, settings.multinight.anchor)
+        core, loose = split_loose_nights(nights, settings.multinight.loose_nights)
+        anchor_index = resolve_anchor_index(core, settings.multinight.anchor)
+        nights = core + loose
         xmatch = crossmatch_nights(nights, anchor_index, settings.multinight.match_radius_arcsec)
-        tie = tie_nights(nights, xmatch, anchor_index, settings.multinight)
+        if loose:
+            tie_core = tie_nights(
+                core, core_crossmatch(xmatch, len(core)), anchor_index, settings.multinight
+            )
+            tie = tie_loose_nights(core, loose, xmatch, tie_core, settings.multinight)
+        else:
+            tie = tie_nights(nights, xmatch, anchor_index, settings.multinight)
         mlc = build_multinight_lightcurves(nights, xmatch, tie, settings.multinight)
     except RelphotError:
         logger.exception("multinight processing failed")
@@ -1091,10 +1150,11 @@ def _run_multinight(args: argparse.Namespace) -> int:
         chi2_val = float(tie.chi2_after[n, a_report])
         chi2_holdout_val = float(tie.chi2_holdout[n, a_report])
         logger.info(
-            "night %s: frames kept %d/%d, stars %d, matched %d, tie stars %d, "
+            "night %s%s: frames kept %d/%d, stars %d, matched %d, tie stars %d, "
             "resid bright %.2f mmag, floor(bright) %.2f mmag, chi2_after %.2f, "
             "chi2_holdout %.2f",
-            night.label, int(np.count_nonzero(night.frame_kept)), night.n_frames, night.n_stars,
+            night.label, " (loose)" if tie.loose[n] else "",
+            int(np.count_nonzero(night.frame_kept)), night.n_frames, night.n_stars,
             int(xmatch.n_matched[n]), int(tie.n_tie[n, a_report]),
             float(tie.resid_mad_bright[n, a_report]) * 1000.0,
             floor_bright_mmag if np.isfinite(floor_bright_mmag) else float("nan"),
@@ -1209,6 +1269,236 @@ def _run_multisearch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_db_init(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect, init_schema
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    try:
+        applied = init_schema(conn)
+    finally:
+        conn.close()
+
+    if applied:
+        print(f"applied migrations: {', '.join(str(v) for v in applied)}")
+    else:
+        print("schema already up to date")
+    return 0
+
+
+def _run_db_load_night(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    if args.label is not None and len(args.night_dirs) > 1:
+        logger.error("--label may only be used with a single NIGHT_RELPHOT_DIR")
+        return 1
+
+    try:
+        from relphot.db import connect, load_night
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    exit_code = 0
+    try:
+        for night_dir in args.night_dirs:
+            try:
+                report = load_night(
+                    conn, night_dir, telescope=args.telescope, label=args.label,
+                    lc_stem=args.lc_stem, settings=settings,
+                )
+            except (OSError, RelphotError):
+                logger.exception("failed to load %s", night_dir)
+                exit_code = 1
+                continue
+            print(
+                f"{night_dir}: night_id={report.night_id} telescope={report.telescope} "
+                f"label={report.label} frames={report.n_kept}/{report.n_frames} kept "
+                f"stars={report.n_stars} passed_cut={report.n_passed_cut} "
+                f"forced={report.n_candidates_forced} stored={report.n_stored} "
+                f"objects(new={report.n_new_objects},matched={report.n_matched_objects}) "
+                f"lightcurve(stars={report.lightcurve_stars},points={report.lightcurve_points}) "
+                f"detections(transit={report.n_transit_detections},"
+                f"variable={report.n_variable_detections}) "
+                f"catalog_matches={report.n_catalog_matches} "
+                f"elapsed={report.elapsed_s:.1f}s"
+            )
+    finally:
+        conn.close()
+    return exit_code
+
+
+def _run_db_load_multinight(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect, load_multinight
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    exit_code = 0
+    try:
+        report = load_multinight(
+            conn, args.stem, search_dir=args.search_dir, settings=settings,
+        )
+    except (OSError, RelphotError):
+        logger.exception("failed to load %s", args.stem)
+        exit_code = 1
+    finally:
+        conn.close()
+    if exit_code:
+        return exit_code
+
+    print(
+        f"{args.stem}: mn_run_id={report.mn_run_id} labels={','.join(report.labels)} "
+        f"anchor={report.anchor} tie_rows={report.n_tie_rows} "
+        f"objects_mapped={report.n_objects_mapped} "
+        f"globals_unmapped={report.n_globals_unmapped} conflicts={report.n_conflicts} "
+        f"detections(internight={report.n_detections_internight},"
+        f"ls_periodic={report.n_detections_ls_periodic},"
+        f"bls={report.n_detections_bls},"
+        f"recurrent={report.n_detections_recurrent}) "
+        f"elapsed={report.elapsed_s:.1f}s"
+    )
+    return 0
+
+
+def _run_db_analyze(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import analyze, connect
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    try:
+        report = analyze(
+            conn, all_candidates=args.all, obj_ids=args.obj_id, settings=settings,
+            workers=args.workers,
+        )
+    finally:
+        conn.close()
+
+    print(
+        f"objects={report.n_objects} ls_night={report.n_ls_night} "
+        f"ls_combined={report.n_ls_combined} bls={report.n_bls} "
+        f"transit_shapes={report.n_transit_shapes} transit_matches={report.n_transit_matches} "
+        f"period_estimates={report.n_period_estimates} "
+        f"coincidence_rejected={report.n_coincidence_rejected} "
+        f"coincidence_nights={report.n_coincidence_nights} "
+        f"coarsened={report.n_coarsened} elapsed={report.elapsed_s:.1f}s"
+    )
+    return 0
+
+
+def _run_db_reprocess(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect, reprocess
+        from relphot.db.connect import resolve_dsn
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    import signal
+    import threading
+
+    import psycopg
+
+    stop = threading.Event()
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, lambda _signum, _frame: stop.set())
+
+    try:
+        conn = connect(args.dsn)
+        listen_conn = (
+            psycopg.connect(resolve_dsn(args.dsn), autocommit=True) if args.watch else None
+        )
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    try:
+        report = reprocess(
+            conn, settings=settings, watch=args.watch, listen_conn=listen_conn,
+            poll_seconds=args.poll_seconds, stop=stop,
+        )
+    finally:
+        conn.close()
+        if listen_conn is not None:
+            listen_conn.close()
+
+    print(
+        f"requests done={report.n_done} failed={report.n_failed} elapsed={report.elapsed_s:.1f}s"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="relphot")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1283,6 +1573,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-decorrelation", action="store_true",
         help="disable decorrelation (output lc = lc_raw)",
     )
+    lightcurves.add_argument(
+        "--inflate-errors", choices=["none", "blended", "excess", "all"], default=None,
+        help=(
+            "multiply lc_err by the measured point-to-point excess scatter for: no star, "
+            "blended stars, blended stars and any star with a significant excess, or every "
+            "star (default: the [lightcurve] inflate_errors setting, 'excess')"
+        ),
+    )
     lightcurves.set_defaults(func=_run_lightcurves)
 
     search = subparsers.add_parser(
@@ -1326,6 +1624,11 @@ def build_parser() -> argparse.ArgumentParser:
     multinight.add_argument(
         "--aper", type=int, default=None, help="override settings.multinight.aperture",
     )
+    multinight.add_argument(
+        "--loose", default=None,
+        help="comma-separated night labels to tie loosely to the other nights' fixed frame "
+        "(overrides settings.multinight.loose_nights)",
+    )
     multinight.add_argument("--config", type=Path, default=None, help="TOML settings file")
     multinight.add_argument(
         "--format", choices=["auto", "parquet", "fits"], default="auto",
@@ -1358,6 +1661,133 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum candidate PNGs to write, highest inter-night chi2 first (default: 50)",
     )
     multisearch.set_defaults(func=_run_multisearch)
+
+    db = subparsers.add_parser("db", help="relphot results-database operations")
+    db_subparsers = db.add_subparsers(dest="db_command", required=True)
+
+    db_init = db_subparsers.add_parser(
+        "init", help="create or upgrade the results-database schema"
+    )
+    db_init.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_init.set_defaults(func=_run_db_init)
+
+    db_load_night = db_subparsers.add_parser(
+        "load-night", help="load one or more nights' relphot outputs into the results database"
+    )
+    db_load_night.add_argument(
+        "night_dirs", nargs="+", metavar="NIGHT_RELPHOT_DIR",
+        help="a night's relphot/ directory (holding night.npz, ref.npz, lc/)",
+    )
+    db_load_night.add_argument(
+        "--telescope", default=None,
+        help="telescope name (default: inferred from a '<TEL>_reduced' path component)",
+    )
+    db_load_night.add_argument(
+        "--label", default=None,
+        help=(
+            "night label (default: the night directory's parent directory name); "
+            "only allowed with a single NIGHT_RELPHOT_DIR"
+        ),
+    )
+    db_load_night.add_argument(
+        "--lc-stem", default=None,
+        help=(
+            "lc/<stem>_*.parquet stem (default: discovered; required if more than "
+            "one *_starstats.parquet is present)"
+        ),
+    )
+    db_load_night.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_load_night.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.search/settings.db drive the noise cut)",
+    )
+    db_load_night.set_defaults(func=_run_db_load_night)
+
+    db_analyze = db_subparsers.add_parser(
+        "analyze", help="recompute periodograms and PERIOD for candidate objects"
+    )
+    db_analyze.add_argument(
+        "--all", action="store_true",
+        help="analyse every candidate object, not just those needing re-analysis",
+    )
+    db_analyze.add_argument(
+        "--obj-id", type=int, action="append", default=None, dest="obj_id",
+        help="analyse only this object id (repeatable); overrides --all and the default selection",
+    )
+    db_analyze.add_argument(
+        "--workers", type=int, default=None,
+        help="parallel worker processes (default: the number of CPUs)",
+    )
+    db_analyze.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_analyze.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.db drives the period grids and thresholds)",
+    )
+    db_analyze.set_defaults(func=_run_db_analyze)
+
+    db_reprocess = db_subparsers.add_parser(
+        "reprocess",
+        help="work off the web's user-guided reprocess requests (period / transit guesses)",
+    )
+    mode = db_reprocess.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--once", action="store_true",
+        help="work off the queued requests and exit (the default)",
+    )
+    mode.add_argument(
+        "--watch", action="store_true",
+        help=(
+            "keep running: wait for new requests (LISTEN relphot_reprocess, with a "
+            "--poll-seconds fallback) until SIGTERM / SIGINT"
+        ),
+    )
+    db_reprocess.add_argument(
+        "--poll-seconds", type=float, default=60.0,
+        help="--watch: poll the queue at least this often, in seconds (default: 60)",
+    )
+    db_reprocess.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_reprocess.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.db drives the period grids and windows)",
+    )
+    db_reprocess.set_defaults(func=_run_db_reprocess)
+
+    db_load_multinight = db_subparsers.add_parser(
+        "load-multinight",
+        help="load one multi-night tie run's tie rows and detections into the results database",
+    )
+    db_load_multinight.add_argument(
+        "stem", metavar="STEM",
+        help="multi-night output stem passed to `relphot multinight --out` (STEM.npz)",
+    )
+    db_load_multinight.add_argument(
+        "--search-dir", default=None,
+        help=(
+            "output directory of a matching `relphot multisearch` run "
+            "(multinight_search_metrics.parquet); omit to skip multi-night detections"
+        ),
+    )
+    db_load_multinight.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_load_multinight.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.db drives the BLS/LS PERIOD thresholds)",
+    )
+    db_load_multinight.set_defaults(func=_run_db_load_multinight)
 
     return parser
 

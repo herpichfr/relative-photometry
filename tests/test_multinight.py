@@ -19,19 +19,23 @@ import pytest
 
 from relphot.config import MultiNightSettings, settings_to_dict
 from relphot.decorrelate import compute_crowding
-from relphot.exceptions import MultiNightError
+from relphot.exceptions import ConfigError, MultiNightError
 from relphot.multinight import (
     NightCrossMatch,
     NightProducts,
     build_multinight_lightcurves,
     check_compatible,
+    core_crossmatch,
     crossmatch_nights,
+    evaluate_zero_point,
     load_multinight,
     resolve_anchor_index,
     save_floor_report,
     save_multinight,
     save_multinight_tables,
     save_tie_report,
+    split_loose_nights,
+    tie_loose_nights,
     tie_nights,
 )
 from relphot.numeric import nanmedian_quiet
@@ -509,7 +513,7 @@ def test_save_load_round_trip(tmp_path) -> None:
         "coef", "xi", "eta", "mag0", "zp", "mean_mag", "night_mag", "night_mag_err",
         "tie_star", "rejected", "floor_mag_centres", "floor", "n_tie", "resid_mad",
         "resid_mad_bright", "chi2_after", "chi2_holdout", "chi2_holdout_bins", "n_iter",
-        "seeing_coef", "seeing_mag0", "seeing_crowd0", "night_fwhm", "crowding",
+        "seeing_coef", "seeing_mag0", "seeing_crowd0", "night_fwhm", "crowding", "loose",
     ):
         np.testing.assert_array_equal(getattr(tie, field_name), getattr(tie2, field_name))
 
@@ -763,3 +767,184 @@ def test_seeing_term_two_nights_degeneracy_warning(caplog) -> None:
     # Still runs and produces a usable (finite) crowding-surface coefficient.
     cc_index = tie_two.seeing_basis_terms.index("cc")
     assert np.isfinite(tie_two.seeing_coef[0, cc_index])
+
+
+# --------------------------------------------------------------------------
+# loose nights: tied to the fixed core frame, never moving the core tie
+# --------------------------------------------------------------------------
+
+_LOOSE_FLOOR_MMAG = 15.0
+#: linear-only truth for the loose night (the loose surface is degree 1 / 1); no poly2 terms
+_LOOSE_ZP_COEFS = (0.02, 0.03, -0.02, 0.0, 0.0, 0.0, 0.002, 0.0)
+
+
+def _loose_scenario(seed: int = 21, missing_frac: float = 0.1):
+    """Three core nights and a fourth, noisier, night with a linear zero-point surface."""
+    zp_coefs = [(0.0,) * 8]
+    for n in (1, 2):
+        rng = np.random.default_rng(seed * 100 + n)
+        cap = np.array([0.010, 0.020, 0.020, 0.040, 0.040, 0.040, 0.003, 0.0011])
+        zp_coefs.append(tuple(rng.uniform(0.3, 1.0, 8) * cap * rng.choice([-1.0, 1.0], 8)))
+    zp_coefs.append(_LOOSE_ZP_COEFS)
+    nights, truth = _synthetic_tie_scenario(
+        n_nights=4, n_stars=4000, seed=seed, zp_coefs=zp_coefs,
+        floor_mmag=[3.0, 3.0, 3.0, _LOOSE_FLOOR_MMAG], missing_frac=missing_frac,
+    )
+    return nights, truth
+
+
+def _tie_core_and_loose(nights, settings, n_core: int = 3):
+    core, loose = split_loose_nights(nights, (nights[-1].label,))
+    assert len(core) == n_core
+    anchor_index = resolve_anchor_index(core, "auto")
+    xmatch = crossmatch_nights(core + loose, anchor_index, 1.0)
+    tie_core = tie_nights(core, core_crossmatch(xmatch, n_core), anchor_index, settings)
+    tie = tie_loose_nights(core, loose, xmatch, tie_core, settings)
+    return core, loose, xmatch, tie_core, tie
+
+
+def test_loose_night_leaves_the_core_tie_bit_identical() -> None:
+    nights, _truth = _loose_scenario()
+    settings = MultiNightSettings()
+    core, loose, xmatch, _tie_core, tie = _tie_core_and_loose(nights, settings)
+
+    # the core alone, by the plain path a run without a loose night takes
+    anchor_index = resolve_anchor_index(core, "auto")
+    xmatch_alone = crossmatch_nights(core, anchor_index, 1.0)
+    tie_alone = tie_nights(core, xmatch_alone, anchor_index, settings)
+    mlc_alone = build_multinight_lightcurves(core, xmatch_alone, tie_alone, settings)
+    mlc = build_multinight_lightcurves(core + loose, xmatch, tie, settings)
+
+    n_g = xmatch_alone.ra.shape[0]
+    assert xmatch.ra.shape[0] >= n_g
+    np.testing.assert_array_equal(xmatch.index[:3, :n_g], xmatch_alone.index)
+    np.testing.assert_array_equal(tie.loose, [False, False, False, True])
+    assert tie.anchor_index == tie_alone.anchor_index
+
+    for name in ("zp", "night_mag", "night_mag_err", "tie_star"):
+        np.testing.assert_array_equal(
+            getattr(tie, name)[:3, :n_g], getattr(tie_alone, name), err_msg=name
+        )
+    for name in ("mean_mag", "rejected", "xi", "eta", "crowding"):
+        np.testing.assert_array_equal(
+            getattr(tie, name)[:n_g], getattr(tie_alone, name), err_msg=name
+        )
+    for name in (
+        "coef", "floor", "n_tie", "resid_mad", "resid_mad_bright", "chi2_after",
+        "chi2_holdout", "chi2_holdout_bins", "night_fwhm",
+    ):
+        np.testing.assert_array_equal(
+            getattr(tie, name)[:3], getattr(tie_alone, name), err_msg=name
+        )
+    np.testing.assert_array_equal(tie.floor_mag_centres, tie_alone.floor_mag_centres)
+    np.testing.assert_array_equal(tie.seeing_coef, tie_alone.seeing_coef)
+
+    np.testing.assert_array_equal(mlc.aperture[:n_g], mlc_alone.aperture)
+    np.testing.assert_array_equal(mlc.night_mean_mag[:3, :n_g], mlc_alone.night_mean_mag)
+    np.testing.assert_array_equal(mlc.night_mean_err[:3, :n_g], mlc_alone.night_mean_err)
+    np.testing.assert_array_equal(mlc.mean_mag[:n_g], mlc_alone.mean_mag)
+    n_epochs_core = mlc_alone.bjd_tdb.shape[0]
+    np.testing.assert_array_equal(mlc.mag[:n_g, :n_epochs_core], mlc_alone.mag)
+    # a star only the loose night contains has no aperture, hence no tied output
+    assert np.all(mlc.aperture[n_g:] == -1)
+
+
+def test_loose_night_floor_is_measured_and_inflates_its_errors() -> None:
+    nights, truth = _loose_scenario()
+    settings = MultiNightSettings()
+    core, loose, xmatch, _tie_core, tie = _tie_core_and_loose(nights, settings)
+    mlc = build_multinight_lightcurves(core + loose, xmatch, tie, settings)
+
+    a = 1
+    floor_mmag = tie.floor[3, a] * 1000.0
+    assert np.all(np.isfinite(floor_mmag))
+    assert np.max(np.abs(floor_mmag - _LOOSE_FLOOR_MMAG)) < 3.0, floor_mmag
+    assert 0.8 <= float(tie.chi2_after[3, a]) <= 1.25
+    assert 0.8 <= float(tie.chi2_holdout[3, a]) <= 1.25
+    core_floor_mmag = tie.floor[:3, a] * 1000.0
+    assert np.all(core_floor_mmag < 6.0)
+
+    # the surface: its own 4 terms in the core basis, recovered to ~1 mmag on its fit stars
+    coef = tie.coef[3, a]
+    used = [i for i, t in enumerate(tie.basis_terms) if t in ("1", "xi", "eta", "dm")]
+    assert np.all(coef[[i for i in range(coef.size) if i not in used]] == 0.0)
+    g_fit = np.nonzero(tie.tie_star[3, :, a])[0]
+    truth_i = xmatch.index[3, g_fit]  # a synthetic night's local star index is the truth index
+    resid = tie.zp[3, g_fit, a] - _truth_zp(truth, 3)[truth_i]
+    assert float(np.sqrt(np.mean(resid**2))) * 1000.0 < 2.0
+    assert int(tie.n_tie[3, a]) == int(np.count_nonzero(tie.tie_star[3, :, a]))
+
+    # its per-night errors carry the measured floor; the core nights' do not
+    sel = (mlc.aperture == a) & np.isfinite(mlc.night_mean_err[3])
+    assert np.count_nonzero(sel) > 1000
+    assert float(np.median(mlc.night_mean_err[3, sel])) > 0.010
+    core_sel = (mlc.aperture == a) & np.isfinite(mlc.night_mean_err[0])
+    assert float(np.median(mlc.night_mean_err[0, core_sel])) < 0.006
+
+    # evaluate_zero_point reproduces the stored zero point; no seeing term, no crowding needed
+    g = np.nonzero(np.isfinite(tie.zp[3, :, a]))[0][:200]
+    z = evaluate_zero_point(tie, 3, a, tie.xi[g], tie.eta[g], tie.mean_mag[g, a])
+    np.testing.assert_allclose(z, tie.zp[3, g, a], atol=1e-12)
+
+
+def test_loose_night_needs_enough_fit_stars() -> None:
+    nights, _truth = _loose_scenario()
+    core, loose = split_loose_nights(nights, (nights[-1].label,))
+    anchor_index = resolve_anchor_index(core, "auto")
+    xmatch = crossmatch_nights(core + loose, anchor_index, 1.0)
+    settings = MultiNightSettings(min_tie_stars=50)
+    tie_core = tie_nights(core, core_crossmatch(xmatch, 3), anchor_index, settings)
+    with pytest.raises(MultiNightError, match="fit stars for loose night"):
+        tie_loose_nights(core, loose, xmatch, tie_core, replace(settings, min_tie_stars=10**6))
+
+
+def test_split_loose_nights_validation_and_settings() -> None:
+    nights, _truth = _synthetic_tie_scenario(n_nights=3, n_stars=50, frames_per_night=5, n_aper=1)
+    core, loose = split_loose_nights(nights, ("N2",))
+    assert [n.label for n in core] == ["N0", "N1"] and [n.label for n in loose] == ["N2"]
+    core, loose = split_loose_nights(nights, ())
+    assert len(core) == 3 and loose == []
+    with pytest.raises(MultiNightError, match="not found"):
+        split_loose_nights(nights, ("nope",))
+    with pytest.raises(MultiNightError, match="at least 2 core"):
+        split_loose_nights(nights, ("N1", "N2"))
+
+    with pytest.raises(ConfigError, match="cannot be a loose night"):
+        MultiNightSettings(anchor="N1", loose_nights=("N1",))
+    with pytest.raises(ConfigError, match="duplicate"):
+        MultiNightSettings(loose_nights=("N1", "N1"))
+    with pytest.raises(ConfigError, match="loose_spatial_degree"):
+        MultiNightSettings(loose_spatial_degree=3)
+    with pytest.raises(ConfigError, match="loose_mag_degree"):
+        MultiNightSettings(loose_mag_degree=-1)
+    with pytest.raises(ConfigError, match="loose_internight_support_p"):
+        MultiNightSettings(loose_internight_support_p=0.0)
+    default = MultiNightSettings()
+    assert default.loose_nights == () and default.loose_internight_support_p == 1e-2
+    assert (default.loose_spatial_degree, default.loose_mag_degree) == (1, 1)
+
+
+def test_save_load_round_trip_with_loose_and_old_file_without_it(tmp_path) -> None:
+    nights, _truth = _loose_scenario(seed=22)
+    settings = MultiNightSettings()
+    core, loose, xmatch, _tie_core, tie = _tie_core_and_loose(nights, settings)
+    mlc = build_multinight_lightcurves(core + loose, xmatch, tie, settings)
+
+    from relphot.config import Settings
+
+    full_settings = replace(Settings(), multinight=replace(settings, loose_nights=("N3",)))
+    path = tmp_path / "loose.npz"
+    save_multinight(path, core + loose, xmatch, tie, mlc, full_settings)
+    _xm, tie2, _mlc, _info, settings2 = load_multinight(path)
+    np.testing.assert_array_equal(tie2.loose, [False, False, False, True])
+    assert settings2.multinight.loose_nights == ("N3",)
+
+    # a file written before `loose` existed has no tie_loose key: all nights are core
+    with np.load(path, allow_pickle=False) as data:
+        old = {k: data[k] for k in data.files if k != "tie_loose"}
+    old_path = tmp_path / "old.npz"
+    np.savez(old_path, **old)
+    _xm, tie_old, _mlc, _info, _settings = load_multinight(old_path)
+    assert tie_old.loose.dtype == bool and tie_old.loose.shape == (4,)
+    assert not tie_old.loose.any()
+    np.testing.assert_array_equal(tie_old.zp, tie.zp)

@@ -1,0 +1,15 @@
+[Unit]
+Description=relphot results-database reprocess worker (relphot db reprocess --watch)
+After=relphotdb-db.service
+Requires=relphotdb-db.service
+
+[Service]
+Type=simple
+# RELPHOT_DB_DSN (role relphot_owner) comes from the installer-written env file
+EnvironmentFile=%h/.config/relphot/relphotdb.env
+ExecStart=__RELPHOT_BIN__ db reprocess --watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

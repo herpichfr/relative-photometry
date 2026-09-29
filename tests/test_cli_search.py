@@ -74,3 +74,105 @@ def test_search_smoke(fits_files, tmp_path) -> None:
     assert "transit_snr" in table.colnames
     assert "variability_excess" in table.colnames
     assert len(table) > 0
+
+
+def test_search_known_variable_with_transit_stays_a_candidate(
+    fits_files, tmp_path, monkeypatch
+) -> None:
+    """A transit event on a known (disqualifying-type) variable is still a transit candidate,
+    carrying ON_VARIABLE, in candidates.csv and in the search-metrics table."""
+    import numpy as np
+    from astropy.table import Table
+
+    import relphot.cli as cli
+    from relphot.catalogs import (
+        NeighbourDilutionResult,
+        PlanetMatchResult,
+        VariableMatchResult,
+    )
+
+    night_out = tmp_path / "night.npz"
+    assert main(["ingest", "--out", str(night_out), *[str(p) for p in fits_files]]) == 0
+    ref_out = tmp_path / "ref.npz"
+    assert main(["reference", str(night_out), "--out", str(ref_out), "--no-variables"]) == 0
+    assert main([
+        "lightcurves", str(night_out), str(ref_out),
+        "--out", str(tmp_path / "lc"), "--no-variables", "--format", "fits", "--no-plot",
+    ]) == 0
+
+    config = tmp_path / "search.toml"
+    config.write_text(
+        "[search]\nmin_epochs = 2\nmin_epoch_fraction = 0.0\nn_cbv = 1\n"
+        "cbv_explained_variance = 0.999\nduration_min_hours = 0.01\n"
+        "duration_max_hours = 0.03\nn_durations = 2\nmin_in_transit_points = 1\n"
+        "few_points_threshold = 1\nlc_clip_window = 3\ncoincidence_snr_threshold = 1.0\n"
+        "excess_rms_threshold = 1.0\nvariability_min_bin_stars = 1\n"
+    )
+
+    target = 5
+    real_search_transits = cli.search_transits
+
+    def search_with_forced_candidate(*args, **kwargs):
+        result = real_search_transits(*args, **kwargs)
+        result.searched[target] = True
+        result.candidate[target] = True
+        result.flags[target] &= ~cli.FLAG_TOO_DEEP
+        return result
+
+    def known_variable(night, _settings):
+        n = night.n_stars
+        matched = np.zeros(n, dtype=bool)
+        matched[target] = True
+        name = np.full(n, "", dtype=object)
+        name[target] = "V* Test"
+        var_type = np.full(n, "", dtype=object)
+        var_type[target] = "EA"
+        return VariableMatchResult(matched, name, var_type, np.full(n, np.nan))
+
+    def no_planets(night, _settings):
+        n = night.n_stars
+        return PlanetMatchResult(
+            np.zeros(n, dtype=bool), np.full(n, "", dtype=object), np.full(n, np.nan),
+            np.full(n, np.nan), np.zeros(n, dtype=bool),
+        )
+
+    def no_neighbours(night, _settings):
+        n = night.n_stars
+        return NeighbourDilutionResult(
+            np.full(n, "", dtype=object), np.zeros(n, dtype=bool), np.full(n, np.nan),
+            np.full(n, np.nan),
+        )
+
+    monkeypatch.setattr(cli, "search_transits", search_with_forced_candidate)
+    monkeypatch.setattr(cli, "match_known_variables", known_variable)
+    monkeypatch.setattr(cli, "match_known_planets", no_planets)
+    monkeypatch.setattr(cli, "compute_neighbour_dilution", no_neighbours)
+
+    transits_dir = tmp_path / "transits"
+    variables_dir = tmp_path / "variables"
+    rc = main([
+        "search", str(night_out), str(ref_out), str(tmp_path / "lc.npz"),
+        "--config", str(config),
+        "--transits-dir", str(transits_dir), "--variables-dir", str(variables_dir),
+        "--no-plot",
+    ])
+    assert rc == 0
+
+    import csv
+
+    with (transits_dir / "candidates.csv").open() as handle:
+        rows = {int(r["star_id"]): r for r in csv.DictReader(handle)}
+    assert target in rows
+    assert "ON_VARIABLE" in rows[target]["flags"].split("|")
+    with (variables_dir / "candidates.csv").open() as handle:
+        variable_ids = {int(r["star_id"]) for r in csv.DictReader(handle)}
+    assert target in variable_ids  # still listed as a (known) variable as well
+
+    metrics = next(
+        p for p in (tmp_path / "lc_search_metrics.parquet", tmp_path / "lc_search_metrics.fits")
+        if p.is_file()
+    )
+    table = Table.read(metrics)
+    row = table[int(np.flatnonzero(np.asarray(table["star_id"]) == target)[0])]
+    assert bool(row["transit_candidate"])
+    assert "ON_VARIABLE" in str(row["transit_flags_str"]).split("|")

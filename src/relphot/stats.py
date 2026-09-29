@@ -38,22 +38,47 @@ __all__ = [
 class StarStats:
     """Per-star light-curve statistics at each aperture.
 
-    All arrays are ``(n_stars, n_aper)``. NaN where n_epochs == 0.
+    All arrays are ``(n_stars, n_aper)`` (except ``blended``, ``(n_stars,)`` and
+    ``near_edge``, ``(n_stars,)``). NaN where n_epochs == 0. ``chi2_reduced`` is
+    against the errors as used downstream (``lc_err``, inflated where the settings
+    ask for it); ``expected_noise`` is the formal, un-inflated prediction (photon
+    plus ensemble noise), so the results-database noise cut and the RMS-vs-magnitude
+    plot keep their meaning. ``err_scale`` is the factor applied to ``lc_err`` and
+    ``blended`` the neighbour-flag verdict (see
+    :func:`relphot.lightcurve.error_inflation`); both are ``None`` for statistics
+    loaded from a product written before error inflation existed. ``near_edge`` is
+    True for stars near the detector border (border eligibility cut); ``tailed`` is
+    True for stars withdrawn from the reference and comparison stars by the tail cut
+    (isolated single-epoch dips), ``(n_stars,)``.
     """
 
     rms: np.ndarray
     chi2_reduced: np.ndarray
     expected_noise: np.ndarray
     n_epochs: np.ndarray
+    err_scale: np.ndarray | None = None
+    blended: np.ndarray | None = None
+    near_edge: np.ndarray | None = None
+    tailed: np.ndarray | None = None
 
 
-def compute_star_stats(lc_result: LightCurveResult) -> StarStats:
+def compute_star_stats(
+    lc_result: LightCurveResult,
+    near_edge: np.ndarray | None = None,
+    tailed: np.ndarray | None = None,
+) -> StarStats:
     """Compute RMS, chi2, and expected noise for every star and aperture.
 
     Parameters
     ----------
     lc_result : LightCurveResult
         Light curve result with lc, lc_err, and epoch_ok arrays.
+    near_edge : np.ndarray | None, optional
+        (n_stars,) bool mask of stars near detector border; passed through
+        to StarStats. If None, set to all False.
+    tailed : np.ndarray | None, optional
+        (n_stars,) bool mask of stars removed by the tail cut; passed through
+        to StarStats. If None, stays None (written as all False).
 
     Returns
     -------
@@ -65,6 +90,9 @@ def compute_star_stats(lc_result: LightCurveResult) -> StarStats:
     use = np.isfinite(lc) & np.isfinite(lc_err) & lc_result.epoch_ok[:, :, None]
     lc = np.where(use, lc, np.nan)
     lc_err = np.where(use, lc_err, np.nan)
+    formal_err = lc_err
+    if lc_result.lc_err_raw is not None:
+        formal_err = np.where(use, lc_result.lc_err_raw.astype(np.float64), np.nan)
     n_epochs = use.sum(axis=1).astype(np.int64)  # (n_stars, n_aper)
 
     med = nanmedian_quiet(lc, axis=1)  # (n_stars, n_aper)
@@ -73,7 +101,7 @@ def compute_star_stats(lc_result: LightCurveResult) -> StarStats:
         norm = lc / med[:, None, :]
         norm_err = lc_err / med[:, None, :]
         rms = mad_sigma(norm, axis=1)
-        expected_noise = nanmedian_quiet(norm_err, axis=1)
+        expected_noise = nanmedian_quiet(formal_err / med[:, None, :], axis=1)
         chi2_sum = np.nansum(((norm - 1.0) / norm_err) ** 2, axis=1)
         chi2_reduced = chi2_sum / np.maximum(n_epochs - 1, 1)
     empty = n_epochs == 0
@@ -86,6 +114,10 @@ def compute_star_stats(lc_result: LightCurveResult) -> StarStats:
         chi2_reduced=chi2_reduced,
         expected_noise=expected_noise,
         n_epochs=n_epochs,
+        err_scale=lc_result.err_scale,
+        blended=lc_result.blended,
+        near_edge=near_edge,
+        tailed=tailed,
     )
 
 

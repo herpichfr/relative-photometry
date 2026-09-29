@@ -1,0 +1,392 @@
+body {
+    font-family: 'system-ui', 'Segoe UI', Roboto, Arial, sans-serif;
+    max-width: 1280px;
+    margin: 0 auto;
+    background: #f7f7f9;
+    color: #1a1a1a;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+.app-header {
+    padding: 1rem 0;
+    border-bottom: 1px solid #ddd;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.app-header h1 {
+    font-size: 1.5rem;
+    margin: 0;
+    font-weight: bold;
+}
+
+.panel {
+    background: white;
+    border: 1px solid #ddd;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    border-radius: 6px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.filter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 0.75rem;
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+}
+
+.field-wide {
+    grid-column: 1 / -1;
+}
+
+.button-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 0.75rem;
+}
+
+button {
+    background: #2b6cb0;
+    color: white;
+    padding: 0.35rem 0.5rem;
+    border: none;
+    border-radius: 4px;
+    font-size: inherit;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+button:hover {
+    background: #1e4e8c;
+}
+
+button:disabled {
+    background: #aaa;
+    cursor: not-allowed;
+}
+
+#advanced-sql {
+    margin-top: 1rem;
+}
+
+#advanced-sql summary {
+    font-weight: bold;
+    cursor: pointer;
+}
+
+fieldset {
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    padding: 0.5rem;
+}
+
+legend {
+    font-weight: bold;
+    font-size: 12px;
+}
+
+#sql-textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: monospace;
+}
+
+.error {
+    color: #b00020;
+    margin: 0.5rem 0;
+}
+
+.table-scroll {
+    overflow-x: auto;
+    max-height: 480px;
+    overflow-y: auto;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+
+thead th {
+    position: sticky;
+    top: 0;
+    background: #f0f0f2;
+    font-weight: bold;
+}
+
+th,
+td {
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid #e5e5e5;
+    text-align: left;
+    font-size: 13px;
+}
+
+th:hover {
+    background: #e0e0e2;
+}
+
+tbody tr:hover {
+    background: #f5f8fc;
+}
+
+tbody tr:nth-child(even) {
+    background: #fafafa;
+}
+
+#detail-meta th {
+    width: 160px;
+    font-weight: normal;
+    text-align: right;
+    color: #555;
+}
+
+#detail-meta td {
+    padding-left: 1rem;
+}
+
+.detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+}
+
+@media (max-width: 900px) {
+    .detail-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.plot {
+    width: 100%;
+    min-height: 380px;
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+#night-buttons {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.5rem;
+}
+
+#edit-box label {
+    display: inline-flex;
+    gap: 0.3rem;
+    align-items: center;
+}
+
+.note {
+    font-style: italic;
+    color: #666;
+    margin-top: 0.4rem;
+}
+
+.warn {
+    color: #b00020;
+    font-weight: bold;
+}
+
+/* an event the cross-candidate check rejected automatically (a person's status still applies) */
+.auto-reject {
+    color: #b00020;
+    font-size: 0.85em;
+    margin-top: 0.2rem;
+}
+
+.auto-reject-reason {
+    color: #666;
+    font-size: 0.85em;
+    max-width: 22rem;
+}
+
+details.similar-events summary {
+    cursor: pointer;
+    font-size: 0.85em;
+}
+
+.rerun-entry label, #rerun-toggle {
+    display: inline-flex;
+    gap: 0.3rem;
+    align-items: center;
+}
+
+.rerun-entry {
+    border: 1px solid #ccc;
+    padding: 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+}
+
+.rerun-entry.active {
+    border-color: #06c;
+}
+
+#phase-aliases {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+
+input,
+select,
+textarea {
+    padding: 0.35rem 0.5rem;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: inherit;
+    transition: border-color 0.3s;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+    border-color: #007bff;
+}
+
+/* a night with an automatic event still awaiting the person's verdict */
+tbody tr.needs-review {
+    background: #fff4d6;
+}
+
+tbody tr.needs-review:hover {
+    background: #ffecb3;
+}
+
+#detail-night-reviews input[type="text"] {
+    width: 16rem;
+    max-width: 100%;
+}
+
+/* the object loaded in the detail panel */
+tbody tr.current-object {
+    background: #dbe9fb;
+}
+
+tbody tr.current-object:hover {
+    background: #cfe1f8;
+}
+
+tbody tr.current-object td:first-child {
+    border-left: 3px solid #2b6cb0;
+}
+
+.obj-id {
+    font-weight: normal;
+    font-size: 0.9em;
+    color: #555;
+}
+
+/* RERUN status: queued/running, done, failed (results table, detail header, top bar) */
+.rerun-badge {
+    display: inline-block;
+    max-width: 32rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
+    padding: 0.1rem 0.5rem;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: bold;
+    text-decoration: none;
+}
+
+td .rerun-badge {
+    margin-left: 0.4rem;
+}
+
+.rerun-badge.pending {
+    background: #fff4d6;
+    color: #7a5200;
+    border-color: #e0b84d;
+}
+
+.rerun-badge.done {
+    background: #e3f4e6;
+    color: #1b6b2c;
+    border-color: #8ccf9b;
+}
+
+.rerun-badge.failed {
+    background: #fde7ea;
+    color: #b00020;
+    border-color: #e59aa5;
+}
+
+button.rerun-badge.pending:hover {
+    background: #ffecb3;
+}
+
+#rerun-global {
+    position: relative;
+}
+
+#rerun-list {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 900;
+    min-width: 16rem;
+    padding: 0.4rem 0.6rem;
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+#rerun-list a {
+    display: block;
+    padding: 0.15rem 0;
+    color: #2b6cb0;
+    white-space: nowrap;
+}
+
+/* non-blocking "RERUN finished" notices */
+#rerun-notices {
+    position: fixed;
+    top: 0.75rem;
+    right: 0.75rem;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-width: 28rem;
+}
+
+.rerun-notice {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.5rem 0.75rem;
+    background: white;
+    border: 1px solid #ddd;
+    border-left: 4px solid #2b6cb0;
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.rerun-notice.done {
+    border-left-color: #1b6b2c;
+}
+
+.rerun-notice.failed {
+    border-left-color: #b00020;
+}

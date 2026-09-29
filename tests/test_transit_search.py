@@ -7,11 +7,14 @@ import numpy as np
 from relphot.config import Settings
 from relphot.cotrend import compute_cbvs
 from relphot.transit_search import (
+    FLAG_ON_VARIABLE,
     FLAG_PARTIAL,
     FLAG_SHARED_EPOCH,
     FLAG_STEP_LIKE,
     FLAG_TOO_DEEP,
+    HARD_REJECT_FLAGS,
     depth_at_other_aperture,
+    flag_on_variable,
     flags_to_string,
     search_transits,
     tier_for_flags,
@@ -428,3 +431,22 @@ def test_no_python_loop_over_trial_grid() -> None:
     # 3-candidate step re-check -- never a loop whose body indexes a single
     # (duration, mid-time) trial one at a time.
     assert all(name in ("d", "pos", "t_step", "_pass_idx") for name in loop_targets), loop_targets
+
+
+def test_on_variable_flag_is_informational_only() -> None:
+    assert FLAG_ON_VARIABLE & HARD_REJECT_FLAGS == 0
+    assert flags_to_string(FLAG_ON_VARIABLE) == "ON_VARIABLE"
+    assert flags_to_string(FLAG_SHARED_EPOCH | FLAG_ON_VARIABLE) == "SHARED_EPOCH|ON_VARIABLE"
+    assert tier_for_flags(FLAG_ON_VARIABLE) == 1  # a clean full event stays tier 1
+    assert tier_for_flags(FLAG_SHARED_EPOCH | FLAG_ON_VARIABLE) == 2
+    assert tier_for_flags(FLAG_PARTIAL | FLAG_ON_VARIABLE) == 3
+
+
+def test_flag_on_variable_marks_transit_candidates_that_are_variable() -> None:
+    flags = np.array([0, 0, FLAG_SHARED_EPOCH, 0], dtype=np.int64)
+    candidate = np.array([True, True, True, False])
+    variable = np.array([True, False, True, True])
+    flag_on_variable(flags, candidate, variable)
+    assert flags.tolist() == [FLAG_ON_VARIABLE, 0, FLAG_SHARED_EPOCH | FLAG_ON_VARIABLE, 0]
+    # candidacy is the caller's mask; the helper never changes it
+    assert candidate.tolist() == [True, True, True, False]

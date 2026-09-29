@@ -74,6 +74,7 @@ __all__ = [
     "FLAG_HIGH_BETA",
     "FLAG_NAMES",
     "FLAG_NEIGHBOUR_BLEND",
+    "FLAG_ON_VARIABLE",
     "FLAG_PARTIAL",
     "FLAG_SHARED_EPOCH",
     "FLAG_STEP_LIKE",
@@ -83,6 +84,7 @@ __all__ = [
     "TransitSearchResult",
     "depth_at_other_aperture",
     "fit_nuisance_model",
+    "flag_on_variable",
     "flags_to_string",
     "plot_transit_candidate",
     "search_one_star",
@@ -101,6 +103,11 @@ FLAG_FEW_POINTS = 1 << 5
 FLAG_HIGH_BETA = 1 << 6
 FLAG_NEIGHBOUR_BLEND = 1 << 7
 FLAG_PARTIAL = 1 << 8
+#: Informational only: the star is also a variability candidate or a known
+#: variable of a disqualifying type. A planet host can be variable too, so this
+#: never rejects or demotes an event (not in ``HARD_REJECT_FLAGS``, ignored by
+#: :func:`tier_for_flags`); it is set by :func:`flag_on_variable`.
+FLAG_ON_VARIABLE = 1 << 9
 
 FLAG_NAMES: tuple[tuple[int, str], ...] = (
     (FLAG_SHARED_EPOCH, "SHARED_EPOCH"),
@@ -112,6 +119,7 @@ FLAG_NAMES: tuple[tuple[int, str], ...] = (
     (FLAG_HIGH_BETA, "HIGH_BETA"),
     (FLAG_NEIGHBOUR_BLEND, "NEIGHBOUR_BLEND"),
     (FLAG_PARTIAL, "PARTIAL"),
+    (FLAG_ON_VARIABLE, "ON_VARIABLE"),
 )
 
 #: Flags that disqualify a star from candidate status outright, regardless of
@@ -140,6 +148,21 @@ def flags_to_string(bits: int) -> str:
     """A human-readable ``"|"``-joined name list for a vetting bitmask, or ``"OK"``."""
     names = [name for bit, name in FLAG_NAMES if bits & bit]
     return "|".join(names) if names else "OK"
+
+
+def flag_on_variable(
+    flags: np.ndarray, candidate: np.ndarray, variable_candidate: np.ndarray
+) -> None:
+    """Set ``FLAG_ON_VARIABLE`` in place on every transit candidate that is also variable.
+
+    ``flags`` is a ``(n_stars,)`` integer vetting bitmask, ``candidate`` the
+    transit candidate mask and ``variable_candidate`` the final variability
+    call (search-detected, TOO_DEEP-routed, or a known disqualifying
+    variable). Candidacy is untouched: a variable star can host a transit.
+    """
+    flags[np.asarray(candidate, dtype=bool) & np.asarray(variable_candidate, dtype=bool)] |= (
+        FLAG_ON_VARIABLE
+    )
 
 
 def tier_for_flags(flags: int) -> int:

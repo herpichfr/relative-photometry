@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>relphot results database</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/plotly.min.js"></script>
+</head>
+<body>
+<header class="app-header">
+  <h1>relphot results database</h1>
+  <div id="rerun-global" hidden>
+    <button type="button" id="btn-rerun-list" class="rerun-badge pending"
+            title="RERUN requests of all objects still queued or running; click for the list"></button>
+    <div id="rerun-list" hidden></div>
+  </div>
+</header>
+<div id="rerun-notices"></div>
+
+<main>
+  <section id="search-panel" class="panel">
+    <h2>Query window</h2>
+    <form id="search-form">
+      <div class="filter-grid">
+        <fieldset>
+          <legend>Class</legend>
+          <label><input type="checkbox" name="class" value="UNC"> UNC</label>
+          <label><input type="checkbox" name="class" value="EXOP"> EXOP</label>
+          <label><input type="checkbox" name="class" value="VAR"> VAR</label>
+          <label><input type="checkbox" name="class" value="EXOP+VAR"> EXOP+VAR</label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Independent flags</legend>
+          <label>Exoplanet host
+            <select id="filter-is-exop" name="is_exop">
+              <option value="">any</option>
+              <option value="true">yes</option>
+              <option value="false">no</option>
+            </select>
+          </label>
+          <label>Variable
+            <select id="filter-is-var" name="is_var">
+              <option value="">any</option>
+              <option value="true">yes</option>
+              <option value="false">no</option>
+            </select>
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Night review</legend>
+          <label>Needs review
+            <select id="filter-needs-review" name="needs_review"
+                    title="objects with a night (or multi-night event) still awaiting your verdict">
+              <option value="">any</option>
+              <option value="true">yes</option>
+              <option value="false">no</option>
+            </select>
+          </label>
+          <label>Reviewed by you
+            <select id="filter-user-reviewed" name="user_reviewed"
+                    title="objects with at least one night carrying a verdict, a note or a decided event">
+              <option value="">any</option>
+              <option value="true">yes</option>
+              <option value="false">no</option>
+            </select>
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>RERUN</legend>
+          <label>Pending
+            <select id="filter-rerun-pending" name="rerun_pending"
+                    title="objects with a RERUN request still queued or running">
+              <option value="">any</option>
+              <option value="true">yes</option>
+              <option value="false">no</option>
+            </select>
+          </label>
+        </fieldset>
+
+        <label class="field">Min transit-match p
+          <input type="number" step="any" min="0" max="1" id="filter-min-p-match" name="min_p_match"
+                 title="objects with a pair of transit events whose matching probability is at least this">
+        </label>
+
+        <fieldset>
+          <legend>Detection kind</legend>
+          <label><input type="checkbox" name="detection_kind" value="transit"> transit</label>
+          <label><input type="checkbox" name="detection_kind" value="variable"> variable</label>
+          <label><input type="checkbox" name="detection_kind" value="bls"> bls</label>
+          <label><input type="checkbox" name="detection_kind" value="ls_periodic"> ls_periodic</label>
+          <label><input type="checkbox" name="detection_kind" value="internight"> internight</label>
+          <label><input type="checkbox" name="detection_kind" value="recurrent"> recurrent</label>
+          <label>Scope
+            <select id="filter-detection-scope" name="detection_scope">
+              <option value="">any</option>
+              <option value="night">night</option>
+              <option value="multinight">multinight</option>
+            </select>
+          </label>
+        </fieldset>
+
+        <label class="field">Known
+          <select id="filter-known" name="known">
+            <option value="">any</option>
+            <option value="true">yes</option>
+            <option value="false">no</option>
+          </select>
+        </label>
+
+        <label class="field">Source DB
+          <input type="text" id="filter-source-db" name="source_db">
+        </label>
+
+        <label class="field">Status
+          <select id="filter-status" name="status">
+            <option value="">any</option>
+            <option value="UNCONFIRMED">UNCONFIRMED</option>
+            <option value="CONFIRMED">CONFIRMED</option>
+            <option value="REJECTED">REJECTED</option>
+          </select>
+        </label>
+
+        <label class="field">Telescope
+          <input type="text" id="filter-telescope" name="telescope">
+        </label>
+
+        <label class="field">Name / Gaia ID
+          <input type="text" id="filter-name" name="name" placeholder="name substring">
+          <input type="text" id="filter-gaia-id" name="gaia_id" placeholder="Gaia ID">
+        </label>
+
+        <fieldset>
+          <legend>Cone search</legend>
+          <label>RA (deg) <input type="number" step="any" id="filter-ra" name="ra"></label>
+          <label>Dec (deg) <input type="number" step="any" id="filter-dec" name="dec"></label>
+          <label>Radius (arcsec) <input type="number" step="any" id="filter-radius" name="radius"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Magnitude</legend>
+          <label>min <input type="number" step="any" id="filter-mag-min" name="mag_min"></label>
+          <label>max <input type="number" step="any" id="filter-mag-max" name="mag_max"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Period (days)</legend>
+          <label>min <input type="number" step="any" id="filter-period-min" name="period_min"></label>
+          <label>max <input type="number" step="any" id="filter-period-max" name="period_max"></label>
+        </fieldset>
+
+        <label class="field">Min SNR
+          <input type="number" step="any" id="filter-snr-min" name="snr_min">
+        </label>
+
+        <label class="field">Min depth
+          <input type="number" step="any" id="filter-depth-min" name="depth_min">
+        </label>
+
+        <label class="field">Max tier
+          <input type="number" step="1" id="filter-tier-max" name="tier_max">
+        </label>
+
+        <label class="field">Min nights
+          <input type="number" step="1" id="filter-n-nights-min" name="n_nights_min">
+        </label>
+
+        <fieldset>
+          <legend>Night date range</legend>
+          <label>from <input type="date" id="filter-night-from" name="night_from"></label>
+          <label>to <input type="date" id="filter-night-to" name="night_to"></label>
+        </fieldset>
+
+        <label class="field">Has periodogram
+          <select id="filter-has-periodogram" name="has_periodogram">
+            <option value="">any</option>
+            <option value="true">yes</option>
+            <option value="false">no</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="button-row">
+        <button type="submit" id="btn-search">Search</button>
+        <button type="button" id="btn-reset">Reset</button>
+        <button type="button" id="btn-export-csv">Export CSV</button>
+      </div>
+    </form>
+
+    <details id="advanced-sql">
+      <summary>Advanced SQL</summary>
+      <textarea id="sql-textarea" rows="4" placeholder="SELECT * FROM relphot.object LIMIT 20"></textarea>
+      <div class="button-row">
+        <button type="button" id="btn-run-sql">Run</button>
+      </div>
+      <div id="sql-error" class="error" hidden></div>
+      <div id="sql-result-container" class="table-scroll"></div>
+    </details>
+  </section>
+
+  <section id="results-panel" class="panel">
+    <h2>Results</h2>
+    <div id="results-info"></div>
+    <div class="table-scroll">
+      <table id="results-table">
+        <thead><tr></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="button-row">
+      <button type="button" id="btn-prev-page">Prev</button>
+      <span id="page-info"></span>
+      <button type="button" id="btn-next-page">Next</button>
+      <label>Page size
+        <select id="page-size-select">
+          <option value="25">25</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="250">250</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <section id="detail-panel" class="panel" hidden>
+    <h2>Object detail <span id="detail-obj-id" class="obj-id"></span>
+      <a id="rerun-badge" class="rerun-badge" href="#rerun-heading" hidden></a></h2>
+
+    <div class="detail-grid">
+      <div>
+        <h3>Metadata</h3>
+        <table id="detail-meta"></table>
+      </div>
+      <div>
+        <h3>Catalogue matches</h3>
+        <table id="detail-catalog-matches">
+          <thead><tr><th>Catalog</th><th>Name</th><th>Type</th><th>Period</th><th>Sep (")</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <h3>Detections</h3>
+        <table id="detail-detections">
+          <thead>
+            <tr><th>Kind</th><th>Source</th><th>SNR</th><th>Depth</th><th>Duration</th>
+                <th>Tier</th><th>Period</th><th>FAP</th><th>Status</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <h3>Transit events</h3>
+    <div class="table-scroll">
+      <table id="detail-transit-events">
+        <thead>
+          <tr><th>Night</th><th>tc (BJD-2460000)</th><th>Depth</th><th>T14</th>
+              <th>Ingress T12/T14</th><th>Tier</th><th>Flags</th><th>Fit</th>
+              <th>Status</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <h3>Matching transits</h3>
+    <div class="note">Probability that two events of this object have the same depth and shape,
+      from their trapezoid fits. Events are never merged automatically: a different depth or
+      shape only lowers the probability (other planets of the same star are expected). The
+      duration of an incomplete transit is only a lower limit (&ge;), so its T14 term is
+      one-sided.</div>
+    <div class="table-scroll">
+      <table id="detail-transit-matches">
+        <thead>
+          <tr><th>Pair</th><th>T14 a</th><th>T14 b</th><th>dt (d)</th><th>depth z</th>
+              <th title="one-sided when either T14 is a lower limit">T14 z</th><th>ingress z</th>
+              <th>p(match)</th><th>Commensurate periods (d)</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <h3>Period verification</h3>
+    <div class="note">One row per re-observation (set of nights): the period found in the data
+      against the literature period; delta = P_obs / harmonic - P_lit. A period longer than a
+      night (1 d) is measured on tie-calibrated magnitudes without per-night offsets and needs a
+      multi-night tie; phase coverage below 50% (in red) means the period is poorly sampled.
+      <b>LS-guided</b> rows come from a re-run with your own period guess (see below).</div>
+    <div class="table-scroll">
+      <table id="detail-period-estimates">
+        <thead>
+          <tr><th>Computed</th><th>Method</th><th>Nights</th><th>Last night</th>
+              <th>Baseline (d)</th><th>Guess (d)</th><th>P_obs (d)</th><th>Harmonic</th>
+              <th>P_lit (d)</th><th>Delta (d)</th><th>z</th>
+              <th title="fraction of 20 phase bins holding a point">Coverage</th>
+              <th title="baseline in periods">Cycles</th><th>Verification</th><th>Note</th>
+              <th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="plot-period-verification" class="plot"></div>
+
+    <h3>Night reviews</h3>
+    <div class="note">Your verdicts apply only to the night they are set on. New nights are always
+      evaluated automatically. Blank = use the automatic result. Literature (known planet/variable)
+      always counts.</div>
+    <div id="night-review-summary" class="note"></div>
+    <div class="table-scroll">
+      <table id="detail-night-reviews">
+        <thead>
+          <tr><th>Night</th><th>Auto EXOP</th><th>Auto VAR</th><th>EXOP</th><th>VAR</th>
+              <th>Note</th><th>Effective</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <h3>Manual edit</h3>
+    <div id="edit-box" class="button-row">
+      <label><input type="checkbox" id="edit-exop-check"> Exoplanet host (set on the nights loaded now)</label>
+      <button type="button" id="btn-reset-exop-auto">reset to auto</button>
+      <label><input type="checkbox" id="edit-var-check"> Variable (set on the nights loaded now)</label>
+      <button type="button" id="btn-reset-var-auto">reset to auto</button>
+      <span id="edit-flag-source" class="note"></span>
+      <label>Status (informational, does not change class)
+        <select id="edit-status-select">
+          <option value="">-</option>
+          <option value="UNCONFIRMED">UNCONFIRMED</option>
+          <option value="CONFIRMED">CONFIRMED</option>
+          <option value="REJECTED">REJECTED</option>
+        </select>
+      </label>
+      <label>Period (days)
+        <input type="number" step="any" id="edit-period-input">
+      </label>
+      <button type="button" id="btn-reset-period-auto">reset period to auto</button>
+      <label class="field-wide">Notes
+        <textarea id="edit-notes-textarea" rows="2"></textarea>
+      </label>
+      <button type="button" id="btn-save-edit">Save</button>
+      <span id="edit-status-msg"></span>
+    </div>
+
+    <h3>Light curves</h3>
+    <div id="night-buttons" class="button-row"></div>
+    <div class="button-row">
+      <label>Y axis
+        <select id="lc-unit-select"
+                title="apparent magnitude = the night's mean magnitude + its zero point (Gaia calibration where the frames have one, else 20 mag assumed) + the curve's change in magnitude">
+          <option value="mag" selected>apparent magnitude</option>
+          <option value="flux">relative flux</option>
+        </select>
+      </label>
+    </div>
+    <div id="plot-lightcurve" class="plot"></div>
+
+    <div id="phase-section">
+      <h3>Phase diagram</h3>
+      <div class="note">All nights folded at the chosen period, coloured by night (error bars
+        include the inflation for blended stars).</div>
+      <div id="phase-mode-note" class="note"></div>
+      <div class="button-row">
+        <label>Period from
+          <select id="phase-candidate-select"></select>
+        </label>
+        <label>Period (days) <input type="number" step="any" min="0" id="phase-period-input"></label>
+        <button type="button" id="btn-phase-x2">x2</button>
+        <button type="button" id="btn-phase-div2">/2</button>
+        <label>Epoch
+          <select id="phase-epoch-select">
+            <option value="first">first epoch</option>
+            <option value="fit">fitted phase zero (deepest minimum)</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="phase-range-check"> phase -0.25 to 1.25</label>
+        <label><input type="checkbox" id="phase-model-check" checked> Fourier model</label>
+      </div>
+      <div id="phase-coverage-note" class="note"></div>
+      <div id="phase-aliases" class="button-row"></div>
+      <div id="plot-phase" class="plot"></div>
+    </div>
+
+    <h3 id="rerun-heading">Re-run (on demand)</h3>
+    <div class="note">Nothing is re-run unless you tick RERUN, fill an entry and press the run button.
+      Per night tick EXOP (transit centre + width: trapezoid fit, adds a user event; search events are
+      never touched) and/or VAR (period guess: adds an LS-guided estimate; PERIOD changes only if you
+      adopt it). "All nights rerun" uses every night of the object; unticked, the period search uses
+      only the chosen night. Clicking the light curve fills the transit centre of the entry you last
+      edited. While RERUN is ticked, dragging horizontally on the light curve selects a span instead
+      of zooming (the mode bar's zoom button brings zooming back): for an EXOP entry it fills the
+      transit centre (the midpoint) and the width in hours, for a VAR-only entry the period guess
+      (the span in days -- drag from one peak to the next), and it switches the entry to the night
+      with data in the span. The worker (<code>relphot db reprocess --watch</code>) works the queue off.</div>
+    <label id="rerun-toggle"><input type="checkbox" id="rerun-check"> RERUN</label>
+    <div id="rerun-panel" hidden>
+      <div id="rerun-entries"></div>
+      <div class="button-row">
+        <label class="field-wide">Note <input type="text" id="rp-note" maxlength="2000"></label>
+        <button type="button" id="btn-rp-submit">Run selected re-runs</button>
+        <span id="rp-msg"></span>
+      </div>
+    </div>
+    <template id="rerun-entry-template">
+      <fieldset class="rerun-entry">
+        <legend class="rr-title"></legend>
+        <div class="button-row">
+          <label class="rr-night-label">Night <select class="rr-night"></select></label>
+          <label><input type="checkbox" class="rr-exop"> EXOP</label>
+          <label><input type="checkbox" class="rr-var"> VAR</label>
+        </div>
+        <div class="button-row rr-exop-box" hidden>
+          <label>Transit centre, BJD_TDB (within the night) <input type="number" step="any" class="rr-tc"></label>
+          <label>Width of the suspected eclipse (h, 0.1 to 12) <input type="number" step="any" min="0.1" max="12" class="rr-width"></label>
+        </div>
+        <div class="button-row rr-var-box" hidden>
+          <label>Period guess (days) <input type="number" step="any" min="0" class="rr-period"></label>
+          <label><input type="checkbox" class="rr-all-nights"> All nights rerun</label>
+          <span class="note">One night can only constrain periods shorter than about its span.</span>
+        </div>
+        <div class="button-row">
+          <label class="rr-add-label"><input type="checkbox" class="rr-add"> Add another rerun</label>
+          <span class="rr-msg warn"></span>
+        </div>
+      </fieldset>
+    </template>
+    <div id="rp-queue" class="note"></div>
+    <div class="table-scroll">
+      <table id="detail-reprocess">
+        <thead>
+          <tr><th>#</th><th>Kind</th><th>Guess</th><th>Requested</th><th>Status</th>
+              <th>Result</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <h3>Periodogram</h3>
+    <div class="button-row">
+      <label>Scope
+        <select id="periodogram-scope-select"></select>
+      </label>
+      <label>Method
+        <select id="periodogram-method-select"></select>
+      </label>
+    </div>
+    <div id="periodogram-message"></div>
+    <div id="plot-periodogram" class="plot"></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

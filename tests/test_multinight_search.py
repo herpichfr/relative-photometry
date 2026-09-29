@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from relphot.config import MultiNightSettings
-from relphot.multinight import MultiNightLightCurves, NightTie
+from relphot.multinight import MultiNightLightCurves, NightCrossMatch, NightTie
 from relphot.multinight_search import (
     bls_search,
     combined_periodogram,
     commensurate_periods,
     compute_internight_variability,
+    cross_reference_nights,
     period_compatibility,
+    run_multisearch,
 )
 
 
@@ -376,3 +379,156 @@ def test_two_night_step_is_internight_but_not_periodic_or_bls() -> None:
     bls_result = bls_search(mlc, np.array([0]), settings)
     assert not bls_result["candidate"][0]
     assert not np.isfinite(bls_result["period"][0])
+
+
+# --------------------------------------------------------------------------
+# loose nights: variability yes (with a core-support rule), transit tests no
+# --------------------------------------------------------------------------
+
+
+def test_internight_loose_night_alone_never_makes_a_candidate() -> None:
+    rng = np.random.default_rng(5)
+    n_nights, n_stars = 4, 1200
+    base = rng.uniform(13.0, 19.0, n_stars)
+    err = 0.005
+    mag = base[None, :] + rng.normal(0.0, err, (n_nights, n_stars))
+    errs = np.full((n_nights, n_stars), err)
+    loose = np.array([False, False, False, True])
+
+    # noise-free special stars, so the core-only test is exactly consistent (p_core = 1)
+    mag[:, :5] = base[None, :5]
+    mag[3, 0] += 0.05  # 0: a step in the loose night only
+    mag[1, 1] += 0.05  # 1: a step in a core night
+    mag[:3, 2] = np.nan  # 2: the loose night and just one core night ...
+    mag[0, 2] = base[2]
+    mag[3, 2] += 0.05  # ... which differ
+    mag[3, 3] = np.nan  # 3: a step between core nights, no loose data at all
+    mag[2, 3] += 0.05
+    mlc = _toy_mlc(mag, errs)
+    settings = MultiNightSettings()
+
+    plain = compute_internight_variability(mlc, settings)
+    assert plain["candidate"][:4].all()
+    assert np.all(np.isnan(plain["p_core"])) and not plain["loose_gated"].any()
+
+    res = compute_internight_variability(mlc, settings, loose)
+    assert not res["candidate"][0] and res["loose_gated"][0]  # loose night alone: gated
+    assert res["p_core"][0] == pytest.approx(1.0)
+    assert res["candidate"][1] and not res["loose_gated"][1]  # core night supports it
+    assert res["p_core"][1] < 1e-4
+    assert not res["candidate"][2] and res["loose_gated"][2]  # < 2 core nights: never
+    assert np.isnan(res["p_core"][2])
+    assert res["candidate"][3] and not res["loose_gated"][3]  # no loose data: unchanged
+    # everything else is untouched by the rule (same verdict, same p)
+    np.testing.assert_array_equal(
+        res["candidate"][4:] | res["loose_gated"][4:], plain["candidate"][4:]
+    )
+    np.testing.assert_array_equal(res["p"], plain["p"])
+
+
+def _flat_mlc(
+    n_nights: int, transit_nights: tuple[int, ...], depth: float
+) -> MultiNightLightCurves:
+    """One star, ``n_nights`` consecutive 8 h nights; a 2 h dip at each night's start in
+    ``transit_nights`` only. ``night_mean_*`` are constant (no inter-night signal)."""
+    rng = np.random.default_rng(9)
+    n_per = 60
+    bjd = np.concatenate([
+        float(n) + np.linspace(0.05, 0.05 + 8.0 / 24.0, n_per) for n in range(n_nights)
+    ])
+    night = np.repeat(np.arange(n_nights), n_per)
+    flux = 1.0 + rng.normal(0.0, 0.0008, bjd.size)
+    dip = np.isin(night, transit_nights) & (bjd % 1.0 < 0.05 + 2.0 / 24.0)
+    flux[dip] -= depth
+    mag = 15.0 + rng.normal(0.0, 0.002, bjd.size)
+    return MultiNightLightCurves(
+        labels=tuple(f"N{n}" for n in range(n_nights)),
+        night_of_frame=night.astype(np.int64),
+        frame_in_night=np.zeros(bjd.size, dtype=np.int64),
+        bjd_tdb=bjd,
+        airmass=np.ones_like(bjd),
+        fwhm=np.ones_like(bjd),
+        aperture=np.zeros(1, dtype=np.int64),
+        mag=mag[None, :].astype(np.float32),
+        mag_err=np.full((1, bjd.size), 0.002, dtype=np.float32),
+        flux_norm=flux[None, :].astype(np.float32),
+        flux_norm_err=np.full((1, bjd.size), 0.0008, dtype=np.float32),
+        night_mean_mag=np.full((n_nights, 1), 15.0),
+        night_mean_err=np.full((n_nights, 1), 0.01),
+        mean_mag=np.array([15.0]),
+        n_nights=np.array([n_nights], dtype=np.int64),
+    )
+
+
+def test_bls_epoch_mask_keeps_loose_epochs_out() -> None:
+    n_nights = 8
+    loose = np.array([n >= 4 for n in range(n_nights)])
+    mlc = _flat_mlc(n_nights, transit_nights=(4, 5, 6, 7), depth=0.03)  # dips only in loose nights
+    settings = MultiNightSettings()
+
+    unmasked = bls_search(mlc, np.array([0]), settings)
+    assert unmasked["candidate"][0]  # the search does see the loose nights' dips
+
+    masked = bls_search(mlc, np.array([0]), settings, ~loose[mlc.night_of_frame])
+    assert not masked["candidate"][0]
+
+    # too few core nights left for a periodic search: skipped outright
+    too_few = np.array([n >= 2 for n in range(n_nights)])
+    skipped = bls_search(mlc, np.array([0]), settings, ~too_few[mlc.night_of_frame])
+    assert not np.isfinite(skipped["period"][0]) and not skipped["candidate"][0]
+
+
+def _write_night_search(directory, *, event: bool) -> None:
+    (directory / "lc").mkdir(parents=True)
+    pd.DataFrame({
+        "star_id": np.array([0]),
+        "variability_candidate": np.array([False]),
+        "transit_candidate": np.array([event]),
+        "transit_tc_bjd_tdb": np.array([0.1]),
+        "transit_depth": np.array([0.03]),
+        "transit_snr": np.array([20.0]),
+        "transit_duration_hours": np.array([2.0]),
+    }).to_parquet(directory / "lc" / "night_lc_search_metrics.parquet")
+
+
+def _multisearch_inputs(tmp_path, event_nights: tuple[int, ...], loose: tuple[int, ...]):
+    n_nights = 6
+    mlc = _flat_mlc(n_nights, transit_nights=tuple(range(n_nights)), depth=0.03)
+    labels = mlc.labels
+    night_info = []
+    for n, label in enumerate(labels):
+        directory = tmp_path / label
+        _write_night_search(directory, event=n in event_nights)
+        night_info.append({"label": label, "directory": str(directory)})
+    xmatch = NightCrossMatch(
+        ra=np.zeros(1), dec=np.zeros(1), index=np.zeros((n_nights, 1), dtype=np.int64),
+        labels=labels, n_matched=np.zeros(n_nights, dtype=np.int64),
+    )
+    tie = _toy_tie(n_nights, labels=labels)
+    tie.loose = np.array([n in loose for n in range(n_nights)])
+    return xmatch, tie, mlc, night_info
+
+
+def test_cross_reference_and_multisearch_drop_loose_nights_transit_events(tmp_path) -> None:
+    settings = MultiNightSettings()
+
+    # an event only in the loose night 5: no event, hence no period-compatibility run
+    xmatch, tie, mlc, night_info = _multisearch_inputs(tmp_path / "a", (5,), (5,))
+    plain = cross_reference_nights(night_info, xmatch)
+    assert list(plain.events) == [0] and plain.events[0][0]["night"] == "N5"
+    skipped = cross_reference_nights(night_info, xmatch, tie.loose)
+    assert skipped.events == {}
+    result = run_multisearch(xmatch, tie, mlc, night_info, settings)
+    assert result["cross_ref"].events == {} and result["period_compat"] == {}
+
+    # the same event in a core night is kept and gets its period-compatibility scan, which
+    # (like the BLS search) sees only the core nights' epochs
+    xmatch, tie, mlc, night_info = _multisearch_inputs(tmp_path / "b", (1,), (5,))
+    result = run_multisearch(xmatch, tie, mlc, night_info, settings)
+    assert list(result["cross_ref"].events) == [0]
+    assert 0 in result["period_compat"]
+
+    # without any loose night nothing changes
+    xmatch, tie, mlc, night_info = _multisearch_inputs(tmp_path / "c", (5,), ())
+    result = run_multisearch(xmatch, tie, mlc, night_info, settings)
+    assert list(result["cross_ref"].events) == [0] and 0 in result["period_compat"]
