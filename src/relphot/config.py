@@ -343,7 +343,11 @@ class ComparisonSettings:
     min_comparison_stars: int = 5
     clip_sigma: float = 3.0
     max_iter: int = 5
-    ensemble_statistic: str = "weighted_clipped_mean"
+    #: Per-epoch ensemble of the comparison stars' normalised fluxes: ``"median"`` (target
+    #: light curve = target / median of the comparison stars, error of the median =
+    #: sqrt(pi/2) * MAD / sqrt(n)) or ``"weighted_clipped_mean"`` (inverse-variance mean
+    #: with sigma clipping).
+    ensemble_statistic: str = "median"
 
 
 @dataclass(frozen=True, slots=True)

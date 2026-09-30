@@ -161,14 +161,21 @@ tbody tr:nth-child(even) {
     padding-left: 1rem;
 }
 
-.detail-grid {
+.detail-stack {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
     gap: 1.5rem;
 }
 
+.meta-columns {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    column-gap: 1.5rem;
+    align-items: start;
+}
+
 @media (max-width: 900px) {
-    .detail-grid {
+    .meta-columns {
         grid-template-columns: 1fr;
     }
 }

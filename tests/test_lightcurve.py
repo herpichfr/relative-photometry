@@ -383,3 +383,32 @@ def test_compute_light_curves_inflates_lc_err_and_keeps_the_raw_error() -> None:
         rtol=1e-5,
     )
     np.testing.assert_array_equal(res.lc_err[plain_star], res.lc_err_raw[plain_star])
+
+
+def test_lc_err_of_a_median_night_is_target_photon_noise_plus_error_of_the_median() -> None:
+    """lc_err (no inflation, no decorrelation) = sqrt((phot/ens)^2 + (lc_raw*sig_ens/ens)^2)."""
+    night, _airmass, _flux0 = make_synthetic_night(n_stars=300, n_frames=30, seed=21)
+    settings = Settings()
+    assert settings.comparison.ensemble_statistic == "median"
+    settings = replace(
+        settings,
+        decorrelation=replace(settings.decorrelation, enabled=False),
+        lightcurve=replace(settings.lightcurve, inflate_errors="none"),
+    )
+    variable_mask = np.zeros(night.n_stars, dtype=bool)
+    candidates = select_candidates(night, variable_mask, settings, aper=0)
+    tilemap = build_tilemap(night, candidates, settings)
+    selection = select_reference_frames_and_stars(night, tilemap, candidates, settings, aper=0)
+    ref = build_references(night, tilemap, selection, settings)
+    comp = select_comparison_stars(night, tilemap, ref, variable_mask, settings)
+    lc = compute_light_curves(night, tilemap, ref, comp, settings)
+
+    i = int(np.nonzero(tilemap.core_tile >= 0)[0][0])
+    t = int(tilemap.core_tile[i])
+    ok = lc.epoch_ok[i] & np.isfinite(lc.lc_err[i, :, 0])
+    ens = comp.ensemble[t, :, 0]
+    phot = night.fluxerr[i, :, 0] / ref.R[t, :, 0]
+    ens_term = lc.lc_raw[i, :, 0] * comp.sigma_ensemble[t, :, 0] / ens
+    expected = np.sqrt((phot / ens) ** 2 + ens_term**2)
+    np.testing.assert_allclose(lc.lc_err[i, ok, 0], expected[ok], rtol=1e-4)
+    assert np.all(lc.lc_err[i, ok, 0] > phot[ok] / ens[ok])  # the ensemble term is added

@@ -319,6 +319,7 @@ def save_lightcurves_npz(
         "comparison_mag": comparison_result.mag,
         "comparison_n_comparison": comparison_result.n_comparison,
         "comparison_n_rounds_used": comparison_result.n_rounds_used,
+        "comparison_method": np.array(comparison_result.method),
         "config_json": config_json,
     }
 
@@ -397,7 +398,9 @@ def load_lightcurves_npz(path: Path | str):
             mag=data["comparison_mag"],
             n_comparison=data["comparison_n_comparison"],
             n_rounds_used=data["comparison_n_rounds_used"],
-            method="loaded",
+            method=(
+                str(data["comparison_method"]) if "comparison_method" in data.files else "loaded"
+            ),
         )
 
         settings = settings_from_dict(json.loads(str(data["config_json"])))

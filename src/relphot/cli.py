@@ -629,6 +629,12 @@ def _run_members(args: argparse.Namespace) -> int:
                 'mask': data['comparison_mask'],
                 'n_comparison': data['comparison_n_comparison'],
                 'n_rounds_used': data['comparison_n_rounds_used'],
+                # products written before the median default carry no method: they are weighted
+                'method': (
+                    str(data['comparison_method'])
+                    if 'comparison_method' in data.files
+                    else 'weighted_clipped_mean'
+                ),
             }
             best_aper_per_tile = data['best_aper_per_tile']
     except (OSError, RelphotError):
@@ -668,7 +674,7 @@ def _run_members(args: argparse.Namespace) -> int:
         mag=np.zeros_like(comparison_result_data['ensemble']),
         n_comparison=comparison_result_data['n_comparison'],
         n_rounds_used=comparison_result_data['n_rounds_used'],
-        method=settings.comparison.ensemble_statistic,
+        method=comparison_result_data['method'],
     )
 
     # Build members

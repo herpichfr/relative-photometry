@@ -77,6 +77,14 @@ def test_reference_new_settings_round_trip() -> None:
     assert s2.reference.star_reject_iter == s.reference.star_reject_iter
 
 
+def test_ensemble_statistic_defaults_to_median_and_stays_selectable(tmp_path) -> None:
+    """New runs use the median ensemble; the weighted clipped mean is one TOML line away."""
+    assert Settings().comparison.ensemble_statistic == "median"
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text('[comparison]\nensemble_statistic = "weighted_clipped_mean"\n')
+    assert load_settings(cfg).comparison.ensemble_statistic == "weighted_clipped_mean"
+
+
 def test_comparison_toml_override(tmp_path) -> None:
     """TOML override of [comparison] k_floor works."""
     cfg = tmp_path / "cfg.toml"

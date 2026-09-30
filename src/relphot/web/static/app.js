@@ -382,23 +382,28 @@ function zpText(source, zp) {
 }
 
 function renderMeta(obj) {
-  const table = $("detail-meta");
-  table.innerHTML = "";
+  const container = $("detail-meta");
+  container.innerHTML = "";
   const display = Object.assign({}, obj, {
     mean_mag_display: appMagText(obj),
     ra_sexagesimal: raToHms(obj.ra),
     dec_sexagesimal: decToDms(obj.dec),
   });
-  for (const [key, label] of META_FIELDS) {
-    const tr = document.createElement("tr");
-    const th = document.createElement("th");
-    th.textContent = label;
-    const td = document.createElement("td");
-    const v = display[key];
-    td.textContent = v === null || v === undefined ? "" : String(v);
-    tr.appendChild(th);
-    tr.appendChild(td);
-    table.appendChild(tr);
+  const perColumn = Math.ceil(META_FIELDS.length / 3);
+  for (let start = 0; start < META_FIELDS.length; start += perColumn) {
+    const table = document.createElement("table");
+    for (const [key, label] of META_FIELDS.slice(start, start + perColumn)) {
+      const tr = document.createElement("tr");
+      const th = document.createElement("th");
+      th.textContent = label;
+      const td = document.createElement("td");
+      const v = display[key];
+      td.textContent = v === null || v === undefined ? "" : String(v);
+      tr.appendChild(th);
+      tr.appendChild(td);
+      table.appendChild(tr);
+    }
+    container.appendChild(table);
   }
 }
 
@@ -980,8 +985,10 @@ async function loadNightLc(nightId) {
     return;
   }
   const lc = await resp.json();
+  lc.ratios = null;
   state.lcView = { kind: "night", nightId, lc };
   plotNightLc(nightId, lc);
+  if ($("lc-ratios-check").checked) loadNightRatios(nightId, lc);
 
   // Enable/disable tile light curve buttons based on night's has_reference/has_comparison
   const night = state.currentObject.nights.find(n => n.night_id === nightId);
@@ -993,6 +1000,56 @@ async function loadNightLc(nightId) {
   } else {
     $("tile-lc-controls").hidden = true;
   }
+}
+
+// The individual target / comparison-star curves behind the night's light curve, drawn under it
+// in green. A night without stored members (loaded before schema v11) answers 404: nothing is
+// drawn. The curve is replotted once they arrive, unless another night or view took over.
+async function loadNightRatios(nightId, lc) {
+  const night = state.currentObject.nights.find((n) => n.night_id === nightId);
+  if (!night || !night.has_comparison) return;
+  const objId = state.currentObject.object.obj_id;
+  const limit = parseInt($("lc-ratios-limit-select").value);
+  const resp = await fetch(`/api/object/${objId}/night/${nightId}/lc_ratios?limit=${limit}`);
+  if (!resp.ok) return;
+  const payload = await resp.json();
+  const v = state.lcView;
+  if (!v || v.kind !== "night" || v.nightId !== nightId || !$("lc-ratios-check").checked) return;
+  lc.ratios = payload;
+  plotNightLc(nightId, lc);
+}
+
+// One thin translucent green line per comparison star (`lc.ratios`, aligned with the night's
+// own frames); the line's legend entry says whether their median is the plotted curve.
+function ratioTracesOf(lc, x, yOf) {
+  const r = lc.ratios;
+  if (!r || !$("lc-ratios-check").checked || r.frame_index.length !== x.length) return [];
+  const name = `target / comp_i (${r.n_shown} of ${r.n_members})`;
+  return r.members.map((m, k) => ({
+    x, y: m.ratio.map((v) => (v === null ? null : yOf(v))),
+    type: "scatter", mode: "lines", connectgaps: false,
+    line: { color: "rgba(34,139,34,0.22)", width: 0.8 },
+    hoverinfo: "skip", name, legendgroup: "ratios", showlegend: k === 0,
+  }));
+}
+
+// y range that fits the night's own curve with its error bars (padded), so the green curves of
+// faint comparison stars do not squash it; [bottom, top] of the axis, magnitudes brighter up.
+function ownCurveRange(lc, yOf, useMag) {
+  let lo = Infinity;
+  let hi = -Infinity;
+  lc.flux.forEach((f, i) => {
+    if (!Number.isFinite(f) || !(f > 0)) return;
+    const e = useMag ? 1.0857 * lc.flux_err[i] / f : lc.flux_err[i];
+    const y = yOf(f);
+    if (Number.isFinite(y) && Number.isFinite(e)) {
+      lo = Math.min(lo, y - e);
+      hi = Math.max(hi, y + e);
+    }
+  });
+  if (!(hi > lo)) return null;
+  const pad = 0.25 * (hi - lo);
+  return useMag ? [hi + pad, lo - pad] : [lo - pad, hi + pad];
 }
 
 function plotNightLc(nightId, lc) {
@@ -1016,8 +1073,15 @@ function plotNightLc(nightId, lc) {
     meta: { night_id: nightId },
   };
   const shapes = [];
-  const traces = [trace];
+  const ratioTraces = ratioTracesOf(lc, x, yOf);
+  const traces = [...ratioTraces, trace];
   const annotations = [];
+  const ratios = ratioTraces.length ? lc.ratios : null;
+  $("lc-ratios-note").textContent = ratios
+    ? (ratios.ensemble === "median"
+      ? `aperture ${ratios.aperture}: the median of these is the plotted curve`
+      : `aperture ${ratios.aperture}: weighted-mean night, the median of these is not the plotted curve`)
+    : "";
   const nightEvents = (state.currentObject.transit_events || []).filter(
     (ev) => ev.night_id === nightId && ev.tc !== null && ev.tc !== undefined
   );
@@ -1069,11 +1133,17 @@ function plotNightLc(nightId, lc) {
       text: `T14 ${transit.duration_display || ""}`,
     });
   }
+  const yaxis = useMag
+    ? { title: { text: `apparent mag (${zpText(lc.zp_source, lc.zp)})` }, autorange: "reversed" }
+    : { title: { text: "relative flux" } };
+  const ownRange = ratios ? ownCurveRange(lc, yOf, useMag) : null;
+  if (ownRange) {
+    yaxis.range = ownRange;
+    yaxis.autorange = false;
+  }
   Plotly.newPlot("plot-lightcurve", traces, {
     xaxis: { title: { text: "BJD_TDB - 2460000" } },
-    yaxis: useMag
-      ? { title: { text: `apparent mag (${zpText(lc.zp_source, lc.zp)})` }, autorange: "reversed" }
-      : { title: { text: "relative flux" } },
+    yaxis,
     shapes,
     annotations,
     margin: { t: 20 },
@@ -1099,6 +1169,7 @@ async function loadCombinedLc() {
 // point = apparent); untied, it is flux over the night's median, given the night's apparent
 // mean magnitude (`app_mag`) as its level.
 function plotCombinedLc(lc) {
+  $("lc-ratios-note").textContent = "";
   const tied = lc.mode === "tied-mag";
   const useMag = lcUnit() === "mag" && (!tied || (lc.zp !== null && lc.zp !== undefined));
   const sortedValues = lc.value.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
@@ -2321,6 +2392,15 @@ function init() {
   });
   for (const id of ["phase-epoch-select", "phase-range-check", "phase-model-check"]) {
     $(id).addEventListener("change", plotPhase);
+  }
+  for (const id of ["lc-ratios-check", "lc-ratios-limit-select"]) {
+    $(id).addEventListener("change", () => {
+      const v = state.lcView;
+      if (!v || v.kind !== "night") return;
+      v.lc.ratios = null;
+      if ($("lc-ratios-check").checked) loadNightRatios(v.nightId, v.lc);
+      else plotNightLc(v.nightId, v.lc);
+    });
   }
   $("lc-unit-select").addEventListener("change", () => {
     replotLightcurve();
