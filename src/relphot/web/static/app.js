@@ -25,6 +25,7 @@ const state = {
   rerunKey: null, // ids of the pending requests at the last poll (null before the first)
   lcView: null, // plotted light curve {kind, nightId, lc}, re-plotted when the y unit changes
   tileView: null, // plotted tile lc {kind, nightId, tile, aperture, lc, type} type in [reference, comparison]
+  repeatWindows: null, // last /api/repeat/predict response for the loaded object
   timeMarker: null, // x (BJD_TDB - 2460000) of the dashed line a click on the light curve set, or null
 };
 
@@ -93,6 +94,7 @@ function collectFilters() {
     ["filter-needs-review", "needs_review"],
     ["filter-user-reviewed", "user_reviewed"],
     ["filter-rerun-pending", "rerun_pending"],
+    ["filter-has-repeat-family", "has_repeat_family"],
     ["filter-known", "known"],
     ["filter-status", "status"],
     ["filter-has-periodogram", "has_periodogram"],
@@ -140,7 +142,7 @@ const RESULT_COLUMNS = [
   "mean_mag", "mean_mag_app", "mag_zp_source", "n_nights", "best_snr", "depth", "duration_h",
   "duration_lower_limit",
   "amplitude", "status", "first_night", "last_night", "n_review_pending", "n_nights_reviewed",
-  "n_transit_events", "max_p_match", "period_delta",
+  "n_transit_events", "max_p_match", "n_repeat_families", "period_delta",
   "period_delta_err", "period_verify_status", "period_verify_note",
   "n_rerun_pending", "last_rerun_status", "last_rerun_finished_at",
 ];
@@ -598,6 +600,7 @@ async function refreshObject() {
   renderMeta(data.object);
   renderDetections(data.detections);
   renderTransitEvents(data.transit_events);
+  renderRepeatFamilies(data);
   renderNightReviews(data.nights, data.object);
   prefillEditBox(data.object);
 }
@@ -627,6 +630,320 @@ function renderTransitMatches(matches) {
     }
     tbody.appendChild(tr);
   }
+}
+
+// ---------------------------------------------------------------------
+// Repeated-event candidates: families of alike transit events of one object. Nothing is merged;
+// SAME / DIFFERENT only store the person's verdict on a pair (relphot.repeat_decision), and the
+// families are recomputed at the next `relphot db analyze` (stale until then).
+// ---------------------------------------------------------------------
+
+const REPEAT_STALE_TEXT = "stale \u2014 recomputed at next analyze";
+
+function repeatCell(tr, content, title) {
+  const td = document.createElement("td");
+  if (content instanceof Node) td.appendChild(content);
+  else td.textContent = content === null || content === undefined ? "" : String(content);
+  if (title) td.title = title;
+  tr.appendChild(td);
+  return td;
+}
+
+function repeatFlag(text, title, warn) {
+  const span = document.createElement("span");
+  span.className = "repeat-flag" + (warn ? " warn-flag" : "");
+  span.textContent = text;
+  span.title = title;
+  return span;
+}
+
+function repeatTc(tc) {
+  return tc === null || tc === undefined ? "" : (tc - 2460000).toFixed(5);
+}
+
+function repeatMembersTable(fam) {
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>Night</th><th>tc (BJD-2460000)</th><th>Depth</th><th>T14</th>"
+    + "<th>Ingress T12/T14</th><th>Status</th><th></th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  for (const m of fam.members) {
+    const tr = document.createElement("tr");
+    const night = document.createElement("span");
+    night.textContent = `${m.night_label || ""} (${m.telescope || ""})`;
+    if (m.loose) {
+      const mark = document.createElement("span");
+      mark.className = "loose-mark";
+      mark.textContent = "loose night";
+      mark.title = "a loosely tied night (short or cloudy): shape and time are still its own fit";
+      night.appendChild(mark);
+    }
+    repeatCell(tr, night);
+    repeatCell(tr, repeatTc(m.tc));
+    repeatCell(tr, fmtPm(m.depth, m.depth_err, 4));
+    // an incomplete transit's duration is only a minimum: "\u2265 x.xx h", never a measurement
+    repeatCell(tr, m.t14_lower_limit ? m.duration_display : fmtPm(m.t14_h, m.t14_err, 3) + " h",
+      m.t14_lower_limit ? "incomplete event: T14 is a lower limit" : "");
+    repeatCell(tr, fmtPm(m.ingress_frac, m.ingress_err, 3));
+    repeatCell(tr, m.effective_status);
+    const plot = document.createElement("button");
+    plot.textContent = "Plot";
+    plot.addEventListener("click", () => loadNightLc(m.night_id));
+    repeatCell(tr, plot);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  return table;
+}
+
+function repeatLinksTable(fam) {
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>Pair</th><th>dt (d)</th><th>p(match)</th>"
+    + "<th title=\"likelihood-ratio test of one common trapezoid on both light curves\">p(joint)</th>"
+    + "<th>Flags</th><th>Your verdict</th><th>Decide</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  for (const lk of fam.links) {
+    const tr = document.createElement("tr");
+    repeatCell(tr, `${lk.night_label_a} / ${lk.night_label_b}`);
+    repeatCell(tr, fmtValue(lk.dt_days, 5));
+    repeatCell(tr, lk.p_match === null ? "" : lk.p_match.toPrecision(3));
+    repeatCell(tr, lk.p_joint === null ? "n/a" : `${lk.p_joint.toPrecision(3)} (dof ${lk.dof_joint})`);
+    const flags = document.createElement("span");
+    flags.appendChild(lk.phys_ok
+      ? repeatFlag("P_min ok", `${lk.n_alias} period alias(es) long enough for a star of the assumed density`, false)
+      : repeatFlag("too dense", "every period dt/k is shorter than the density bound allows", true));
+    if (lk.diurnal) {
+      flags.appendChild(repeatFlag("daily", "dt is a whole number of days: a nightly systematic at a fixed time looks the same", true));
+    }
+    if (lk.involves_loose) flags.appendChild(repeatFlag("loose", "involves a loose night", false));
+    repeatCell(tr, flags);
+    repeatCell(tr, lk.decision || "", lk.decision_applied !== lk.decision ? "changed since the family was computed" : "");
+    const tdAct = document.createElement("td");
+    const note = document.createElement("input");
+    note.type = "text";
+    note.size = 14;
+    note.placeholder = "note";
+    const msg = document.createElement("span");
+    for (const decision of ["SAME", "DIFFERENT"]) {
+      const btn = document.createElement("button");
+      btn.textContent = decision;
+      btn.title = decision === "SAME"
+        ? "these two events are transits of one planet (nothing is merged)"
+        : "these are not the same signal (both events stay)";
+      btn.addEventListener("click", () => saveRepeatDecision(lk.det_a, lk.det_b, decision, note.value, msg));
+      tdAct.appendChild(btn);
+    }
+    tdAct.appendChild(note);
+    tdAct.appendChild(msg);
+    tr.appendChild(tdAct);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  return table;
+}
+
+function repeatAliasTable(fam) {
+  const counts = {};
+  for (const a of fam.aliases) counts[a.status] = (counts[a.status] || 0) + 1;
+  const details = document.createElement("details");
+  details.open = fam.aliases.length <= 12;
+  const summary = document.createElement("summary");
+  summary.textContent = `Periods (aliases P = dt/k): ${counts.allowed || 0} allowed, `
+    + `${counts.vetoed_nondetection || 0} ruled out by a non-detection, `
+    + `${counts.vetoed_density || 0} too short for the stellar density`;
+  details.appendChild(summary);
+  const scroll = document.createElement("div");
+  scroll.className = "table-scroll";
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>k</th><th>P \u00b1 err (d)</th><th>tc0 (BJD-2460000)</th>"
+    + "<th>Status</th><th title=\"nights whose frames cover a predicted transit\">Nights tested</th>"
+    + "<th title=\"delta chi2 of the family's transit against flat on the night that vetoed it\">Worst \u0394\u03c7\u00b2</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  for (const a of fam.aliases) {
+    const tr = document.createElement("tr");
+    tr.className = a.status === "allowed" ? "" : "alias-vetoed";
+    repeatCell(tr, a.alias_k);
+    repeatCell(tr, a.period_err === null || a.period_err === undefined
+      ? a.period.toFixed(5) : `${a.period.toFixed(5)} \u00b1 ${a.period_err.toPrecision(2)}`);
+    repeatCell(tr, repeatTc(a.tc0));
+    const td = repeatCell(tr, a.status.replace("_", " "));
+    if (a.status === "allowed") td.className = "alias-allowed";
+    repeatCell(tr, fmtValue(a.n_nights_tested));
+    repeatCell(tr, a.veto_dchi2 === null || a.veto_dchi2 === undefined ? ""
+      : `${a.veto_dchi2.toFixed(1)}${a.veto_night_label ? " (" + a.veto_night_label + ")" : ""}`);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  scroll.appendChild(table);
+  details.appendChild(scroll);
+  return details;
+}
+
+function repeatFamilyBlock(fam) {
+  const box = document.createElement("div");
+  box.className = "repeat-family" + (fam.stale ? " stale" : "");
+  const head = document.createElement("h4");
+  const tail = fam.t14_lower_limit ? `T14 \u2265 ${fam.t14_h.toFixed(2)} h` : `T14 ${fam.t14_h.toFixed(2)} h`;
+  head.textContent = `Family ${fam.fam_id}: ${fam.members.length} of ${fam.n_members_stored} events, `
+    + `depth ${fmtValue(fam.depth, 3)}, ${tail}, score ${fmtValue(fam.score, 2)}`
+    + (fam.accepted ? " \u2014 accepted by you" : "");
+  if (fam.involves_loose) {
+    const loose = document.createElement("span");
+    loose.className = "loose-mark";
+    loose.textContent = "involves a loose night";
+    head.appendChild(loose);
+  }
+  if (fam.stale) {
+    const badge = document.createElement("span");
+    badge.className = "stale-badge";
+    badge.textContent = "stale";
+    badge.title = fam.stale_reason;
+    head.appendChild(document.createTextNode(" "));
+    head.appendChild(badge);
+  }
+  box.appendChild(head);
+  if (fam.stale) {
+    const why = document.createElement("div");
+    why.className = "note";
+    why.textContent = fam.stale_reason || REPEAT_STALE_TEXT;
+    box.appendChild(why);
+  }
+  for (const node of [repeatMembersTable(fam), repeatLinksTable(fam), repeatAliasTable(fam)]) {
+    if (node.tagName === "TABLE") {
+      const wrap = document.createElement("div");
+      wrap.className = "table-scroll";
+      wrap.appendChild(node);
+      box.appendChild(wrap);
+    } else {
+      box.appendChild(node);
+    }
+  }
+  return box;
+}
+
+function renderRepeatDecisions(decisions) {
+  const tbody = qs("#detail-repeat-decisions tbody");
+  tbody.innerHTML = "";
+  $("repeat-decisions-details").hidden = !(decisions || []).length;
+  for (const d of decisions || []) {
+    const tr = document.createElement("tr");
+    repeatCell(tr, `${d.label_a} / ${d.label_b}`);
+    repeatCell(tr, `${repeatTc(d.tc_a)} / ${repeatTc(d.tc_b)}`);
+    repeatCell(tr, d.decision);
+    repeatCell(tr, d.note || "");
+    repeatCell(tr, d.updated_at ? String(d.updated_at).replace("T", " ").slice(0, 19) : "");
+    const btn = document.createElement("button");
+    btn.textContent = "Clear";
+    btn.title = "forget this verdict: the automatic link stands again at the next analyze";
+    const ev = (state.currentObject.transit_events || []);
+    btn.addEventListener("click", () => clearRepeatDecision(d, ev, btn));
+    repeatCell(tr, btn);
+    tbody.appendChild(tr);
+  }
+}
+
+function renderRepeatFamilies(data) {
+  const box = $("repeat-families");
+  box.innerHTML = "";
+  const fams = data.repeat_families || [];
+  $("repeat-stale-badge").hidden = !fams.some((f) => f.stale);
+  if (!fams.length) {
+    const p = document.createElement("p");
+    p.className = "note";
+    p.textContent = "No repeated-event family for this object.";
+    box.appendChild(p);
+  }
+  for (const fam of fams) box.appendChild(repeatFamilyBlock(fam));
+  renderRepeatDecisions(data.repeat_decisions);
+  $("repeat-predict-box").hidden = !fams.length;
+  if (fams.length) loadRepeatPredict();
+  else state.repeatWindows = null;
+}
+
+async function saveRepeatDecision(detA, detB, decision, note, msgSpan) {
+  if (!state.currentObject) return;
+  const objId = state.currentObject.object.obj_id;
+  const resp = await fetch(`/api/object/${objId}/repeat_link`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ det_a: detA, det_b: detB, decision, note: note || null }),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    if (msgSpan) msgSpan.textContent = data.detail || "could not save";
+    return;
+  }
+  await refreshObject();
+  $("edit-status-msg").textContent = `pair ${detA}/${detB}: ${decision}. ${data.note}`;
+}
+
+// clear a stored verdict: the two events of the pair are found by night and centre time
+async function clearRepeatDecision(d, events, btn) {
+  const near = (nightId, tc) => events.find(
+    (e) => e.night_id === nightId && e.tc !== null && Math.abs(e.tc - tc) < 0.01 + 0.5 * (e.t14_h || 0) / 24
+  );
+  const a = near(d.night_a, d.tc_a);
+  const b = near(d.night_b, d.tc_b);
+  if (!a || !b) {
+    btn.textContent = "event gone";
+    return;
+  }
+  const objId = state.currentObject.object.obj_id;
+  const resp = await fetch(`/api/object/${objId}/repeat_link?det_a=${a.det_id}&det_b=${b.det_id}`, {
+    method: "DELETE",
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    btn.textContent = data.detail || "failed";
+    return;
+  }
+  await refreshObject();
+  $("edit-status-msg").textContent = data.note;
+}
+
+function renderRepeatWindows(data) {
+  const tbody = qs("#detail-repeat-windows tbody");
+  tbody.innerHTML = "";
+  const msg = $("repeat-predict-msg");
+  if (!data) {
+    msg.textContent = "";
+    return;
+  }
+  msg.textContent = data.windows.length
+    ? `${data.windows.length} window(s), ${data.start_utc} to ${data.end_utc} UTC`
+    : `no predicted window between ${data.start_utc} and ${data.end_utc} UTC`;
+  for (const w of data.windows) {
+    const tr = document.createElement("tr");
+    repeatCell(tr, w.fam_id === null ? "" : `Family ${w.fam_id}`);
+    repeatCell(tr, w.start_utc);
+    repeatCell(tr, w.end_utc);
+    repeatCell(tr, `${(w.start_bjd - 2460000).toFixed(3)} \u2013 ${(w.end_bjd - 2460000).toFixed(3)}`);
+    repeatCell(tr, `${w.n_aliases} / ${w.n_aliases_total}`,
+      w.n_aliases < w.n_aliases_total ? "only some allowed periods predict this window" : "");
+    repeatCell(tr, fmtValue(w.depth, 3));
+    repeatCell(tr, w.duration_display || "");
+    repeatCell(tr, w.stale ? "stale family" : "");
+    tbody.appendChild(tr);
+  }
+}
+
+// the loaded object's windows: the next 10 days from now unless the inputs say otherwise
+async function loadRepeatPredict() {
+  if (!state.currentObject) return;
+  const objId = state.currentObject.object.obj_id;
+  const params = new URLSearchParams({ obj_id: String(objId) });
+  const start = $("repeat-start").value.trim();
+  const end = $("repeat-end").value.trim();
+  if (start) params.set("start", start);
+  if (end) params.set("end", end);
+  const resp = await fetch(`/api/repeat/predict?${params}`);
+  if (!state.currentObject || state.currentObject.object.obj_id !== objId) return;
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    $("repeat-predict-msg").textContent = err.detail || "prediction failed";
+    return;
+  }
+  state.repeatWindows = await resp.json();
+  renderRepeatWindows(state.repeatWindows);
 }
 
 function renderPeriodEstimates(rows) {
@@ -927,6 +1244,7 @@ async function loadObject(objId) {
   renderDetections(data.detections);
   renderTransitEvents(data.transit_events);
   renderTransitMatches(data.transit_matches);
+  renderRepeatFamilies(data);
   renderPeriodEstimates(data.period_estimates);
   renderNightButtons(data.object, data.nights);
   renderNightReviews(data.nights, data.object);
@@ -2150,6 +2468,7 @@ async function refreshAndPlotNight(nightId) {
     state.currentObject = data;
     renderTransitEvents(data.transit_events);
     renderTransitMatches(data.transit_matches);
+    renderRepeatFamilies(data);
     renderDetections(data.detections);
     renderPeriodEstimates(data.period_estimates);
   }
@@ -2236,6 +2555,7 @@ async function loadReprocess() {
       state.currentObject = d;
       renderTransitEvents(d.transit_events);
       renderTransitMatches(d.transit_matches);
+      renderRepeatFamilies(d);
       renderDetections(d.detections);
       renderPeriodEstimates(d.period_estimates);
       renderMeta(d.object);
@@ -2426,6 +2746,7 @@ function init() {
   });
   $("periodogram-scope-select").addEventListener("change", loadPeriodogram);
   $("periodogram-method-select").addEventListener("change", loadPeriodogram);
+  $("repeat-predict-btn").addEventListener("click", loadRepeatPredict);
   $("btn-phase-x2").addEventListener("click", () => {
     const current = phasePeriodFromInput();
     if (current !== null) loadPhase(current * 2);

@@ -265,6 +265,25 @@ def test_db_coincidence_defaults_and_toml_override(tmp_path) -> None:
     assert s.db.max_expected_noise == Settings().db.max_expected_noise  # the rest is untouched
 
 
+def test_db_repeat_event_defaults_and_toml_override(tmp_path) -> None:
+    """The repeated-event settings: defaults, [db] override (incl. the loose flag), round trip."""
+    d = Settings().db
+    assert (d.repeat_p_min, d.repeat_t14_sys_frac, d.repeat_rho_max_cgs) == (0.05, 0.05, 5.0)
+    assert (d.repeat_include_loose, d.repeat_veto_dchi2) == (True, 9.0)
+    assert (d.repeat_n_sigma_window, d.repeat_tc_err_floor_days) == (3.0, 0.002)
+    assert (d.repeat_max_aliases, d.repeat_max_family_events) == (500, 12)
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text(
+        "[db]\nrepeat_p_min = 0.1\nrepeat_rho_max_cgs = 15\nrepeat_include_loose = false\n"
+        "repeat_max_family_events = 8\n"
+    )
+    s = load_settings(cfg)
+    assert (s.db.repeat_p_min, s.db.repeat_rho_max_cgs) == (0.1, 15)
+    assert s.db.repeat_include_loose is False
+    assert s.db.repeat_max_family_events == 8
+    assert settings_from_dict(settings_to_dict(s)).db == s.db
+
+
 @pytest.mark.parametrize(
     "body",
     [

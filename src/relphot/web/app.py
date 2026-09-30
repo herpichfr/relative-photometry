@@ -3,12 +3,14 @@ docs/DB_PLAN.md, "Web (requirements 10-15)").
 
 Every read goes through the ``relphot_ro`` role (SELECT only); the manual-edit
 endpoints (``PATCH /api/object/{obj_id}``, ``PATCH /api/detection/{det_id}``,
-``PUT /api/object/{obj_id}/night/{night_id}/review``, and
+``PUT /api/object/{obj_id}/night/{night_id}/review``,
+``PUT`` / ``DELETE /api/object/{obj_id}/repeat_link``, and
 ``POST /api/object/{obj_id}/adopt_period``) and the reprocess-request endpoint
 (``POST /api/object/{obj_id}/reprocess``, an INSERT into the queue
 ``relphot db reprocess`` works off) go through ``relphot_web`` (SELECT plus UPDATE on a
 fixed set of ``relphot.object`` / ``relphot.detection`` / ``relphot.user_night_review``
-columns, plus INSERT on a fixed set of ``relphot.reprocess_request`` columns). No query
+columns, plus INSERT on a fixed set of ``relphot.reprocess_request`` columns, plus
+INSERT/UPDATE/DELETE on ``relphot.repeat_decision``). No query
 ever interpolates a user-supplied *value* into SQL -- only a handful of fixed,
 code-controlled identifiers (column names from a whitelist, ``ASC``/``DESC``) are
 ever placed directly in a query string.
@@ -32,6 +34,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from relphot.config import DbSettings
 from relphot.objflags import PLANET_CATALOGS, night_state, refresh_flags
+from relphot.repeat import (
+    decision_tol_days,
+    load_families,
+    match_decision,
+    parse_when,
+    predict_windows,
+)
 from relphot.web.db import column_exists, get_ro_conn, get_rw_conn, resolve_ro_dsn
 from relphot.web.phase import fourier_model, phase_coverage
 from relphot.web.tile_lc import (
@@ -157,6 +166,9 @@ _SEARCH_DERIVED_SQL = {
     "max_p_match": (
         "(SELECT max(m.p_match) FROM relphot.transit_match m WHERE m.obj_id = o.obj_id)"
     ),
+    "n_repeat_families": (
+        "(SELECT count(*) FROM relphot.repeat_family rf WHERE rf.obj_id = o.obj_id)"
+    ),
     "period_delta": "pv.delta",
     "period_delta_err": "pv.delta_err",
     "period_verify_status": "pv.verify_status",
@@ -210,6 +222,9 @@ def _search_filters(
     rerun_pending: bool | None = Query(
         default=None, description="objects with a RERUN request still queued or running"
     ),
+    has_repeat_family: bool | None = Query(
+        default=None, description="objects with (or without) a repeated-event family"
+    ),
     telescope: str | None = Query(default=None),
     name: str | None = Query(default=None),
     gaia_id: str | None = Query(default=None),
@@ -234,7 +249,7 @@ def _search_filters(
         "class_": class_, "is_exop": is_exop, "is_var": is_var, "min_p_match": min_p_match,
         "known": known, "source_db": source_db, "status": status,
         "needs_review": needs_review, "user_reviewed": user_reviewed,
-        "rerun_pending": rerun_pending,
+        "rerun_pending": rerun_pending, "has_repeat_family": has_repeat_family,
         "telescope": telescope, "name": name, "gaia_id": gaia_id, "ra": ra, "dec": dec,
         "radius": radius, "mag_min": mag_min, "mag_max": mag_max, "period_min": period_min,
         "period_max": period_max, "snr_min": snr_min, "depth_min": depth_min,
@@ -291,6 +306,9 @@ def _build_where(f: dict) -> tuple[str, dict[str, object]]:
             "AND rr.status IN ('queued', 'running'))"
         )
         clauses.append(pending if f["rerun_pending"] else f"NOT {pending}")
+    if f["has_repeat_family"] is not None:
+        family = "EXISTS (SELECT 1 FROM relphot.repeat_family rf WHERE rf.obj_id = o.obj_id)"
+        clauses.append(family if f["has_repeat_family"] else f"NOT {family}")
     if f["telescope"]:
         clauses.append(
             "EXISTS (SELECT 1 FROM relphot.star_night sn "
@@ -683,6 +701,8 @@ def object_detail(obj_id: int):
                 m["t14_a_display"] = _fmt_duration(m["t14_a_h"], m["t14_a_lower_limit"])
                 m["t14_b_display"] = _fmt_duration(m["t14_b_h"], m["t14_b_lower_limit"])
 
+            repeat_families, repeat_decisions = _object_repeat(conn, cur, obj_id)
+
             cur.execute(
                 "SELECT est_id, computed_at, method, input, night_ids, n_nights, last_night, "
                 "baseline_days, period, period_err, power, fap, lit_period, lit_period_err, "
@@ -725,6 +745,8 @@ def object_detail(obj_id: int):
             "ties": ties,
             "transit_events": transit_events,
             "transit_matches": transit_matches,
+            "repeat_families": repeat_families,
+            "repeat_decisions": repeat_decisions,
             "period_estimates": period_estimates,
         }
     )
@@ -2163,6 +2185,283 @@ def delete_night_review(obj_id: int, night_id: int):
     """Delete a per-night review (same as PUT with all null)."""
     body = NightReviewBody(exop=None, var=None, note=None)
     return put_night_review(obj_id, night_id, body)
+
+
+# --------------------------------------------------------------------------
+# Repeated transit events: /api/object/{obj_id}/repeat_link, /api/repeat/predict
+# --------------------------------------------------------------------------
+
+#: ``relphot db analyze`` recomputes the families; until then a web verdict only marks them stale.
+_REPEAT_NOTE = (
+    "Families and their periods are recomputed at the next `relphot db analyze`; "
+    "until then the affected families are marked stale."
+)
+_STALE_TEXT = "stale \u2014 recomputed at next analyze"
+_PREDICT_DEFAULT_DAYS = 10.0
+
+
+def _has_repeat_tables(conn: psycopg.Connection) -> bool:
+    """Whether migration 012 (``relphot.repeat_family``) is applied."""
+    return column_exists(conn, "repeat_family", "fam_id")
+
+
+def _object_repeat(
+    conn: psycopg.Connection, cur: psycopg.Cursor, obj_id: int
+) -> tuple[list[dict], list[dict]]:
+    """``(repeat_families, repeat_decisions)`` of one object for ``/api/object``.
+
+    Every stored family is returned, whatever its alias statuses. Members the person has since
+    rejected (or the coincidence check auto-rejected, unless confirmed) are dropped and the family
+    is marked ``stale``, as it is when a decision was made on one of its pairs since it was
+    computed: the families themselves only change at the next ``relphot db analyze``. Links are
+    the stored pair scores (``decision`` is the person's current one, ``decision_applied`` the one
+    the family was computed with).
+    """
+    if not _has_repeat_tables(conn):
+        return [], []
+    cur.execute(
+        "SELECT fam_id, family_key, n_members, member_night_ids, involves_loose, depth, "
+        "depth_err, t14_h, t14_lower_limit, ingress_frac, score, n_alias, n_allowed, accepted, "
+        "computed_at FROM relphot.repeat_family WHERE obj_id = %s ORDER BY fam_id",
+        (obj_id,),
+    )
+    families = _rows_to_dicts(cur, cur.fetchall())
+    cur.execute(
+        "SELECT r.night_a, na.label AS label_a, r.night_b, nb.label AS label_b, r.tc_a, r.tc_b, "
+        "r.decision, r.note, r.updated_at "
+        "FROM relphot.repeat_decision r "
+        "JOIN relphot.night na ON na.night_id = r.night_a "
+        "JOIN relphot.night nb ON nb.night_id = r.night_b "
+        "WHERE r.obj_id = %s ORDER BY r.night_a, r.night_b, r.tc_a",
+        (obj_id,),
+    )
+    decisions = _rows_to_dicts(cur, cur.fetchall())
+    if not families:
+        return [], decisions
+    fam_ids = [f["fam_id"] for f in families]
+
+    cur.execute(
+        "SELECT m.fam_id, d.det_id, d.night_id, n.label AS night_label, n.telescope, "
+        "ts.tc, ts.tc_err, ts.depth, ts.depth_err, ts.t14_h, ts.t14_err, ts.t14_lower_limit, "
+        "ts.ingress_frac, ts.ingress_err, d.status, d.auto_status, d.flags, "
+        "(d.night_id IN (SELECT unnest(loose_night_ids) FROM relphot.mn_run)) AS loose "
+        "FROM relphot.repeat_family_member m "
+        "JOIN relphot.detection d ON d.det_id = m.det_id "
+        "JOIN relphot.transit_shape ts ON ts.det_id = m.det_id "
+        "JOIN relphot.night n ON n.night_id = d.night_id "
+        "WHERE m.fam_id = ANY(%s) ORDER BY m.fam_id, ts.tc",
+        (fam_ids,),
+    )
+    members_by_fam: dict[int, list[dict]] = {}
+    for mem in _rows_to_dicts(cur, cur.fetchall()):
+        mem["effective_status"] = _effective_status(mem["status"], mem["auto_status"])
+        mem["duration_display"] = _fmt_duration(mem["t14_h"], mem["t14_lower_limit"])
+        members_by_fam.setdefault(mem.pop("fam_id"), []).append(mem)
+
+    cur.execute(
+        "SELECT det_a, det_b, dt_days, p_match, p_joint, chi2_joint, dof_joint, phys_ok, "
+        "n_alias, diurnal, involves_loose, linked, decision FROM relphot.repeat_link "
+        "WHERE obj_id = %s",
+        (obj_id,),
+    )
+    link_of = {(r["det_a"], r["det_b"]): r for r in _rows_to_dicts(cur, cur.fetchall())}
+
+    cur.execute(
+        "SELECT fam_id, alias_k, period, period_err, tc0, tc0_err, status, veto_night_id, "
+        "veto_dchi2, n_nights_tested FROM relphot.repeat_ephemeris WHERE fam_id = ANY(%s) "
+        "ORDER BY fam_id, alias_k",
+        (fam_ids,),
+    )
+    aliases_by_fam: dict[int, list[dict]] = {}
+    for al in _rows_to_dicts(cur, cur.fetchall()):
+        aliases_by_fam.setdefault(al.pop("fam_id"), []).append(al)
+    night_label = {}
+    if any(a["veto_night_id"] is not None for al in aliases_by_fam.values() for a in al):
+        cur.execute("SELECT night_id, label FROM relphot.night")
+        night_label = dict(cur.fetchall())
+
+    for fam in families:
+        all_members = members_by_fam.get(fam["fam_id"], [])
+        members = [
+            m for m in all_members
+            if m["status"] != "REJECTED"
+            and not (m["auto_status"] == "REJECTED" and m["status"] != "CONFIRMED")
+        ]
+        reasons = []
+        if len(members) < len(all_members):
+            reasons.append(f"{len(all_members) - len(members)} member(s) rejected since")
+        links = []
+        for i, a in enumerate(members):
+            for b in members[i + 1:]:
+                first, second = sorted((a, b), key=lambda e: e["det_id"])
+                stored = link_of.get((first["det_id"], second["det_id"]))
+                if stored is None:
+                    continue
+                live = match_decision(a, b, decisions)
+                if live != stored["decision"]:
+                    reasons.append("a decision changed since")
+                links.append({
+                    **stored, "decision_applied": stored["decision"], "decision": live,
+                    "night_label_a": first["night_label"], "night_label_b": second["night_label"],
+                })
+        fam["members"] = members
+        fam["links"] = links
+        fam["aliases"] = aliases_by_fam.get(fam["fam_id"], [])
+        for al in fam["aliases"]:
+            al["veto_night_label"] = night_label.get(al["veto_night_id"])
+        fam["stale"] = bool(reasons)
+        fam["stale_reason"] = (
+            f"{_STALE_TEXT} ({'; '.join(sorted(set(reasons)))})" if reasons else None
+        )
+        fam["n_members_stored"] = len(all_members)
+    return families, decisions
+
+
+class RepeatLinkBody(BaseModel):
+    """The person's verdict on a pair of one object's transit events: SAME (one planet) or
+    DIFFERENT. The events are never merged and are kept either way; ``det_a`` / ``det_b`` are
+    the pair's detection ids (either order)."""
+
+    det_a: int
+    det_b: int
+    decision: str
+    note: str | None = None
+
+
+def _repeat_pair(cur: psycopg.Cursor, obj_id: int, det_a: int, det_b: int) -> tuple[dict, dict]:
+    """The two events (night id, fitted tc, T14) of a pair, ordered ``(night, tc)``."""
+    if det_a == det_b:
+        raise HTTPException(status_code=400, detail="det_a and det_b must differ")
+    cur.execute(
+        "SELECT d.det_id, d.night_id, ts.tc, ts.t14_h FROM relphot.detection d "
+        "JOIN relphot.transit_shape ts ON ts.det_id = d.det_id "
+        "WHERE d.obj_id = %s AND d.kind = 'transit' AND d.det_id = ANY(%s) "
+        "AND ts.tc IS NOT NULL AND ts.t14_h IS NOT NULL",
+        (obj_id, [det_a, det_b]),
+    )
+    events = _rows_to_dicts(cur, cur.fetchall())
+    if len(events) != 2:
+        raise HTTPException(
+            status_code=404, detail="both events must be transit events of this object with a fit"
+        )
+    first, second = sorted(events, key=lambda e: (e["night_id"], e["tc"]))
+    return first, second
+
+
+def _delete_repeat_decision(cur: psycopg.Cursor, obj_id: int, first: dict, second: dict) -> int:
+    """Delete the stored decision(s) on the pair (same nights, centre times within tolerance)."""
+    tol = decision_tol_days(first["t14_h"], second["t14_h"])
+    cur.execute(
+        "DELETE FROM relphot.repeat_decision WHERE obj_id = %s AND night_a = %s AND night_b = %s "
+        "AND abs(tc_a - %s) <= %s AND abs(tc_b - %s) <= %s",
+        (obj_id, first["night_id"], second["night_id"], first["tc"], tol, second["tc"], tol),
+    )
+    return cur.rowcount
+
+
+@app.put("/api/object/{obj_id}/repeat_link")
+def put_repeat_link(obj_id: int, body: RepeatLinkBody):
+    """Record SAME / DIFFERENT on a pair of events (replacing an earlier decision on it).
+
+    Written with the ``relphot_web`` role into ``relphot.repeat_decision`` only; nothing else is
+    touched and no event is merged or rejected. The families change at the next ``relphot db
+    analyze`` (the response says so).
+    """
+    if body.decision not in ("SAME", "DIFFERENT"):
+        raise HTTPException(status_code=400, detail="decision must be 'SAME' or 'DIFFERENT'")
+    if body.note is not None and len(body.note) > _REVIEW_NOTE_MAX:
+        raise HTTPException(
+            status_code=400, detail=f"note must be at most {_REVIEW_NOTE_MAX} characters"
+        )
+    with get_rw_conn() as conn, conn.cursor() as cur:
+        first, second = _repeat_pair(cur, obj_id, body.det_a, body.det_b)
+        _delete_repeat_decision(cur, obj_id, first, second)
+        cur.execute(
+            "INSERT INTO relphot.repeat_decision "
+            "(obj_id, night_a, night_b, tc_a, tc_b, decision, note) "
+            "VALUES (%s, %s, %s, %s, %s, %s, NULLIF(%s, '')) "
+            "RETURNING night_a, night_b, tc_a, tc_b, decision, note, updated_at",
+            (
+                obj_id, first["night_id"], second["night_id"], first["tc"], second["tc"],
+                body.decision, body.note or "",
+            ),
+        )
+        row = _rows_to_dicts(cur, cur.fetchall())[0]
+        conn.commit()
+    return _json({"decision": row, "det_a": first["det_id"], "det_b": second["det_id"],
+                  "note": _REPEAT_NOTE})
+
+
+@app.delete("/api/object/{obj_id}/repeat_link")
+def delete_repeat_link(obj_id: int, det_a: int = Query(...), det_b: int = Query(...)):
+    """Forget the decision on a pair of events (no decision = the automatic link stands)."""
+    with get_rw_conn() as conn, conn.cursor() as cur:
+        first, second = _repeat_pair(cur, obj_id, det_a, det_b)
+        deleted = _delete_repeat_decision(cur, obj_id, first, second)
+        conn.commit()
+    return _json({"deleted": deleted, "det_a": first["det_id"], "det_b": second["det_id"],
+                  "note": _REPEAT_NOTE})
+
+
+@app.get("/api/repeat/predict")
+def repeat_predict(
+    start: str | None = Query(default=None, description="UTC date/date-time or BJD; default now"),
+    end: str | None = Query(
+        default=None, description="UTC date (whole day) / date-time or BJD; default start + 10 d"
+    ),
+    telescope: str | None = Query(default=None),
+    obj_id: int | None = Query(default=None),
+    min_alias_frac: float = Query(default=0.0, ge=0.0, le=1.0),
+    accepted_only: bool = Query(default=False),
+):
+    """Windows in which the stored repeated-event families may transit (allowed aliases only).
+
+    Read-only: :func:`relphot.repeat.predict_windows` over the stored ephemerides. A window lists
+    how many of the family's allowed aliases predict a transit in it; ``stale`` marks a family
+    with a member rejected (or a decision made) since it was computed.
+    """
+    from astropy.time import Time
+
+    try:
+        start_jd = parse_when(start, end=False) if start else float(Time.now().tdb.jd)
+        end_jd = parse_when(end, end=True) if end else start_jd + _PREDICT_DEFAULT_DAYS
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"cannot read start / end: {exc}") from exc
+    if not end_jd > start_jd:
+        raise HTTPException(status_code=400, detail="end must be after start")
+    if end_jd - start_jd > 400.0:
+        raise HTTPException(status_code=400, detail="the range is limited to 400 days")
+
+    def utc(jd: float) -> str:
+        return Time(jd, format="jd", scale="tdb").utc.strftime("%Y-%m-%d %H:%M")
+
+    windows: list[dict] = []
+    n_families = 0
+    with get_ro_conn() as conn:
+        available = _has_repeat_tables(conn)
+        if available:
+            families = load_families(
+                conn, None if obj_id is None else [obj_id], telescope=telescope,
+                accepted_only=accepted_only,
+            )
+            n_families = len(families)
+            names = {f["obj_id"]: f["obj_name"] for f in families}
+            for w in predict_windows(families, start_jd, end_jd, DbSettings()):
+                if w.n_aliases < min_alias_frac * w.n_aliases_total:
+                    continue
+                windows.append({
+                    "obj_id": w.obj_id, "obj_name": names.get(w.obj_id), "fam_id": w.fam_id,
+                    "start_bjd": w.start, "end_bjd": w.end, "start_utc": utc(w.start),
+                    "end_utc": utc(w.end), "n_aliases": w.n_aliases,
+                    "n_aliases_total": w.n_aliases_total, "depth": w.depth, "t14_h": w.t14_h,
+                    "t14_lower_limit": w.t14_lower_limit, "duration_display":
+                    _fmt_duration(w.t14_h, w.t14_lower_limit), "stale": w.stale,
+                })
+    return _json({
+        "available": available, "start_bjd": start_jd, "end_bjd": end_jd,
+        "start_utc": utc(start_jd), "end_utc": utc(end_jd), "n_families": n_families,
+        "windows": windows,
+    })
 
 
 # --------------------------------------------------------------------------

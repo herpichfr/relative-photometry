@@ -533,6 +533,15 @@ def load_night(
                 (night_id,),
             )
             saved_reviews = cur.fetchall()
+            # the repeated-event families with an event of this night go too (their ephemeris
+            # rows stay as history); `db analyze` recomputes them
+            cur.execute(
+                "DELETE FROM relphot.repeat_family WHERE fam_id IN ("
+                "SELECT m.fam_id FROM relphot.repeat_family_member m "
+                "JOIN relphot.detection d ON d.det_id = m.det_id "
+                "WHERE d.night_id = %s AND d.origin = 'search')",
+                (night_id,),
+            )
             # a user's own detections (origin = 'user') are never reloaded away
             cur.execute(
                 "DELETE FROM relphot.detection WHERE night_id = %s AND origin = 'search'",
@@ -887,6 +896,9 @@ def load_night(
                     )
                     AND NOT EXISTS (
                         SELECT 1 FROM relphot.user_night_review r WHERE r.obj_id = o.obj_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM relphot.repeat_decision r WHERE r.obj_id = o.obj_id
                     )
                 """
             )

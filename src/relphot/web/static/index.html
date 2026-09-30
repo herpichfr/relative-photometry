@@ -81,6 +81,18 @@
           </label>
         </fieldset>
 
+        <fieldset>
+          <legend>Repeated events</legend>
+          <label>Has family
+            <select id="filter-has-repeat-family" name="has_repeat_family"
+                    title="objects with a candidate family of repeated transit events">
+              <option value="">any</option>
+              <option value="true">yes</option>
+              <option value="false">no</option>
+            </select>
+          </label>
+        </fieldset>
+
         <label class="field">Min transit-match p
           <input type="number" step="any" min="0" max="1" id="filter-min-p-match" name="min_p_match"
                  title="objects with a pair of transit events whose matching probability is at least this">
@@ -278,6 +290,52 @@
         </thead>
         <tbody></tbody>
       </table>
+    </div>
+
+    <h3>Repeated-event candidates <span id="repeat-stale-badge" class="stale-badge" hidden
+        title="a member was rejected or a pair decided since the families were computed">stale</span></h3>
+    <div class="note">Transit events of this object that look alike (depth, T14, ingress, and a joint
+      refit of their light curves) and whose centre times share a period form a candidate family.
+      Nothing is merged and no event is rejected: SAME / DIFFERENT only record your verdict on a pair
+      (DIFFERENT keeps both events as separate signals, e.g. two planets). Families, their periods
+      and the aliases that the star's own light curves rule out are recomputed at the next
+      <code>relphot db analyze</code>; until then a family with a rejected member or a new verdict is
+      marked stale. The T14 of an incomplete transit is only a lower limit (&ge;); periods are
+      provisional (P = dt / k), and vetoed aliases stay listed.</div>
+    <div id="repeat-families"></div>
+    <details id="repeat-decisions-details" hidden>
+      <summary>Your decisions on pairs</summary>
+      <div class="table-scroll">
+        <table id="detail-repeat-decisions">
+          <thead>
+            <tr><th>Pair</th><th>tc a / tc b (BJD-2460000)</th><th>Decision</th><th>Note</th>
+                <th>Set</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </details>
+    <div id="repeat-predict-box" hidden>
+      <h4>Predicted transit windows</h4>
+      <div class="note">Windows in which an allowed period of these families predicts a transit
+        (centre &plusmn; 3 sigma timing error + T14/2, BJD_TDB; barycentric correction ignored).
+        A window predicted by only some of the allowed periods tells them apart.</div>
+      <div class="rerun-entry">
+        <label>From (UTC date or BJD) <input type="text" id="repeat-start" size="12" placeholder="now"></label>
+        <label>To <input type="text" id="repeat-end" size="12" placeholder="+10 d"></label>
+        <button type="button" id="repeat-predict-btn">Predict</button>
+        <span id="repeat-predict-msg"></span>
+      </div>
+      <div class="table-scroll">
+        <table id="detail-repeat-windows">
+          <thead>
+            <tr><th>Family</th><th>Start (UTC)</th><th>End (UTC)</th><th>BJD-2460000</th>
+                <th title="allowed aliases predicting a transit in the window / allowed aliases">Aliases</th>
+                <th>Depth</th><th>T14</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </div>
 
     <h3>Period verification</h3>
