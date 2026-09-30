@@ -13,6 +13,7 @@ from relphot.lightcurve import compute_light_curves
 from relphot.members import (
     build_members,
     load_members_npz,
+    members_path_for,
     save_members_npz,
 )
 from relphot.reference import (
@@ -454,3 +455,12 @@ def test_save_load_members_npz_round_trip() -> None:
             a = getattr(product, attr)
             b = getattr(product2, attr)
             np.testing.assert_array_equal(a, b, strict=True)
+
+
+def test_members_path_for_with_and_without_npz_suffix() -> None:
+    """With and without .npz suffix, members_path_for produces consistent paths."""
+    from pathlib import Path
+
+    assert members_path_for("lc/night_lc") == Path("lc/night_lc_members.npz")
+    assert members_path_for("lc/night_lc.npz") == Path("lc/night_lc_members.npz")
+    assert members_path_for("lc/x_lightcurves.npz") == Path("lc/x_members.npz")

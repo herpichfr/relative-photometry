@@ -153,8 +153,10 @@ def members_path_for(lc_npz_path: Path | str) -> Path:
     stem = lc_path.name
     if stem.endswith("_lightcurves.npz"):
         new_stem = stem[:-len("_lightcurves.npz")] + "_members.npz"
-    else:
-        new_stem = stem[:-4] + "_members.npz"
+    elif stem.endswith(".npz"):
+        new_stem = stem[: -len(".npz")] + "_members.npz"
+    else:  # an --out stem without the suffix, e.g. lc/night_lc
+        new_stem = stem + "_members.npz"
     return lc_path.with_name(new_stem)
 
 
