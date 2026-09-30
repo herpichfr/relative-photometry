@@ -25,6 +25,7 @@ const state = {
   rerunKey: null, // ids of the pending requests at the last poll (null before the first)
   lcView: null, // plotted light curve {kind, nightId, lc}, re-plotted when the y unit changes
   tileView: null, // plotted tile lc {kind, nightId, tile, aperture, lc, type} type in [reference, comparison]
+  timeMarker: null, // x (BJD_TDB - 2460000) of the dashed line a click on the light curve set, or null
 };
 
 function $(id) {
@@ -916,6 +917,7 @@ async function loadObject(objId) {
   const data = await resp.json();
   state.currentObject = data;
   state.currentNightId = null;
+  state.timeMarker = null;
 
   $("detail-panel").hidden = false;
   renderDetailHeader(data.object);
@@ -1151,6 +1153,7 @@ function plotNightLc(nightId, lc) {
     selectdirection: "h",
   }, { responsive: true });
   attachLightcurveEvents();
+  applyTimeMarker("plot-lightcurve");
 }
 
 async function loadCombinedLc() {
@@ -1225,6 +1228,7 @@ function plotCombinedLc(lc) {
     },
   };
   Plotly.newPlot("plot-lightcurve", traces, layout, { responsive: true });
+  applyTimeMarker("plot-lightcurve");
   attachLightcurveEvents();
 }
 
@@ -1304,6 +1308,7 @@ function plotReferenceLc(p) {
   };
 
   Plotly.newPlot("plot-reference", traces, layout, { responsive: true });
+  applyTimeMarker("plot-reference");
 
   // Update note
   const info = p.tile_info;
@@ -1443,6 +1448,7 @@ function plotComparisonLc(p) {
   };
 
   Plotly.newPlot("plot-comparison", traces, layout, { responsive: true });
+  applyTimeMarker("plot-comparison");
   $("plot-comparison").hidden = false;
 
   // Update note
@@ -1450,6 +1456,51 @@ function plotComparisonLc(p) {
   const target_weight = p.target && p.target.weight ? p.target.weight.toFixed(4) : "N/A";
   const clipped_text = p.members.some(m => m.clipped_frames && m.clipped_frames.length) ? "; clipped = 3σ-rejected frames" : "";
   $("tile-lc-note").textContent = `${p.n_members} members (showing ${p.n_shown} by ${p.order}); target ${is_member} a member (weight ${target_weight}); before decorrelation${clipped_text}`;
+}
+
+// The dashed time marker a click on the light curve sets, drawn at the same time on the light
+// curve and on the reference and comparison curves. It is only drawn on a plot whose data span
+// that time, so a marker of another night does not stretch the axis.
+const TIME_MARKER_PLOTS = ["plot-lightcurve", "plot-reference", "plot-comparison"];
+
+function applyTimeMarker(divId) {
+  const gd = $(divId);
+  if (!gd || !gd.data || !gd.layout) return;
+  const shapes = (gd.layout.shapes || []).filter((s) => s.name !== "time-marker");
+  const x = state.timeMarker;
+  if (x !== null) {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const tr of gd.data) {
+      for (const v of tr.x || []) {
+        if (Number.isFinite(v)) {
+          lo = Math.min(lo, v);
+          hi = Math.max(hi, v);
+        }
+      }
+    }
+    if (x >= lo && x <= hi) {
+      shapes.push({
+        type: "line", name: "time-marker", xref: "x", x0: x, x1: x, yref: "paper", y0: 0, y1: 1,
+        line: { color: "rgba(20,20,20,0.8)", width: 1.2, dash: "dash" },
+      });
+    }
+  }
+  Plotly.relayout(gd, { shapes });
+}
+
+function applyTimeMarkerAll() {
+  for (const id of TIME_MARKER_PLOTS) applyTimeMarker(id);
+}
+
+// a click on the light curve sets the time marker (a second click on the same point clears it)
+// and, while RERUN is ticked, also fills in the transit centre of the rerun entry
+function onLightcurveClick(ev) {
+  if (!ev.points || ev.points.length === 0) return;
+  const x = ev.points[0].x;
+  state.timeMarker = state.timeMarker === x ? null : x;
+  applyTimeMarkerAll();
+  if ($("rerun-check").checked) fillRerunFromClick(ev);
 }
 
 // The rerun entry a click or drag on the light curve fills: the one you last edited.
@@ -1585,7 +1636,7 @@ function attachLightcurveEvents() {
     gd.removeAllListeners("plotly_click");
     gd.removeAllListeners("plotly_selected");
   }
-  gd.on("plotly_click", fillRerunFromClick);
+  gd.on("plotly_click", onLightcurveClick);
   gd.on("plotly_selected", fillRerunFromDrag);
 }
 
