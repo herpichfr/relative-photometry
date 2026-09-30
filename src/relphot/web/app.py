@@ -34,7 +34,13 @@ from relphot.config import DbSettings
 from relphot.objflags import PLANET_CATALOGS, night_state, refresh_flags
 from relphot.web.db import column_exists, get_ro_conn, get_rw_conn, resolve_ro_dsn
 from relphot.web.phase import fourier_model, phase_coverage
-from relphot.web.tile_lc import envelope, member_rms, select_members
+from relphot.web.tile_lc import (
+    envelope,
+    individual_ratio_curves,
+    is_median_ensemble,
+    member_rms,
+    select_members,
+)
 
 __all__ = ["app"]
 
@@ -1551,6 +1557,117 @@ def object_night_comparison(
             raise HTTPException(status_code=404, detail="comparison not found")
 
     return _json(payload)
+
+
+@app.get("/api/object/{obj_id}/night/{night_id}/lc_ratios")
+def object_night_lc_ratios(
+    obj_id: int,
+    night_id: int,
+    limit: int = Query(default=100, ge=1, le=1000),
+):
+    """Individual target / comparison-i light curves behind an object's per-night curve.
+
+    Each ratio is ``lc * ens / c_i`` (see :func:`relphot.web.tile_lc.individual_ratio_curves`)
+    at the target's best aperture, on the scale of the plotted curve and aligned to the
+    target's own ``frame_index`` list. The target itself is left out when it is a member.
+    ``ensemble`` is ``"median"`` when the tile's ensemble was the median (the per-epoch median
+    of the returned ratios is then the plotted curve) and ``"weighted"`` otherwise.
+    """
+    if not _members_schema():
+        msg = "members not available (schema v11 / not loaded)"
+        raise HTTPException(status_code=404, detail=msg)
+
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT sn.tile, sn.best_aperture, sn.star_id, n.zp FROM relphot.star_night sn "
+            "JOIN relphot.night n ON n.night_id = sn.night_id "
+            "WHERE sn.obj_id = %s AND sn.night_id = %s",
+            (obj_id, night_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"object {obj_id} not in night {night_id}")
+        tile, aperture, target_star_id, zp = row
+
+        cur.execute(
+            "SELECT frame_index, flux FROM relphot.lightcurve WHERE obj_id = %s AND night_id = %s",
+            (obj_id, night_id),
+        )
+        lc_row = cur.fetchone()
+        cur.execute(
+            "SELECT ens_flux FROM relphot.tile_lc "
+            "WHERE night_id = %s AND tile = %s AND aperture = %s",
+            (night_id, tile, aperture),
+        )
+        ens_row = cur.fetchone()
+        if not lc_row or not ens_row or not ens_row[0]:
+            raise HTTPException(status_code=404, detail="comparison ratios not available")
+        frame_index, flux = lc_row
+        ens_flux = ens_row[0]
+
+        cur.execute(
+            "SELECT cm.star_id, cm.obj_id, o.name, cm.mag, cm.weight, cm.n_clipped, cm.norm_flux "
+            "FROM relphot.comparison_member cm "
+            "LEFT JOIN relphot.object o ON o.obj_id = cm.obj_id "
+            "WHERE cm.night_id = %s AND cm.tile = %s AND cm.aperture = %s ORDER BY cm.star_id",
+            (night_id, tile, aperture),
+        )
+        member_rows = cur.fetchall()
+
+    frame_idx = np.asarray(frame_index, dtype=np.int64)
+    n_frames = len(ens_flux)
+    keep = (frame_idx >= 0) & (frame_idx < n_frames)
+    frame_idx = frame_idx[keep]
+    lc_sparse = np.asarray(flux, dtype=np.float64)[keep]
+    lc_full = np.full(n_frames, np.nan)
+    lc_full[frame_idx] = lc_sparse
+
+    weights = np.array([r[4] if r[4] is not None else np.nan for r in member_rows])
+    n_clipped = np.array([r[5] for r in member_rows])
+    ensemble = "median" if is_median_ensemble(weights, n_clipped) else "weighted"
+    target_is_member = any(r[0] == target_star_id for r in member_rows)
+    others = [r for r in member_rows if r[0] != target_star_id]
+
+    members: list[dict] = []
+    if others:
+        norm_flux = np.array([r[6] for r in others], dtype=np.float64)
+        ratios = individual_ratio_curves(lc_full, np.asarray(ens_flux, dtype=np.float64), norm_flux)
+        at_target = ratios[:, frame_idx]
+        usable = np.count_nonzero(np.isfinite(at_target), axis=1) >= 3
+        mag = np.array([r[3] if r[3] is not None else np.nan for r in others])
+        idx = np.nonzero(usable)[0]
+        if idx.size:
+            # select_members returns floats when it has no must_include members
+            picked = np.asarray(select_members("mag", limit, mag=mag[idx]), dtype=np.int64)
+            chosen = idx[picked]
+            for i in chosen:
+                star_id, o_id, name, m_mag, _w, _nc, _nf = others[i]
+                members.append(
+                    {
+                        "star_id": star_id,
+                        "obj_id": o_id,
+                        "name": name,
+                        "mag_app": None if m_mag is None or zp is None else m_mag + zp,
+                        "ratio": [
+                            round(float(v), 5) if np.isfinite(v) else None for v in at_target[i]
+                        ],
+                    }
+                )
+
+    return _json(
+        {
+            "night_id": night_id,
+            "tile": tile,
+            "aperture": aperture,
+            "ensemble": ensemble,
+            "target_is_member": target_is_member,
+            "n_members": len(others),
+            "n_shown": len(members),
+            "limit": limit,
+            "frame_index": [int(f) for f in frame_idx],
+            "members": members,
+        }
+    )
 
 
 # --------------------------------------------------------------------------

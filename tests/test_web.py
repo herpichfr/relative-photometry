@@ -456,6 +456,75 @@ def test_lc_with_file_names(client) -> None:
     assert len(data["flux"]) == 3
 
 
+def _add_members(test_conn, ids: dict, *, target_is_member: bool, median: bool) -> np.ndarray:
+    """Tile 0 / aperture 1 of night 1: ``tile_lc`` + comparison members around ``obj_var`` (star 2).
+
+    ``ens_flux`` is the per-frame median of the members' normalised fluxes (also with the target
+    among them). Returns the ``(n_members, 3)`` normalised fluxes in ``star_id`` order.
+    """
+    star_ids = [10, 11, 12, 13, 14] + ([2] if target_is_member else [])
+    c = np.array(
+        [[1.00, 1.02, 0.98], [1.01, 0.99, 1.00], [0.99, 1.00, 1.02],
+         [1.02, 1.01, 0.99], [0.98, 0.98, 1.01], [1.00, 1.00, 1.00]][: len(star_ids)]
+    )
+    ens = np.median(c, axis=0)
+    n = len(star_ids)
+    unequal = np.linspace(1.0, 2.0, n)
+    weights = [1.0 / n] * n if median else list(unequal / unequal.sum())
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.night_tile (night_id, tile, best_apertures) VALUES (%s, 0, '{1}')",
+            (ids["night1"],),
+        )
+        cur.execute(
+            "INSERT INTO relphot.tile_lc (night_id, tile, aperture, ref_flux, ref_flux_err, "
+            "ens_flux, ens_flux_err, n_ensemble, n_comp) VALUES (%s, 0, 1, %s, %s, %s, %s, %s, %s)",
+            (ids["night1"], [1.0] * 3, [0.01] * 3, ens.tolist(), [0.001] * 3, n, n),
+        )
+        for k, (sid, w) in enumerate(zip(star_ids, weights, strict=True)):
+            cur.execute(
+                "INSERT INTO relphot.comparison_member (night_id, tile, aperture, star_id, mag, "
+                "weight, norm_flux) VALUES (%s, 0, 1, %s, %s, %s, %s)",
+                (ids["night1"], sid, 14.0 + 0.1 * k, w, c[k].tolist()),
+            )
+    test_conn.commit()
+    return c
+
+
+def test_lc_ratios_median_night_reproduces_the_plotted_curve(client, test_conn) -> None:
+    test_client, ids = client
+    _add_members(test_conn, ids, target_is_member=False, median=True)
+    resp = test_client.get(f"/api/object/{ids['obj_var']}/night/{ids['night1']}/lc_ratios")
+    assert resp.status_code == 200, resp.text
+    p = resp.json()
+    assert p["ensemble"] == "median" and p["aperture"] == 1 and p["tile"] == 0
+    assert (p["n_members"], p["n_shown"], p["target_is_member"]) == (5, 5, False)
+    assert p["frame_index"] == [0, 1, 2]
+    ratios = np.array([[np.nan if v is None else v for v in m["ratio"]] for m in p["members"]])
+    lc = np.array([1.0, 1.01, 0.99])  # the fixture's obj_var / night 1 flux
+    np.testing.assert_allclose(np.median(ratios, axis=0), lc, atol=1e-4)
+
+
+def test_lc_ratios_leave_the_target_out_and_flag_a_weighted_night(client, test_conn) -> None:
+    test_client, ids = client
+    _add_members(test_conn, ids, target_is_member=True, median=False)
+    p = test_client.get(f"/api/object/{ids['obj_var']}/night/{ids['night1']}/lc_ratios").json()
+    assert p["target_is_member"] is True
+    assert 2 not in [m["star_id"] for m in p["members"]]
+    assert p["n_members"] == 5
+    assert p["ensemble"] == "weighted"
+
+
+def test_lc_ratios_limit_and_missing_members(client, test_conn) -> None:
+    test_client, ids = client
+    url = f"/api/object/{ids['obj_var']}/night/{ids['night1']}/lc_ratios"
+    assert test_client.get(url).status_code == 404  # night without members
+    _add_members(test_conn, ids, target_is_member=False, median=True)
+    p = test_client.get(url, params={"limit": 2}).json()
+    assert (p["n_members"], p["n_shown"]) == (5, 2)
+    assert test_client.get(url, params={"limit": 0}).status_code == 422
+
+
 def test_lc_combined_tied_mode(client) -> None:
     test_client, ids = client
     resp = test_client.get(f"/api/object/{ids['obj_var']}/lc/combined")

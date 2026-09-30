@@ -83,6 +83,9 @@ def test_weighted_ensemble_beats_median() -> None:
     """Weighted clipped-mean ensemble has lower split-subset noise than median."""
     night, _airmass, _flux0 = make_synthetic_night(n_stars=2000, n_frames=40, seed=4)
     settings_weighted = Settings()
+    settings_weighted = replace(settings_weighted,
+        comparison=replace(settings_weighted.comparison, ensemble_statistic="weighted_clipped_mean")
+    )
     settings_median = replace(settings_weighted,
         comparison=replace(settings_weighted.comparison, ensemble_statistic="median")
     )
@@ -232,7 +235,13 @@ def test_weighted_loo_score_matches_exact_exclusion() -> None:
     night, _airmass, _flux0 = make_synthetic_night(n_stars=500, n_frames=30, seed=4)
     base = Settings()
     settings = replace(
-        base, comparison=replace(base.comparison, clip_sigma=1e9, n_rounds=1)
+        base,
+        comparison=replace(
+            base.comparison,
+            ensemble_statistic="weighted_clipped_mean",
+            clip_sigma=1e9,
+            n_rounds=1,
+        ),
     )
     variable_mask = np.zeros(night.n_stars, dtype=bool)
     candidates = select_candidates(night, variable_mask, settings, aper=0)
@@ -298,3 +307,34 @@ def test_excluded_star_has_finite_mag() -> None:
         a = 0  # aperture
         assert np.isfinite(comparison_result.mag[target_star, a]), \
             f"Excluded star {target_star} should have finite mag for decorrelation"
+
+
+def test_median_ensemble_error_is_the_error_of_the_median() -> None:
+    """Default (median) ensemble: sigma = sqrt(pi/2) * 1.4826 MAD / sqrt(n) over the members."""
+    from relphot.comparison import MEDIAN_SE_FACTOR
+
+    night, _airmass, _flux0 = make_synthetic_night(n_stars=500, n_frames=30, seed=4)
+    settings = Settings()
+    assert settings.comparison.ensemble_statistic == "median"
+    variable_mask = np.zeros(night.n_stars, dtype=bool)
+    candidates = select_candidates(night, variable_mask, settings, aper=0)
+    tilemap = build_tilemap(night, candidates, settings)
+    selection = select_reference_frames_and_stars(night, tilemap, candidates, settings, aper=0)
+    ref = build_references(night, tilemap, selection, settings)
+    result = select_comparison_stars(night, tilemap, ref, variable_mask, settings)
+
+    assert result.method == "median"
+    assert np.isclose(MEDIAN_SE_FACTOR, 1.2533, atol=1e-4)
+    a = 0
+    for t in range(tilemap.n_tiles):
+        sel = np.nonzero(result.mask[:, a] & (tilemap.core_tile == t))[0]
+        if sel.size < 5:
+            continue
+        r = ref.relative_flux[sel, :, a]
+        c = r / np.nanmedian(r, axis=1)[:, None]
+        n_used = np.count_nonzero(np.isfinite(c), axis=0)
+        mad = 1.4826 * np.nanmedian(np.abs(c - np.nanmedian(c, axis=0)), axis=0)
+        expected = MEDIAN_SE_FACTOR * mad / np.sqrt(n_used)
+        np.testing.assert_allclose(result.ensemble[t, :, a], np.nanmedian(c, axis=0), rtol=1e-9)
+        ok = np.isfinite(expected) & (n_used > 0)
+        np.testing.assert_allclose(result.sigma_ensemble[t, ok, a], expected[ok], rtol=1e-9)

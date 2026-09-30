@@ -8,7 +8,13 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["envelope", "member_rms", "select_members"]
+__all__ = [
+    "envelope",
+    "individual_ratio_curves",
+    "is_median_ensemble",
+    "member_rms",
+    "select_members",
+]
 
 
 def member_rms(norm_flux: np.ndarray, ens: np.ndarray) -> np.ndarray:
@@ -147,3 +153,45 @@ def select_members(
             if len(result) >= limit:
                 break
     return result
+
+
+def individual_ratio_curves(
+    lc: np.ndarray, ens: np.ndarray, norm_flux: np.ndarray
+) -> np.ndarray:
+    """Target / comparison-i light curves on the scale of the plotted (median) light curve.
+
+    ``lc`` is the target's plotted light curve (decorrelated), ``ens`` the tile ensemble and
+    ``norm_flux`` the members' baseline-normalised fluxes ``c_i`` (all at the target's best
+    aperture, full frame length). The plotted curve is ``lc = rel_flux / ens`` (times the
+    decorrelation factor), so ``target / comp_i`` on the same scale is ``rel_flux / c_i =
+    lc * ens / c_i``. For a median ensemble ``ens = median_i(c_i)``, hence
+    ``median_i(result) == lc`` (exactly for an odd member count).
+
+    Parameters
+    ----------
+    lc, ens : (F,) arrays
+    norm_flux : (M, F) array
+
+    Returns
+    -------
+    (M, F) float64 array, NaN where ``lc``, ``ens`` or ``c_i`` is not finite or ``c_i <= 0``.
+    """
+    lc = np.asarray(lc, dtype=np.float64)
+    ens = np.asarray(ens, dtype=np.float64)
+    c = np.asarray(norm_flux, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = (lc * ens)[None, :] / c
+    return np.where(np.isfinite(out) & (c > 0), out, np.nan)
+
+
+def is_median_ensemble(weights: np.ndarray, n_clipped: np.ndarray) -> bool:
+    """Whether a tile's stored member weights are those of the median ensemble.
+
+    ``comparison_member.weight`` is exactly ``1/n`` for every member of a median ensemble
+    (see ``sql/011_members.sql``) and no member is clipped; a weighted-mean ensemble has
+    unequal weights.
+    """
+    w = np.asarray(weights, dtype=np.float64)
+    if w.size == 0 or not np.all(np.isfinite(w)) or np.any(np.asarray(n_clipped) > 0):
+        return False
+    return bool(np.allclose(w, 1.0 / w.size, rtol=1e-4, atol=0.0))

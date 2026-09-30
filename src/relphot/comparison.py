@@ -38,7 +38,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Standard error of a Gaussian sample median in units of the standard error of the mean,
+#: ``sqrt(pi / 2)`` = 1.2533.
+MEDIAN_SE_FACTOR = float(np.sqrt(np.pi / 2.0))
+
 __all__ = [
+    "MEDIAN_SE_FACTOR",
     "ComparisonResult",
     "select_comparison_pool",
     "select_comparison_stars",
@@ -68,6 +73,20 @@ class ComparisonResult:
     n_comparison: np.ndarray
     n_rounds_used: np.ndarray
     method: str
+
+
+def _median_ensemble(c: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-frame median of ``c`` ``(n_members, n_frames)`` and the standard error of that median.
+
+    ``sigma = MEDIAN_SE_FACTOR * mad_sigma / sqrt(n)`` with ``n`` the finite members of the
+    frame and ``mad_sigma`` the 1.4826-scaled MAD across them; NaN where none is finite.
+    """
+    ens = nanmedian_quiet(c, axis=0)
+    n_used = np.count_nonzero(np.isfinite(c), axis=0)
+    mad = mad_sigma(c, axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sig = np.where(n_used > 0, MEDIAN_SE_FACTOR * mad / np.sqrt(n_used), np.nan)
+    return ens, sig
 
 
 def select_comparison_pool(
@@ -293,15 +312,7 @@ def select_comparison_stars(
                         c, w, comp.clip_sigma, comp.max_iter, axis=0
                     )
                 else:  # median
-                    ens = nanmedian_quiet(c, axis=0)
-                    n_used_per_frame = np.count_nonzero(np.isfinite(c), axis=0)
-                    mad_per_frame = mad_sigma(c, axis=0)
-                    with np.errstate(invalid="ignore", divide="ignore"):
-                        sig = np.where(
-                            n_used_per_frame > 0,
-                            mad_per_frame / np.sqrt(n_used_per_frame),
-                            np.nan,
-                        )
+                    ens, sig = _median_ensemble(c)
                     m = np.isfinite(c)
 
                 # Step 3c: Full score for every pool star
@@ -412,15 +423,7 @@ def select_comparison_stars(
                     c, w, comp.clip_sigma, comp.max_iter, axis=0
                 )
             else:  # median
-                ens = nanmedian_quiet(c, axis=0)
-                n_used_per_frame = np.count_nonzero(np.isfinite(c), axis=0)
-                mad_per_frame = mad_sigma(c, axis=0)
-                with np.errstate(invalid="ignore", divide="ignore"):
-                    sig = np.where(
-                        n_used_per_frame > 0,
-                        mad_per_frame / np.sqrt(n_used_per_frame),
-                        np.nan,
-                    )
+                ens, sig = _median_ensemble(c)
 
             ensemble[t, :, a] = ens
             sigma_ensemble[t, :, a] = sig
