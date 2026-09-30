@@ -430,10 +430,13 @@ class DbSettings:
     assumed_zp: float = 20.0
     #: Measured zero point (mag) per telescope, used instead of ``assumed_zp`` for a night with
     #: no Gaia calibration (``zp_source = 'measured'``). Keys are ``night.telescope`` exactly as
-    #: stored (``'T80S'``, ``'ROBO43'``). T80S 27.85: median of Gaia DR3 G minus relphot
-    #: magnitude for 200 bright isolated T80S stars (MAD-sigma 0.12); relphot magnitudes are per
-    #: 90 s exposure in the R band, matched to G at the star's best aperture with no aperture
-    #: correction. A ``telescope_zp`` in a settings file replaces this table as a whole.
+    #: stored (``'T80S'``, ``'ROBO43'``). T80S 27.85 is the median of Gaia DR3 G minus
+    #: relphot magnitude over bright isolated stars, deliberately kept on the Gaia G scale for a
+    #: uniform magnitude scale across telescopes. T80S filter is S-PLUS rSDSS (not Bessell R).
+    #: The rSDSS AB zero point measured 2026-09-30 from Gaia XP synthetic photometry is
+    #: 27.846 ± 0.004 (colour slope ~0); the G-based value carries a colour term of about
+    #: -0.038 mag per mag of BP-RP (±0.04 mag between BP-RP 0 and 2). A ``telescope_zp`` in a
+    #: settings file replaces this table as a whole.
     telescope_zp: dict[str, float] = field(default_factory=lambda: {"T80S": 27.85})
     #: Cross-candidate check of one night's transit events (``relphot db analyze``): time window
     #: of a pair of events, as a fraction of the shorter T14 (the window is the largest of this,

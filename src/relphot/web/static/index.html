@@ -355,6 +355,77 @@
     </div>
     <div id="plot-lightcurve" class="plot"></div>
 
+    <div id="tile-lc-controls" class="button-row" hidden>
+      <button id="btn-reference-lc" disabled>Reference light curve</button>
+      <button id="btn-comparison-lc" disabled>Comparison light curves</button>
+      <select id="comparison-order-select">
+        <option value="mag" selected>magnitude (stratified)</option>
+        <option value="weight">weight (top members)</option>
+        <option value="rms">RMS (worst members)</option>
+      </select>
+      <select id="comparison-limit-select">
+        <option value="50">50 members</option>
+        <option value="100">100 members</option>
+        <option value="200" selected>200 members</option>
+        <option value="500">500 members</option>
+        <option value="1000">1000 members</option>
+      </select>
+      <select id="comparison-view-select">
+        <option value="normalised" selected>normalised</option>
+        <option value="divided">divided by ensemble</option>
+      </select>
+      <span id="tile-lc-note" class="note"></span>
+    </div>
+    <div id="plot-reference" class="plot" hidden></div>
+    <div id="plot-comparison" class="plot" hidden></div>
+    <details id="reference-members-details" hidden>
+      <summary id="reference-members-summary">Reference members</summary>
+      <div class="table-scroll">
+        <table id="detail-reference-members">
+          <thead>
+            <tr><th>Star</th><th>Object</th><th>Mag (app)</th><th>Weight</th><th>In core</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </details>
+
+    <details id="night-panel" hidden>
+      <summary>Nights</summary>
+      <div class="table-scroll">
+        <table id="night-list">
+          <thead>
+            <tr><th>Label</th><th>Telescope</th><th>Date</th><th>Frames kept</th><th>Tiles</th><th>Members</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="button-row">
+        <label>Aperture
+          <select id="night-aperture-select"></select>
+        </label>
+        <button id="btn-night-all-tiles">Overlay all tiles</button>
+      </div>
+      <div id="plot-night-all" class="plot" hidden></div>
+      <div class="table-scroll">
+        <table id="night-tiles">
+          <thead>
+            <tr><th>Tile</th><th>Bounds</th><th>Ref stars</th><th>Apertures</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="plot-night-reference" class="plot" hidden></div>
+      <div class="table-scroll">
+        <table id="night-ref-members">
+          <thead>
+            <tr><th>Star</th><th>Object</th><th>Mag</th><th>Weight</th><th>In core</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </details>
+
     <div id="phase-section">
       <h3>Phase diagram</h3>
       <div class="note">All nights folded at the chosen period, coloured by night (error bars

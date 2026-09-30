@@ -103,3 +103,116 @@ def test_lightcurves_smoke(fits_files, tmp_path) -> None:
         assert len(lc_table) > 0
     except ImportError:
         pass  # astropy not available, skip check
+
+    # Check that members file exists (it has the path based on lc_out which is stem only)
+    members_npz = lc_out.parent / "_members.npz"
+    assert members_npz.is_file(), f"Members file should be written by default at {members_npz}"
+
+
+def test_lightcurves_no_members(fits_files, tmp_path) -> None:
+    """Test lightcurves with --no-members flag does not write members file."""
+    night_out = tmp_path / "night.npz"
+    rc = main(["ingest", "--out", str(night_out), *[str(p) for p in fits_files]])
+    assert rc == 0
+
+    ref_out = tmp_path / "ref.npz"
+    rc = main(["reference", str(night_out), "--out", str(ref_out), "--no-variables"])
+    assert rc == 0
+
+    lc_out = tmp_path / "lc"
+    rc = main([
+        "lightcurves",
+        str(night_out),
+        str(ref_out),
+        "--out", str(lc_out),
+        "--no-variables",
+        "--no-members",
+        "--format", "fits",
+        "--no-plot",
+    ])
+    assert rc == 0
+
+    # Check that members file does NOT exist
+    members_npz = lc_out.parent / f"{lc_out.name}_members.npz"
+    assert not members_npz.is_file(), "Members file should not be written with --no-members"
+
+
+def test_members_smoke(fits_files, tmp_path) -> None:
+    """Test the 'relphot members' subcommand on reference and light-curve files."""
+    night_out = tmp_path / "night.npz"
+    rc = main(["ingest", "--out", str(night_out), *[str(p) for p in fits_files]])
+    assert rc == 0
+
+    ref_out = tmp_path / "ref.npz"
+    rc = main(["reference", str(night_out), "--out", str(ref_out), "--no-variables"])
+    assert rc == 0
+
+    lc_out = tmp_path / "lc"
+    rc = main([
+        "lightcurves",
+        str(night_out),
+        str(ref_out),
+        "--out", str(lc_out),
+        "--no-variables",
+        "--no-members",
+        "--format", "fits",
+        "--no-plot",
+    ])
+    assert rc == 0
+
+    # Run members command
+    members_out = tmp_path / "lc_members.npz"
+    rc = main(["members", str(night_out), str(ref_out), str(lc_out.parent / f"{lc_out.name}.npz"),
+               "--out", str(members_out)])
+    assert rc == 0
+    assert members_out.is_file()
+
+    # Verify members file is valid
+    from relphot.members import load_members_npz
+    product = load_members_npz(members_out)
+    assert product.n_frames > 0
+    assert product.n_aper >= 0
+
+
+def test_members_ref_without_tile_stars(fits_files, tmp_path) -> None:
+    """Test members command on a ref.npz without tile_ref_* keys."""
+    from relphot.io import load_reference, save_reference
+
+    night_out = tmp_path / "night.npz"
+    rc = main(["ingest", "--out", str(night_out), *[str(p) for p in fits_files]])
+    assert rc == 0
+
+    ref_out = tmp_path / "ref.npz"
+    rc = main(["reference", str(night_out), "--out", str(ref_out), "--no-variables"])
+    assert rc == 0
+
+    # Re-save ref.npz without tile_stars
+    tilemap, result, settings = load_reference(ref_out)
+    ref_out_no_stars = tmp_path / "ref_no_stars.npz"
+    save_reference(tilemap, result, settings, ref_out_no_stars)  # No tile_stars
+
+    lc_out = tmp_path / "lc"
+    rc = main([
+        "lightcurves",
+        str(night_out),
+        str(ref_out_no_stars),
+        "--out", str(lc_out),
+        "--no-variables",
+        "--no-members",
+        "--format", "fits",
+        "--no-plot",
+    ])
+    assert rc == 0
+
+    # Run members command
+    members_out = tmp_path / "lc_members.npz"
+    lc_npz_path = str(lc_out.parent / f"{lc_out.name}.npz")
+    rc = main(["members", str(night_out), str(ref_out_no_stars), lc_npz_path,
+               "--out", str(members_out)])
+    assert rc == 0
+    assert members_out.is_file()
+
+    # Verify members file is valid
+    from relphot.members import load_members_npz
+    product = load_members_npz(members_out)
+    assert product.n_frames > 0

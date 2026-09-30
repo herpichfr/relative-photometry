@@ -24,6 +24,7 @@ const state = {
   rerunPolling: false, // a poll of that list is in flight
   rerunKey: null, // ids of the pending requests at the last poll (null before the first)
   lcView: null, // plotted light curve {kind, nightId, lc}, re-plotted when the y unit changes
+  tileView: null, // plotted tile lc {kind, nightId, tile, aperture, lc, type} type in [reference, comparison]
 };
 
 function $(id) {
@@ -925,8 +926,15 @@ async function loadObject(objId) {
   populatePeriodogramSelectors(data.periodograms);
   prefillEditBox(data.object);
   Plotly.purge("plot-lightcurve");
+  Plotly.purge("plot-reference");
+  Plotly.purge("plot-comparison");
   Plotly.purge("plot-phase");
+  $("plot-reference").hidden = true;
+  $("plot-comparison").hidden = true;
+  $("tile-lc-controls").hidden = true;
+  $("reference-members-details").hidden = true;
   state.lcView = null;
+  state.tileView = null;
   state.phase = null;
   // the phase diagram is for a variable or any object that has a period (PERIOD, or a guided one)
   const hasGuided = (data.period_estimates || []).some(
@@ -974,6 +982,17 @@ async function loadNightLc(nightId) {
   const lc = await resp.json();
   state.lcView = { kind: "night", nightId, lc };
   plotNightLc(nightId, lc);
+
+  // Enable/disable tile light curve buttons based on night's has_reference/has_comparison
+  const night = state.currentObject.nights.find(n => n.night_id === nightId);
+  if (night) {
+    $("tile-lc-controls").hidden = false;
+    $("btn-reference-lc").disabled = !night.has_reference;
+    $("btn-comparison-lc").disabled = !night.has_comparison;
+    $("reference-members-details").hidden = true;
+  } else {
+    $("tile-lc-controls").hidden = true;
+  }
 }
 
 function plotNightLc(nightId, lc) {
@@ -1136,6 +1155,230 @@ function plotCombinedLc(lc) {
   };
   Plotly.newPlot("plot-lightcurve", traces, layout, { responsive: true });
   attachLightcurveEvents();
+}
+
+// --------------------------------------------------------------------------
+// Tile light curves: reference and comparison
+// --------------------------------------------------------------------------
+
+async function loadReferenceLc() {
+  if (!state.currentNightId || !state.currentObject) return;
+  const objId = state.currentObject.object.obj_id;
+  const nightId = state.currentNightId;
+  const resp = await fetch(`/api/object/${objId}/night/${nightId}/reference`);
+  if (!resp.ok) {
+    $("tile-lc-note").textContent = "error loading reference light curve";
+    return;
+  }
+  const payload = await resp.json();
+  state.tileView = { kind: "reference", nightId, tile: payload.tile, aperture: payload.aperture, lc: payload };
+  plotReferenceLc(payload);
+}
+
+function plotReferenceLc(p) {
+  const x = p.frames.map((f) => f.bjd_tdb - 2460000);
+  const useMag = lcUnit() === "mag" && p.zp !== null;
+
+  // Plot reference flux with error bars
+  const yOf = (flux) => {
+    if (!Number.isFinite(flux)) return null;
+    if (useMag) {
+      return p.zp - 2.5 * Math.log10(flux / 1.0); // mag = zp - 2.5 log10(flux / reference)
+    }
+    return flux;
+  };
+
+  const trace = {
+    x, y: p.ref_flux.map(yOf), type: "scatter", mode: "markers",
+    error_y: {
+      type: "data", visible: true,
+      array: useMag ? p.ref_flux_err.map((e, i) => 1.0857 * e / (p.ref_flux[i] || 1.0)) : p.ref_flux_err,
+    },
+    text: p.frames.map((f, i) => `frame ${f.frame_index}<br>${f.file_name || ""}<br>airmass ${f.airmass}`),
+    hoverinfo: "x+y+text",
+    marker: { size: 5 },
+    name: "reference",
+  };
+
+  const traces = [trace];
+
+  // Add dropped frames as vertical lines
+  const shapes = [];
+  for (let i = 0; i < p.frames.length; i++) {
+    if (!p.frames[i].kept) {
+      shapes.push({
+        type: "line", x0: x[i], x1: x[i],
+        y0: "paper", y1: 1, yref: "paper",
+        line: { color: "rgba(255,0,0,0.3)", width: 1, dash: "dot" },
+      });
+    }
+  }
+
+  // Add dropped frame trace for legend
+  traces.push({
+    x: [], y: [], type: "scatter", mode: "lines",
+    line: { color: "rgba(255,0,0,0.3)", width: 1, dash: "dot" },
+    name: "dropped frame",
+    showlegend: true,
+  });
+
+  const layout = {
+    xaxis: { title: { text: "BJD_TDB - 2460000" } },
+    yaxis: {
+      title: { text: useMag ? "apparent mag (+ zp)" : "reference flux" },
+      autorange: useMag ? "reversed" : true,
+    },
+    shapes,
+    margin: { t: 40 },
+  };
+
+  Plotly.newPlot("plot-reference", traces, layout, { responsive: true });
+
+  // Update note
+  const info = p.tile_info;
+  const bounds = info && info.x_min !== null
+    ? `[${info.x_min.toFixed(0)}, ${info.x_max.toFixed(0)}] x [${info.y_min.toFixed(0)}, ${info.y_max.toFixed(0)}]`
+    : "";
+  $("tile-lc-note").textContent = `tile ${p.tile}, aperture ${p.aperture}, ${p.n_ref} reference stars, ${p.n_comp} comparison members ${bounds ? bounds : ""}`;
+
+  $("plot-reference").hidden = false;
+  $("reference-members-details").hidden = false;
+
+  // Load members on toggle
+  const membersSummary = $("reference-members-summary");
+  membersSummary.textContent = `Reference members (${p.n_ref})`;
+}
+
+async function loadComparisonLc() {
+  if (!state.currentNightId || !state.currentObject) return;
+  const objId = state.currentObject.object.obj_id;
+  const nightId = state.currentNightId;
+  const limit = parseInt($("comparison-limit-select").value);
+  const order = $("comparison-order-select").value;
+  const resp = await fetch(`/api/object/${objId}/night/${nightId}/comparison?limit=${limit}&order=${order}`);
+  if (!resp.ok) {
+    $("tile-lc-note").textContent = "error loading comparison light curve";
+    return;
+  }
+  const payload = await resp.json();
+  state.tileView = { kind: "comparison", nightId, tile: payload.tile, aperture: payload.aperture, lc: payload };
+  plotComparisonLc(payload);
+}
+
+function plotComparisonLc(p) {
+  const x = p.frames.map((f) => f.bjd_tdb - 2460000);
+  const view = $("comparison-view-select").value;
+  const useMag = lcUnit() === "mag";
+
+  const traces = [];
+
+  // Envelope
+  if (p.envelope && p.envelope.median) {
+    const env_lo = p.envelope.lo.map((v, i) => {
+      if (v === null || !Number.isFinite(v)) return null;
+      return view === "normalised" ? v : (1.0 - (p.ens_flux[i] || 1.0)) || null;
+    });
+    const env_hi = p.envelope.hi.map((v, i) => {
+      if (v === null || !Number.isFinite(v)) return null;
+      return view === "normalised" ? v : (1.0 + (p.ens_flux[i] || 1.0)) || null;
+    });
+    traces.push({
+      x: [...x, ...x.slice().reverse()],
+      y: [...env_hi, ...env_lo.slice().reverse()],
+      fill: "toself",
+      fillcolor: "rgba(100,150,200,0.3)",
+      line: { color: "transparent" },
+      name: "16-84% envelope",
+      hoverinfo: "skip",
+    });
+  }
+
+  // Member traces (grey, with markers and lines)
+  for (const m of p.members.filter(m => m.shown)) {
+    const y = m.norm_flux.map((v, i) => {
+      if (!Number.isFinite(v)) return null;
+      if (view === "normalised") return v;
+      return useMag ? (v / ((p.ens_flux[i] || 1.0))) : v;
+    });
+    traces.push({
+      x, y, type: "scatter", mode: "lines+markers",
+      line: { color: "rgba(90,90,90,0.35)", width: 1 },
+      marker: { size: 3 },
+      name: m.name || `star ${m.star_id}`,
+      customdata: [m.obj_id],
+      hovertemplate: `<b>${m.name || `star ${m.star_id}`}</b><br>mag ${(m.mag_app || m.mag || "").toFixed(2)}<br>weight ${(m.weight || 0).toFixed(4)}<br>rms ${(m.rms || "").toFixed(4)}<extra></extra>`,
+    });
+  }
+
+  // Clipped points (red x markers)
+  for (const m of p.members.filter(m => m.shown && m.clipped_frames && m.clipped_frames.length)) {
+    const clipped_idx = new Set(m.clipped_frames);
+    const clipped_x = [];
+    const clipped_y = [];
+    for (let i = 0; i < p.frames.length; i++) {
+      if (clipped_idx.has(p.frames[i].frame_index) && m.norm_flux[i] !== null && Number.isFinite(m.norm_flux[i])) {
+        clipped_x.push(x[i]);
+        clipped_y.push(m.norm_flux[i] / ((p.ens_flux[i] || 1.0)));
+      }
+    }
+    if (clipped_x.length > 0) {
+      traces.push({
+        x: clipped_x, y: clipped_y, type: "scatter", mode: "markers",
+        marker: { symbol: "x", size: 8, color: "red" },
+        name: `${m.name || `star ${m.star_id}`} clipped`,
+        hoverinfo: "skip",
+      });
+    }
+  }
+
+  // Ensemble (bold blue)
+  if (p.ens_flux) {
+    const ens_y = p.ens_flux.map((v) => {
+      if (!Number.isFinite(v)) return null;
+      return view === "normalised" ? v : 1.0;
+    });
+    traces.push({
+      x, y: ens_y, type: "scatter", mode: "lines",
+      line: { color: "blue", width: 3 },
+      error_y: view === "normalised" ? {
+        type: "data", array: p.ens_flux_err || [],
+      } : undefined,
+      name: "ensemble",
+      hoverinfo: "x+y",
+    });
+  }
+
+  // Target (bold red)
+  if (p.target) {
+    const tgt_y = (view === "normalised" || view === "divided") && p.target.norm_flux
+      ? p.target.norm_flux.map((v) => v === null ? null : v / ((p.ens_flux && p.ens_flux[p.target.frame_index.indexOf(p.frames.findIndex((f, i) => i === p.target.frame_index[p.target.frame_index.indexOf(i)] || null))] || 1.0)))
+      : (p.target.resid_flux || p.target.norm_flux);
+    traces.push({
+      x, y: useMag ? tgt_y.map(v => v ? -2.5 * Math.log10(v) : null) : tgt_y,
+      type: "scatter", mode: "markers",
+      marker: { size: 7, color: "red" },
+      name: state.currentObject.object.name || `obj ${state.currentObject.object.obj_id}`,
+      hoverinfo: "x+y",
+    });
+  }
+
+  const layout = {
+    xaxis: { title: { text: "BJD_TDB - 2460000" } },
+    yaxis: {
+      title: { text: useMag ? "residual flux (mag)" : (view === "normalised" ? "normalised flux" : "flux / ensemble") },
+      autorange: useMag ? "reversed" : true,
+    },
+    margin: { t: 40 },
+  };
+
+  Plotly.newPlot("plot-comparison", traces, layout, { responsive: true });
+  $("plot-comparison").hidden = false;
+
+  // Update note
+  const is_member = p.target && p.target.is_member ? "IS" : "is NOT";
+  const target_weight = p.target && p.target.weight ? p.target.weight.toFixed(4) : "N/A";
+  const clipped_text = p.members.some(m => m.clipped_frames && m.clipped_frames.length) ? "; clipped = 3σ-rejected frames" : "";
+  $("tile-lc-note").textContent = `${p.n_members} members (showing ${p.n_shown} by ${p.order}); target ${is_member} a member (weight ${target_weight}); before decorrelation${clipped_text}`;
 }
 
 // The rerun entry a click or drag on the light curve fills: the one you last edited.
@@ -2081,6 +2324,13 @@ function init() {
   }
   $("lc-unit-select").addEventListener("change", () => {
     replotLightcurve();
+    if (state.tileView) {
+      if (state.tileView.kind === "reference") {
+        plotReferenceLc(state.tileView.lc);
+      } else if (state.tileView.kind === "comparison") {
+        plotComparisonLc(state.tileView.lc);
+      }
+    }
     plotPhase();
   });
   $("rerun-check").addEventListener("change", onRerunToggle);
@@ -2092,6 +2342,33 @@ function init() {
   $("btn-reset-exop-auto").addEventListener("click", resetExopAuto);
   $("btn-reset-var-auto").addEventListener("click", resetVarAuto);
   $("btn-reset-period-auto").addEventListener("click", resetPeriodAuto);
+
+  // Tile light curve handlers
+  $("btn-reference-lc").addEventListener("click", loadReferenceLc);
+  $("btn-comparison-lc").addEventListener("click", loadComparisonLc);
+  $("comparison-limit-select").addEventListener("change", loadComparisonLc);
+  $("comparison-order-select").addEventListener("change", loadComparisonLc);
+  $("reference-members-details").addEventListener("toggle", async (ev) => {
+    if (ev.newState === "open" && state.tileView && state.tileView.kind === "reference") {
+      const p = state.tileView.lc;
+      const resp = await fetch(`/api/night/${p.night_id}/tile/${p.tile}/reference/members`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const tbody = $("detail-reference-members").querySelector("tbody");
+      tbody.innerHTML = "";
+      for (const m of data.members) {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td>${m.star_id}</td>
+          <td>${m.obj_id && m.name ? `<a href="javascript:loadObject(${m.obj_id})">${m.name}</a>` : (m.name || "not in database")}</td>
+          <td>${(m.mag_app !== null ? m.mag_app.toFixed(3) : "")}</td>
+          <td>${(m.weight !== null ? m.weight.toFixed(4) : "")}</td>
+          <td>${m.in_core ? "yes" : "no"}</td>
+        `;
+        tbody.appendChild(row);
+      }
+    }
+  });
 
   renderResultsHeader();
   doSearch();

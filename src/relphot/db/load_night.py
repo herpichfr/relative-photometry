@@ -20,10 +20,9 @@ detections are deleted and re-created: a detection a person created by reprocess
 (``origin = 'user'``, see :mod:`relphot.db.reprocess`) survives a reload.
 
 ``night.zp`` / ``zp_source``: the median Gaia ``ZPABS`` of the kept frames (``'gaia'``); without
-one, the telescope's measured zero point in ``settings.db.telescope_zp`` (``'measured'``; the
-T80S 27.85 mag is the median of Gaia DR3 G minus relphot magnitude over 200 bright isolated
-stars, MAD-sigma 0.12, at the best aperture and without aperture correction); else
-``settings.db.assumed_zp`` (``'assumed'``, 20 mag).
+one, the telescope's measured zero point in ``settings.db.telescope_zp`` (``'measured'``; T80S
+27.85 is the Gaia DR3 G scale, uniform across telescopes); else ``settings.db.assumed_zp``
+(``'assumed'``, 20 mag).
 
 ``star_night.err_scale`` / ``blended`` come from ``*_starstats.parquet`` (the factor
 ``lc_err`` was inflated by and the neighbour-flag verdict); a product written before error
@@ -78,7 +77,9 @@ class LoadReport:
     n_transit_detections: int
     n_variable_detections: int
     n_catalog_matches: int
-    elapsed_s: float
+    n_reference_members: int = 0
+    n_comparison_members: int = 0
+    elapsed_s: float = 0.0
 
 
 def _format_ra_hms(ra_deg: float) -> str:
@@ -151,9 +152,9 @@ def _night_zero_point(
 ) -> tuple[float, str]:
     """(zp, source) of a night: the median Gaia ``zp`` of its kept frames when at least half of
     them carry one (``'gaia'``); else the telescope's measured zero point from
-    ``settings.telescope_zp`` (``'measured'``: T80S 27.85, Gaia DR3 G minus relphot magnitude
-    of 200 bright isolated stars, see :class:`~relphot.config.DbSettings`); else
-    ``settings.assumed_zp`` (``'assumed'``, robo43's ``instrumental_zp`` of 20 mag)."""
+    ``settings.telescope_zp`` (``'measured'``; T80S 27.85 on the Gaia G scale, uniform across
+    telescopes); else ``settings.assumed_zp`` (``'assumed'``, robo43's ``instrumental_zp`` of
+    20 mag)."""
     zps = np.array(
         [np.nan if m.get("zp") is None else float(m["zp"]) for m in frame_meta], dtype=float
     )
@@ -484,6 +485,8 @@ def load_night(
     n_transit_detections = 0
     n_variable_detections = 0
     n_catalog_matches = 0
+    n_reference_members = 0
+    n_comparison_members = 0
 
     try:
         with conn.cursor() as cur:
@@ -536,6 +539,7 @@ def load_night(
                 (night_id,),
             )
             cur.execute("DELETE FROM relphot.star_night WHERE night_id = %s", (night_id,))
+            cur.execute("DELETE FROM relphot.night_tile WHERE night_id = %s", (night_id,))
             cur.execute("DELETE FROM relphot.frame WHERE night_id = %s", (night_id,))
 
             # --- frames ---
@@ -648,6 +652,35 @@ def load_night(
                             None if blended is None or pd.isna(blended) else bool(blended),
                         )
                     )
+
+            # --- reference and comparison members (optional) ---
+            members_path = lightcurves_path.with_name(
+                lightcurves_path.name[: -len("_lightcurves.parquet")] + "_members.npz"
+            )
+            if members_path.is_file():
+                from relphot.db.load_members import insert_members
+                from relphot.members import load_members_npz
+
+                try:
+                    members_product = load_members_npz(members_path)
+                    members_report = insert_members(
+                        cur,
+                        night_id,
+                        members_product,
+                        star_to_obj,
+                        match_radius_deg=settings.db.match_radius_arcsec / 3600.0,
+                        n_frames=n_frames,
+                    )
+                    # Update report fields
+                    n_reference_members = members_report.n_reference_members
+                    n_comparison_members = members_report.n_comparison_members
+                except Exception:
+                    logger.exception(
+                        "error loading members from %s; skipping",
+                        members_path,
+                    )
+            else:
+                logger.info("no %s; reference/comparison members not loaded", members_path.name)
 
             # --- light curves: numpy groupby, not a per-row Python loop over the parquet ---
             df_lc = pd.read_parquet(lightcurves_path)
@@ -891,5 +924,7 @@ def load_night(
         n_transit_detections=n_transit_detections,
         n_variable_detections=n_variable_detections,
         n_catalog_matches=n_catalog_matches,
+        n_reference_members=n_reference_members,
+        n_comparison_members=n_comparison_members,
         elapsed_s=time.monotonic() - t0,
     )

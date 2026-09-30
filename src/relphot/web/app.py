@@ -34,6 +34,7 @@ from relphot.config import DbSettings
 from relphot.objflags import PLANET_CATALOGS, night_state, refresh_flags
 from relphot.web.db import column_exists, get_ro_conn, get_rw_conn, resolve_ro_dsn
 from relphot.web.phase import fourier_model, phase_coverage
+from relphot.web.tile_lc import envelope, member_rms, select_members
 
 __all__ = ["app"]
 
@@ -551,17 +552,28 @@ def object_detail(obj_id: int):
                 "n.zp, n.zp_source, sn.mag + n.zp AS mag_app, "
                 "(lc.obj_id IS NOT NULL) AS has_lc, "
                 "r.exop_verdict AS review_exop, r.var_verdict AS review_var, "
-                "r.note AS review_note, r.updated_at AS review_updated_at "
+                "r.note AS review_note, r.updated_at AS review_updated_at, "
+                "sn.tile, sn.star_id, sn.is_comparison, "
+                "(tl.night_id IS NOT NULL) AS has_reference, "
+                "COALESCE(tl.n_comp,0) > 0 AS has_comparison "
                 "FROM relphot.star_night sn "
                 "JOIN relphot.night n ON n.night_id = sn.night_id "
                 "LEFT JOIN relphot.lightcurve lc "
                 "ON lc.obj_id = sn.obj_id AND lc.night_id = sn.night_id "
                 "LEFT JOIN relphot.user_night_review r "
                 "ON r.obj_id = sn.obj_id AND r.night_id = sn.night_id "
+                "LEFT JOIN relphot.tile_lc tl "
+                "ON tl.night_id = sn.night_id AND tl.tile = sn.tile "
+                "AND tl.aperture = sn.best_aperture "
                 "WHERE sn.obj_id = %s ORDER BY n.night_date",
                 (obj_id,),
             )
             nights = _rows_to_dicts(cur, cur.fetchall())
+            # Guard: if schema v11 not loaded, set has_reference/has_comparison to false
+            if not column_exists(conn, "tile_lc", "night_id"):
+                for night in nights:
+                    night["has_reference"] = False
+                    night["has_comparison"] = False
 
             pg_cols = _select_columns(
                 conn, "periodogram", ["scope", "method", "peak_period", "peak_power", "fap"],
@@ -879,6 +891,666 @@ def object_lc_combined(obj_id: int):
     with get_ro_conn() as conn, conn.cursor() as cur:
         data = _combined_lc(cur, obj_id)
     return _json({k: v for k, v in data.items() if k != "tie_err"})
+
+
+# --------------------------------------------------------------------------
+# /api/night, /api/object/{obj_id}/night/{night_id} -- reference/comparison members
+# --------------------------------------------------------------------------
+
+
+def _tile_frames(cur: psycopg.Cursor, night_id: int) -> list[dict]:
+    """Fetch frame info for a night."""
+    cur.execute(
+        "SELECT frame_index, bjd_tdb, kept, file_name, airmass "
+        "FROM relphot.frame WHERE night_id = %s ORDER BY frame_index",
+        (night_id,),
+    )
+    return _rows_to_dicts(cur, cur.fetchall())
+
+
+def _reference_payload(
+    cur: psycopg.Cursor, night_id: int, tile: int, aperture: int
+) -> dict | None:
+    """Build reference light-curve payload for a tile."""
+    if not column_exists(cur.connection, "tile_lc", "night_id"):
+        return None
+    cur.execute(
+        "SELECT ref_flux, ref_flux_err, ens_flux, ens_flux_err, n_ensemble, n_comp "
+        "FROM relphot.tile_lc WHERE night_id = %s AND tile = %s AND aperture = %s",
+        (night_id, tile, aperture),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    ref_flux, ref_flux_err, ens_flux, ens_flux_err, _, n_comp = row
+    # Count reference members
+    cur.execute(
+        "SELECT COUNT(*) FROM relphot.reference_member WHERE night_id = %s AND tile = %s",
+        (night_id, tile),
+    )
+    (n_ref,) = cur.fetchone()
+    # Get night info
+    cur.execute("SELECT zp, zp_source FROM relphot.night WHERE night_id = %s", (night_id,))
+    (zp, zp_source) = cur.fetchone()
+    # Get tile info
+    cur.execute(
+        "SELECT x_min, x_max, y_min, y_max FROM relphot.night_tile "
+        "WHERE night_id = %s AND tile = %s",
+        (night_id, tile),
+    )
+    tile_info_row = cur.fetchone()
+    tile_info = (
+        {
+            "x_min": tile_info_row[0],
+            "x_max": tile_info_row[1],
+            "y_min": tile_info_row[2],
+            "y_max": tile_info_row[3],
+        }
+        if tile_info_row
+        else {}
+    )
+    # Get apertures stored for this tile
+    cur.execute(
+        "SELECT array_agg(DISTINCT aperture ORDER BY aperture) FROM relphot.tile_lc "
+        "WHERE night_id = %s AND tile = %s",
+        (night_id, tile),
+    )
+    (apertures,) = cur.fetchone()
+    apertures = apertures or []
+
+    frames = _tile_frames(cur, night_id)
+    return {
+        "night_id": night_id,
+        "tile": tile,
+        "aperture": aperture,
+        "apertures": apertures,
+        "tile_info": tile_info,
+        "frames": frames,
+        "ref_flux": ref_flux,
+        "ref_flux_err": ref_flux_err,
+        "ens_flux": ens_flux,
+        "ens_flux_err": ens_flux_err,
+        "n_ref": n_ref,
+        "n_comp": n_comp,
+        "zp": zp,
+        "zp_source": zp_source,
+    }
+
+
+def _comparison_payload(
+    cur: psycopg.Cursor,
+    night_id: int,
+    tile: int,
+    aperture: int,
+    limit: int = 200,
+    order: str = "mag",
+    target_obj_id: int | None = None,
+) -> dict | None:
+    """Build comparison light-curve payload for a tile."""
+    if not column_exists(cur.connection, "tile_lc", "night_id"):
+        return None
+
+    # Get tile_lc info
+    cur.execute(
+        "SELECT ens_flux, ens_flux_err, n_comp FROM relphot.tile_lc "
+        "WHERE night_id = %s AND tile = %s AND aperture = %s",
+        (night_id, tile, aperture),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    ens_flux, ens_flux_err, _ = row
+
+    # Fetch all comparison members for this (tile, aperture)
+    cur.execute(
+        "SELECT cm.star_id, cm.obj_id, cm.mag, cm.weight, cm.n_clipped, "
+        "cm.clipped_frames, cm.norm_flux, o.name "
+        "FROM relphot.comparison_member cm "
+        "LEFT JOIN relphot.object o ON o.obj_id = cm.obj_id "
+        "WHERE cm.night_id = %s AND cm.tile = %s AND cm.aperture = %s "
+        "ORDER BY cm.star_id",
+        (night_id, tile, aperture),
+    )
+    member_rows = cur.fetchall()
+
+    if not member_rows:
+        return {
+            "tile": tile,
+            "aperture": aperture,
+            "n_members": 0,
+            "n_shown": 0,
+            "order": order,
+            "limit": limit,
+            "frames": _tile_frames(cur, night_id),
+            "ens_flux": ens_flux,
+            "ens_flux_err": ens_flux_err,
+            "envelope": None,
+            "members": [],
+        }
+
+    # Get night info
+    cur.execute("SELECT zp FROM relphot.night WHERE night_id = %s", (night_id,))
+    (zp,) = cur.fetchone()
+
+    # Get target info if applicable
+    target_info = None
+    target_star_id = None
+    if target_obj_id is not None:
+        cur.execute(
+            "SELECT sn.star_id FROM relphot.star_night sn "
+            "WHERE sn.obj_id = %s AND sn.night_id = %s AND sn.tile = %s",
+            (target_obj_id, night_id, tile),
+        )
+        target_row = cur.fetchone()
+        if target_row:
+            (target_star_id,) = target_row
+            # Get target's lc info (sparse: frame_index + flux_raw)
+            cur.execute(
+                "SELECT lc.frame_index, lc.flux_raw FROM relphot.lightcurve lc "
+                "WHERE lc.obj_id = %s AND lc.night_id = %s",
+                (target_obj_id, night_id),
+            )
+            lc_row = cur.fetchone()
+            if lc_row:
+                frame_indices, flux_raw_sparse = lc_row
+                # Scatter sparse flux into full-length array
+                if ens_flux and flux_raw_sparse and frame_indices:
+                    n_frames = len(ens_flux)
+                    flux_raw_full = np.full(n_frames, np.nan, dtype=np.float32)
+                    frame_idx_arr = np.asarray(frame_indices, dtype=np.int32)
+                    flux_raw_arr = np.asarray(flux_raw_sparse, dtype=np.float32)
+                    flux_raw_full[frame_idx_arr] = flux_raw_arr
+                    ens_flux_arr = np.asarray(ens_flux, dtype=np.float32)
+                    prod = flux_raw_full * ens_flux_arr
+                    finite = np.isfinite(prod)
+                    if np.any(finite):
+                        med = np.nanmedian(prod[finite])
+                        norm_flux_target = prod / med
+                        flux_raw_finite = flux_raw_full[np.isfinite(flux_raw_full)]
+                        if len(flux_raw_finite) > 0:
+                            resid_flux = flux_raw_full / np.nanmedian(flux_raw_finite)
+                            # Get is_member and weight from comparison_member
+                            cur.execute(
+                                (
+                                    "SELECT EXISTS(SELECT 1 FROM "
+                                    "relphot.comparison_member WHERE night_id=%s AND tile=%s "
+                                    "AND aperture=%s AND star_id=%s), COALESCE((SELECT weight "
+                                    "FROM relphot.comparison_member WHERE night_id=%s AND "
+                                    "tile=%s AND aperture=%s AND star_id=%s), NULL) FROM "
+                                    "(SELECT 1) dummy"
+                                ),
+                                (
+                                    night_id, tile, aperture, target_star_id,
+                                    night_id, tile, aperture, target_star_id,
+                                ),
+                            )
+                            member_row = cur.fetchone()
+                            is_member = member_row[0] if member_row else False
+                            weight = member_row[1] if member_row else None
+                            target_info = {
+                                "obj_id": target_obj_id,
+                                "star_id": target_star_id,
+                                "is_member": is_member,
+                                "weight": weight,
+                                "frame_index": list(range(n_frames)),
+                                "norm_flux": [
+                                    float(v) if np.isfinite(v) else None
+                                    for v in norm_flux_target
+                                ],
+                                "resid_flux": [
+                                    float(v) if np.isfinite(v) else None
+                                    for v in resid_flux
+                                ],
+                            }
+
+    # Parse member data
+    members_data = []
+    norm_flux_all = []
+    for star_id, obj_id, mag, weight, n_clipped, clipped_frames, norm_flux, name in member_rows:
+        norm_flux_arr = np.asarray(norm_flux, dtype=np.float32)
+        norm_flux_all.append(norm_flux_arr)
+        members_data.append(
+            {
+                "star_id": star_id,
+                "obj_id": obj_id,
+                "name": name,
+                "mag": mag,
+                "mag_app": mag + zp if mag is not None else None,
+                "weight": weight,
+                "n_clipped": n_clipped,
+                "clipped_frames": clipped_frames,
+                "norm_flux": norm_flux_arr,
+            }
+        )
+
+    # Compute RMS and envelope
+    if norm_flux_all:
+        norm_flux_2d = np.array(norm_flux_all)
+        ens_flux_arr = np.asarray(ens_flux, dtype=np.float32) if ens_flux else None
+        if ens_flux_arr is not None:
+            rms_vals = member_rms(norm_flux_2d, ens_flux_arr)
+            for i, m in enumerate(members_data):
+                m["rms"] = float(rms_vals[i]) if np.isfinite(rms_vals[i]) else None
+        env = envelope(norm_flux_2d)
+    else:
+        env = None
+
+    # Select members to show
+    n_members = len(members_data)
+    must_include = (
+        {i for i, m in enumerate(members_data) if m["star_id"] == target_star_id}
+        if target_star_id
+        else set()
+    )
+
+    if order == "mag":
+        mag_arr = np.array(
+            [m["mag"] if m["mag"] is not None else np.nan for m in members_data]
+        )
+        selected_indices = select_members(
+            order, limit, mag=mag_arr, must_include=must_include
+        )
+    elif order == "weight":
+        weight_arr = np.array(
+            [m["weight"] if m["weight"] is not None else 0.0 for m in members_data]
+        )
+        selected_indices = select_members(
+            order, limit, weight=weight_arr, must_include=must_include
+        )
+    elif order == "rms":
+        rms_arr = np.array([m.get("rms", np.nan) or np.nan for m in members_data])
+        selected_indices = select_members(
+            order, limit, rms=rms_arr, must_include=must_include
+        )
+    else:
+        selected_indices = select_members(order, limit, must_include=must_include)
+
+    # Build member list with shown flag
+    shown_set = {int(i) for i in selected_indices}
+    for i, m in enumerate(members_data):
+        m["shown"] = i in shown_set
+        if m["shown"]:
+            m["norm_flux"] = [
+                round(float(v), 5) if np.isfinite(v) else None for v in m["norm_flux"]
+            ]
+        else:
+            # Don't include flux arrays for non-shown members
+            m.pop("norm_flux", None)
+            m.pop("clipped_frames", None)
+
+    frames = _tile_frames(cur, night_id)
+    return {
+        "tile": tile,
+        "aperture": aperture,
+        "n_members": n_members,
+        "n_shown": len(shown_set),
+        "order": order,
+        "limit": limit,
+        "frames": frames,
+        "ens_flux": ens_flux,
+        "ens_flux_err": ens_flux_err,
+        "envelope": env,
+        "members": members_data,
+        "target": target_info,
+    }
+
+
+def _members_schema() -> bool:
+    """Whether the schema-v11 member tables exist (cached after the first check)."""
+    with get_ro_conn() as conn:
+        return column_exists(conn, "tile_lc", "night_id")
+
+
+@app.get("/api/nights")
+def list_nights():
+    """List nights with basic info and member status."""
+    if not _members_schema():
+        return _json({
+            "nights": [],
+            "note": "members not available (schema v11 / not loaded)"
+        })
+
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT n.night_id, n.label, n.telescope, n.night_date, n.n_frames, "
+            "(SELECT count(*) FROM relphot.frame f "
+            " WHERE f.night_id = n.night_id AND f.kept) AS n_kept, "
+            "n.zp, n.zp_source, "
+            "(SELECT count(*) FROM relphot.night_tile nt "
+            " WHERE nt.night_id = n.night_id) AS n_tiles, "
+            "EXISTS (SELECT 1 FROM relphot.night_tile nt "
+            " WHERE nt.night_id = n.night_id) AS has_members "
+            "FROM relphot.night n "
+            "ORDER BY n.night_date DESC"
+        )
+        nights = _rows_to_dicts(cur, cur.fetchall())
+    return _json({"nights": nights})
+
+
+@app.get("/api/night/{night_id}/tiles")
+def night_tiles(night_id: int):
+    """List tiles of a night with their metadata."""
+    if not _members_schema():
+        msg = "members not available (schema v11 / not loaded)"
+        raise HTTPException(status_code=404, detail=msg)
+
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        # Check night exists
+        cur.execute("SELECT night_id FROM relphot.night WHERE night_id = %s", (night_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail=f"night {night_id} not found")
+
+        # Get night info
+        cur.execute(
+            "SELECT label, telescope, night_date, n_frames FROM relphot.night "
+            "WHERE night_id = %s",
+            (night_id,),
+        )
+        night_row = cur.fetchone()
+        night_info = {
+            "night_id": night_id,
+            "label": night_row[0],
+            "telescope": night_row[1],
+            "night_date": night_row[2],
+            "n_frames": night_row[3],
+        } if night_row else {}
+
+        # Get tiles
+        cur.execute(
+            "SELECT tile, x_min, x_max, y_min, y_max, n_core, n_extended, "
+            "n_ref_stars, ref_aperture, best_apertures "
+            "FROM relphot.night_tile WHERE night_id = %s ORDER BY tile",
+            (night_id,),
+        )
+        tile_rows = cur.fetchall()
+
+        tiles = []
+        for (
+            tile,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            n_core,
+            n_extended,
+            n_ref_stars,
+            ref_aperture,
+            best_apertures,
+        ) in tile_rows:
+            # Count stored comparison members for this tile
+            cur.execute(
+                (
+                    "SELECT COUNT(DISTINCT aperture) FROM relphot.tile_lc "
+                    "WHERE night_id = %s AND tile = %s"
+                ),
+                (night_id, tile),
+            )
+            (n_comp,) = cur.fetchone()
+            tiles.append({
+                "tile": tile,
+                "x_min": x_min,
+                "x_max": x_max,
+                "y_min": y_min,
+                "y_max": y_max,
+                "n_core": n_core,
+                "n_extended": n_extended,
+                "n_ref_stars": n_ref_stars,
+                "ref_aperture": ref_aperture,
+                "best_apertures": best_apertures or [],
+                "n_comp": n_comp or 0,
+            })
+
+    return _json({"night": night_info, "tiles": tiles})
+
+
+@app.get("/api/night/{night_id}/tiles/references")
+def night_tiles_references(night_id: int, aperture: int = Query(default=None)):
+    """Get reference light curves for all tiles of a night at a given aperture."""
+    if not _members_schema():
+        msg = "members not available (schema v11 / not loaded)"
+        raise HTTPException(status_code=404, detail=msg)
+
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        # Check night exists
+        cur.execute("SELECT night_id FROM relphot.night WHERE night_id = %s", (night_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail=f"night {night_id} not found")
+
+        frames = _tile_frames(cur, night_id)
+
+        # Get tiles and their reference fluxes at the given aperture
+        cur.execute(
+            "SELECT tl.tile, tl.aperture, tl.ref_flux "
+            "FROM relphot.tile_lc tl "
+            "WHERE tl.night_id = %s AND (aperture = %s OR %s IS NULL) "
+            "ORDER BY tl.tile, tl.aperture",
+            (night_id, aperture, aperture),
+        )
+        tile_rows = cur.fetchall()
+
+        tiles_data = []
+        for tile, aper, ref_flux in tile_rows:
+            tiles_data.append({
+                "tile": tile,
+                "aperture": aper,
+                "n_ref": len([f for f in ref_flux if f is not None]),
+                "ref_flux": ref_flux,
+            })
+
+    return _json({
+        "frames": frames,
+        "aperture": aperture,
+        "tiles": tiles_data,
+    })
+
+
+@app.get("/api/night/{night_id}/tile/{tile}/reference")
+def night_tile_reference(night_id: int, tile: int, aperture: int = Query(default=None)):
+    """Get reference light curve for a tile."""
+    if not _members_schema():
+        msg = "members not available (schema v11 / not loaded)"
+        raise HTTPException(status_code=404, detail=msg)
+
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        # Check night and tile exist
+        cur.execute("SELECT night_id FROM relphot.night WHERE night_id = %s", (night_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail=f"night {night_id} not found")
+
+        # Get best_apertures for this tile, use default aperture if needed
+        cur.execute(
+            (
+                "SELECT ref_aperture, best_apertures FROM relphot.night_tile "
+                "WHERE night_id = %s AND tile = %s"
+            ),
+            (night_id, tile),
+        )
+        nt_row = cur.fetchone()
+        if not nt_row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"tile {tile} not found in night {night_id}",
+            )
+
+        ref_aperture, best_apertures = nt_row
+        if aperture is None:
+            # Use first of best_apertures, or ref_aperture if empty
+            aperture = (best_apertures[0] if best_apertures else ref_aperture) or 0
+
+        payload = _reference_payload(cur, night_id, tile, aperture)
+        if payload is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"reference not found for tile {tile} aperture "
+                    f"{aperture}"
+                ),
+            )
+
+    return _json(payload)
+
+
+@app.get("/api/night/{night_id}/tile/{tile}/reference/members")
+def night_tile_reference_members(night_id: int, tile: int):
+    """Get reference members for a tile."""
+    if not _members_schema():
+        msg = "members not available (schema v11 / not loaded)"
+        raise HTTPException(status_code=404, detail=msg)
+
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        # Get reference aperture for this tile
+        cur.execute(
+            "SELECT ref_aperture FROM relphot.night_tile WHERE night_id = %s AND tile = %s",
+            (night_id, tile),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"tile {tile} not found")
+
+        (ref_aperture,) = row
+        if ref_aperture is None:
+            ref_aperture = 0
+
+        # Get night's zero point
+        cur.execute("SELECT zp FROM relphot.night WHERE night_id = %s", (night_id,))
+        (zp,) = cur.fetchone()
+
+        # Get reference members ordered by weight desc
+        cur.execute(
+            "SELECT rm.star_id, rm.obj_id, o.name, rm.ra, rm.dec, rm.mag, rm.weight, rm.in_core "
+            "FROM relphot.reference_member rm "
+            "LEFT JOIN relphot.object o ON o.obj_id = rm.obj_id "
+            "WHERE rm.night_id = %s AND rm.tile = %s "
+            "ORDER BY rm.weight DESC, rm.star_id",
+            (night_id, tile),
+        )
+        rows = cur.fetchall()
+
+        members = []
+        for star_id, obj_id, name, ra, dec, mag, weight, in_core in rows:
+            members.append({
+                "star_id": star_id,
+                "obj_id": obj_id,
+                "name": name,
+                "ra": ra,
+                "dec": dec,
+                "mag": mag,
+                "mag_app": mag + zp if mag is not None else None,
+                "weight": weight,
+                "in_core": in_core,
+            })
+
+    return _json({"members": members})
+
+
+@app.get("/api/night/{night_id}/tile/{tile}/comparison")
+def night_tile_comparison(
+    night_id: int,
+    tile: int,
+    aperture: int = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    order: str = Query(default="mag"),
+):
+    """Get comparison members for a tile."""
+    if not _members_schema():
+        msg = "members not available (schema v11 / not loaded)"
+        raise HTTPException(status_code=404, detail=msg)
+
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        # Validate parameters
+        if order not in ("mag", "weight", "rms"):
+            order = "mag"
+
+        # Check tile exists
+        cur.execute(
+            "SELECT best_apertures FROM relphot.night_tile WHERE night_id = %s AND tile = %s",
+            (night_id, tile),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"tile {tile} not found")
+
+        best_apertures, = row
+        if aperture is None:
+            aperture = best_apertures[0] if best_apertures else 0
+
+        payload = _comparison_payload(cur, night_id, tile, aperture, limit, order)
+        if payload is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"comparison not found for tile {tile} aperture "
+                    f"{aperture}"
+                ),
+            )
+
+    return _json(payload)
+
+
+@app.get("/api/object/{obj_id}/night/{night_id}/reference")
+def object_night_reference(obj_id: int, night_id: int):
+    """Get reference light curve for an object on a given night."""
+    if not _members_schema():
+        msg = "members not available (schema v11 / not loaded)"
+        raise HTTPException(status_code=404, detail=msg)
+
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        # Get object's star_night for this night
+        cur.execute(
+            "SELECT sn.tile, sn.best_aperture FROM relphot.star_night sn "
+            "WHERE sn.obj_id = %s AND sn.night_id = %s",
+            (obj_id, night_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"object {obj_id} not in night {night_id}")
+
+        tile, best_aperture = row
+
+        payload = _reference_payload(cur, night_id, tile, best_aperture)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="reference not found")
+
+    return _json(payload)
+
+
+@app.get("/api/object/{obj_id}/night/{night_id}/comparison")
+def object_night_comparison(
+    obj_id: int,
+    night_id: int,
+    limit: int = Query(default=200, ge=1, le=1000),
+    order: str = Query(default="mag"),
+):
+    """Get comparison members for an object on a given night."""
+    if not _members_schema():
+        msg = "members not available (schema v11 / not loaded)"
+        raise HTTPException(status_code=404, detail=msg)
+
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        # Validate parameters
+        if order not in ("mag", "weight", "rms"):
+            order = "mag"
+
+        # Get object's star_night for this night
+        cur.execute(
+            "SELECT sn.tile, sn.best_aperture FROM relphot.star_night sn "
+            "WHERE sn.obj_id = %s AND sn.night_id = %s",
+            (obj_id, night_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"object {obj_id} not in night {night_id}")
+
+        tile, best_aperture = row
+
+        payload = _comparison_payload(
+            cur, night_id, tile, best_aperture, limit, order,
+            target_obj_id=obj_id,
+        )
+        if payload is None:
+            raise HTTPException(status_code=404, detail="comparison not found")
+
+    return _json(payload)
 
 
 # --------------------------------------------------------------------------

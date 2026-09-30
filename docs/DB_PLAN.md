@@ -309,6 +309,56 @@ no `bls` detection, per-night transit event in the period-compatibility search, 
 `db analyze` reads the flag from the run that ties the object (most nights covered, then latest loaded); such a run
 counts as tying an object even when a loose night of the object has no `tie` row (the tied series omits it).
 
+## Reference and comparison members (schema v11)
+
+The comparison and reference light curves are built from sets of other stars. Schema v11 stores which stars
+contributed to each tile's curves and their individual measurements, to support traceability and web plots.
+
+**Four new tables** (created by migration `011_members.sql`; cascading DELETE from `night_tile`):
+
+- `night_tile`: one row per (night, tile); stores tile bounds (xmin/xmax/ymin/ymax in pixels; named x/y_min/max
+  because xmin/xmax are PostgreSQL system columns), core and extended star counts, reference aperture, and the list
+  of best apertures used by stars in that tile.
+- `tile_lc`: one row per (night, tile, aperture) that was used; stores reference and comparison ensemble curves (arrays
+  of length n_frames, indexed by frame_index; NaN where frames were dropped), ensemble sizes, and a count of stored
+  comparison members for that pair. `tile_lc` covers every (tile, aperture), but only holds data where some comparison
+  or reference member exists.
+- `reference_member`: one row per (night, tile, reference star); stores the star's measurements (ra, dec, magnitude),
+  its weight in the reference average (normalised inverse-variance; sums to 1 per tile), and its position class
+  (in_core: whether the star's core tile matches this reference tile).
+- `comparison_member`: one row per (night, tile, aperture, comparison star); stores measurements (ra, dec, magnitude,
+  weight), clipping record (n_clipped count and the frame_index values clipped), and the star's normalised light
+  curve (full length, NaN where dropped or not in the night's epoch list). Weight is the share of total ensemble
+  weight for that (tile, aperture), summing to 1 across all members of the pair; not all members of a tile appear in
+  all apertures.
+
+**Data model**:
+- Arrays (norm_flux, ref_flux, ens_flux, etc.) are full length (= night.n_frames) and indexed by frame_index; NaN marks
+  frames dropped from the night (frame.kept = false) or where the value is undefined.
+- star_id is night-local (scope within one night); ra/dec/mag are from the night's star catalog; mag_app = mag + night.zp.
+- Members failing the database noise cut are stored with obj_id NULL (cannot be linked to objects) or linked by q3c
+  1-arcsecond position match to existing objects.
+- norm_flux values are BEFORE decorrelation (as stored in the npz products); the web endpoint applies any decorrelation.
+- Reference weight: normalised inverse-variance (1/variance sum to 1 per tile, or 1/n for median_fixed). Comparison
+  weight: share of total ensemble weight (1/n for median, or weighted sum of clipped-accept frames).
+
+**Backfill workflow**:
+1. Rerun the processing pipeline to recover reference star lists and build member products:
+   - `relphot reference` (existing), saving with `--tile-stars` for recovery.
+   - `relphot lightcurves` (new: `--no-members` to skip; default includes automatic backfill if ref.npz has tile_ref_flat keys).
+   - Or standalone: `relphot members <night>/night.npz <night>/ref.npz <night>/lc/<stem>.npz` -> `<night>/lc/<stem>_members.npz`.
+2. Load into the database:
+   - `relphot db load-members <night>/relphot [--lc-stem STEM]` reads `*_lightcurves_members.npz` or the given stem.
+
+**Web endpoints** (new in schema v11):
+- `GET /api/nights`: list of nights with schema version, n_frames, n_kept, zero point, and has_members flag.
+- `GET /api/night/{night_id}/tiles`: night info and tile list (bounds, star counts, apertures).
+- `GET /api/night/{night_id}/tiles/references?aperture=A`: reference light curves for all tiles.
+- `GET /api/night/{night_id}/tile/{tile}/reference?aperture=A`: tile reference (flux + error).
+- `GET /api/night/{night_id}/tile/{tile}/reference/members`: reference stars of a tile (name, mag, weight, in_core).
+- `GET /api/night/{night_id}/tile/{tile}/comparison?aperture=A&limit=N&order=FIELD`: tile comparison ensemble and member list (order: mag, weight, rms; limit: default 200, max 1000).
+- `GET /api/object/{obj_id}/night/{night_id}/reference` and `/comparison`: object-level wrappers (include target info).
+
 ## Coincident events (schema v9)
 
 One planet cannot transit two stars at once. A per-night transit event whose trapezoid fit has many look-alikes on

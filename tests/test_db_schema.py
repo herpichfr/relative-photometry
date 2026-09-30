@@ -56,6 +56,7 @@ def test_init_schema_creates_tables(test_conn) -> None:
         "night", "frame", "object", "star_night", "lightcurve", "detection",
         "catalog_match", "mn_run", "tie", "periodogram", "schema_version",
         "transit_shape", "transit_match", "period_estimate",
+        "night_tile", "tile_lc", "reference_member", "comparison_member",
     }
     with test_conn.cursor() as cur:
         cur.execute(
@@ -147,8 +148,8 @@ def test_migration_004_from_v3_maps_class_to_flags(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9, 10]
-    assert current_version(test_conn) == 10
+    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9, 10, 11]
+    assert current_version(test_conn) == 11
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -282,7 +283,7 @@ def test_migration_005_verify_status_backfill_and_check(test_conn) -> None:
             )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [5, 6, 7, 8, 9, 10]
+    assert init_schema(test_conn) == [5, 6, 7, 8, 9, 10, 11]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -305,7 +306,7 @@ def test_migration_007_night_zero_point_defaults_existing_nights_to_assumed(test
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [7, 8, 9, 10]
+    assert init_schema(test_conn) == [7, 8, 9, 10, 11]
 
     with test_conn.cursor() as cur:
         cur.execute("SELECT zp, zp_source FROM relphot.night")
@@ -332,7 +333,7 @@ def test_migration_008_night_zero_point_source_accepts_measured(test_conn) -> No
         cur.execute("UPDATE relphot.night SET zp_source = 'measured'")
     test_conn.rollback()
 
-    assert init_schema(test_conn) == [8, 9, 10]
+    assert init_schema(test_conn) == [8, 9, 10, 11]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -373,7 +374,7 @@ def test_migration_009_coincidence_columns_and_table_from_v8(test_conn) -> None:
         (det_id,) = cur.fetchone()
     test_conn.commit()
 
-    assert init_schema(test_conn) == [9, 10]
+    assert init_schema(test_conn) == [9, 10, 11]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -472,8 +473,8 @@ def test_migration_006_guided_reprocessing_schema_from_v5(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9, 10]
-    assert current_version(test_conn) == 10
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11]
+    assert current_version(test_conn) == 11
 
     with test_conn.cursor() as cur:
         # existing rows: searches' detections, no inflation information, no new estimate info
@@ -567,7 +568,7 @@ def test_migration_006_user_night_review_from_v5_backfills_object_level_flags(te
                 )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9, 10]
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -796,7 +797,7 @@ def test_migration_010_loose_night_ids_from_v9(test_conn) -> None:
             (["a", "b"],),
         )
     test_conn.commit()
-    assert init_schema(test_conn) == [10]
+    assert init_schema(test_conn) == [10, 11]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -819,3 +820,170 @@ def test_migration_010_loose_night_ids_from_v9(test_conn) -> None:
     with pytest.raises(psycopg.errors.NotNullViolation), test_conn.cursor() as cur:
         cur.execute("INSERT INTO relphot.mn_run (stem, loose_night_ids) VALUES ('bad', NULL)")
     test_conn.rollback()
+
+
+def test_migration_011_members_from_v10(test_conn) -> None:
+    _apply_up_to(test_conn, 10)
+    with test_conn.cursor() as cur:
+        # Insert a night
+        cur.execute(
+            "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+            "VALUES ('T80S', '2025-01-01', 'test', '/tmp/test') RETURNING night_id"
+        )
+        (night_id,) = cur.fetchone()
+        # Insert an object
+        cur.execute(
+            "INSERT INTO relphot.object (name, ra, dec) VALUES ('obj1', 1.0, 1.0) "
+            "RETURNING obj_id"
+        )
+        (obj_id,) = cur.fetchone()
+    test_conn.commit()
+
+    assert init_schema(test_conn) == [11]
+    assert init_schema(test_conn) == []
+
+    with test_conn.cursor() as cur:
+        # Test night_tile creation and PK uniqueness
+        cur.execute(
+            "INSERT INTO relphot.night_tile (night_id, tile) VALUES (%s, 0)",
+            (night_id,),
+        )
+        cur.execute(
+            "INSERT INTO relphot.tile_lc (night_id, tile, aperture, ref_flux, ref_flux_err) "
+            "VALUES (%s, 0, 0, %s, %s)",
+            (night_id, [1.0, 2.0, float('nan')], [0.1, 0.2, float('nan')]),
+        )
+        cur.execute(
+            "INSERT INTO relphot.reference_member"
+            " (night_id, tile, star_id, obj_id, ra, dec, mag, weight, in_core) "
+            "VALUES (%s, 0, 100, %s, 1.0, 1.0, 10.0, 0.5, true)",
+            (night_id, obj_id),
+        )
+        cur.execute(
+            "INSERT INTO relphot.comparison_member"
+            " (night_id, tile, aperture, star_id, obj_id, ra, dec, mag, weight, norm_flux) "
+            "VALUES (%s, 0, 0, 101, NULL, 2.0, 2.0, 11.0, 0.3, %s)",
+            (night_id, [1.0, 1.1, float('nan')]),
+        )
+    test_conn.commit()
+
+    # Test PK duplicate rejection
+    with pytest.raises(psycopg.errors.IntegrityError), test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.night_tile (night_id, tile) VALUES (%s, 0)",
+            (night_id,),
+        )
+    test_conn.rollback()
+
+    # Test cascade delete from night
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.night WHERE night_id = %s", (night_id,))
+    test_conn.commit()
+
+    with test_conn.cursor() as cur:
+        # All related rows should be deleted
+        cur.execute("SELECT COUNT(*) FROM relphot.night_tile WHERE night_id = %s", (night_id,))
+        assert cur.fetchone() == (0,)
+        cur.execute(
+            "SELECT COUNT(*) FROM relphot.reference_member WHERE night_id = %s",
+            (night_id,),
+        )
+        assert cur.fetchone() == (0,)
+        cur.execute(
+            "SELECT COUNT(*) FROM relphot.comparison_member WHERE night_id = %s",
+            (night_id,),
+        )
+        assert cur.fetchone() == (0,)
+
+    # Insert again to test cascade from night_tile
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+            "VALUES ('T80S', '2025-01-02', 'test2', '/tmp/test2') RETURNING night_id"
+        )
+        (night_id2,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.night_tile (night_id, tile) VALUES (%s, 1)",
+            (night_id2,),
+        )
+        cur.execute(
+            "INSERT INTO relphot.tile_lc (night_id, tile, aperture, ref_flux, ref_flux_err) "
+            "VALUES (%s, 1, 1, %s, %s)",
+            (night_id2, [1.0], [0.1]),
+        )
+        cur.execute(
+            "INSERT INTO relphot.reference_member (night_id, tile, star_id, ra, dec) "
+            "VALUES (%s, 1, 200, 3.0, 3.0)",
+            (night_id2,),
+        )
+        cur.execute(
+            "INSERT INTO relphot.comparison_member"
+            " (night_id, tile, aperture, star_id, ra, dec, norm_flux) "
+            "VALUES (%s, 1, 1, 201, 4.0, 4.0, %s)",
+            (night_id2, [1.0]),
+        )
+    test_conn.commit()
+
+    # Test cascade delete from night_tile
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.night_tile WHERE night_id = %s AND tile = 1", (night_id2,))
+    test_conn.commit()
+
+    with test_conn.cursor() as cur:
+        # tile_lc, reference_member, comparison_member should be deleted
+        cur.execute(
+            "SELECT COUNT(*) FROM relphot.tile_lc WHERE night_id = %s AND tile = 1",
+            (night_id2,),
+        )
+        assert cur.fetchone() == (0,)
+        cur.execute(
+            "SELECT COUNT(*) FROM relphot.reference_member WHERE night_id = %s AND tile = 1",
+            (night_id2,),
+        )
+        assert cur.fetchone() == (0,)
+        cur.execute(
+            "SELECT COUNT(*) FROM relphot.comparison_member WHERE night_id = %s AND tile = 1",
+            (night_id2,),
+        )
+        assert cur.fetchone() == (0,)
+
+    # Test obj_id SET NULL on object delete
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.night_tile (night_id, tile) VALUES (%s, 2)",
+            (night_id2,),
+        )
+        cur.execute(
+            "INSERT INTO relphot.reference_member (night_id, tile, star_id, obj_id, ra, dec) "
+            "VALUES (%s, 2, 300, %s, 5.0, 5.0)",
+            (night_id2, obj_id),
+        )
+    test_conn.commit()
+
+    with test_conn.cursor() as cur:
+        cur.execute("DELETE FROM relphot.object WHERE obj_id = %s", (obj_id,))
+    test_conn.commit()
+
+    with test_conn.cursor() as cur:
+        # obj_id should be NULL but row still exists
+        cur.execute(
+            "SELECT obj_id FROM relphot.reference_member WHERE night_id = %s AND star_id = 300",
+            (night_id2,),
+        )
+        assert cur.fetchone() == (None,)
+
+    # Test role permissions
+    with test_conn.cursor() as cur:
+        for table in ("night_tile", "tile_lc", "reference_member", "comparison_member"):
+            for role in ("relphot_ro", "relphot_web"):
+                cur.execute(
+                    "SELECT has_table_privilege(%s, 'relphot.' || %s, 'SELECT')",
+                    (role, table),
+                )
+                assert cur.fetchone() == (True,), f"{role} should have SELECT on {table}"
+            cur.execute(
+                "SELECT has_table_privilege('relphot_ro', 'relphot.' || %s, 'INSERT')",
+                (table,),
+            )
+            assert cur.fetchone() == (False,), f"relphot_ro should not have INSERT on {table}"
+    test_conn.commit()

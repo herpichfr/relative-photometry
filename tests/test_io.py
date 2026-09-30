@@ -456,3 +456,88 @@ def test_starstats_table_has_tailed_column(tmp_path) -> None:
     ss = Table.read(str(ss_path), format="fits")
     assert ss["tailed"].dtype == bool
     np.testing.assert_array_equal(np.asarray(ss["tailed"]), tailed[np.asarray(ss["star_id"])])
+
+
+def test_save_reference_with_tile_stars(tmp_path) -> None:
+    """Test save_reference with tile_stars parameter and load_reference_stars round trip."""
+    from relphot.io import load_reference_stars
+
+    night, _airmass, _flux0 = make_synthetic_night(n_stars=100, n_frames=30, seed=54)
+
+    settings = Settings()
+    variable_mask = np.zeros(night.n_stars, dtype=bool)
+    candidates = select_candidates(night, variable_mask, settings, aper=0)
+    tilemap = build_tilemap(night, candidates, settings)
+    frame_selection = select_reference_frames_and_stars(
+        night, tilemap, candidates, settings, aper=0
+    )
+    result = build_references(night, tilemap, frame_selection, settings)
+
+    ref_out = tmp_path / "ref.npz"
+    save_reference(
+        tilemap, result, settings, ref_out,
+        tile_stars=frame_selection.tile_stars, ref_aper=1
+    )
+
+    # Load with load_reference_stars
+    loaded_result = load_reference_stars(ref_out)
+
+    assert loaded_result is not None
+    loaded_tile_stars, loaded_ref_aper = loaded_result
+    assert len(loaded_tile_stars) == len(frame_selection.tile_stars)
+    assert loaded_ref_aper == 1
+
+    for t in range(tilemap.n_tiles):
+        np.testing.assert_array_equal(
+            np.sort(loaded_tile_stars[t]),
+            np.sort(frame_selection.tile_stars[t])
+        )
+
+
+def test_save_reference_without_tile_stars_load_returns_none(tmp_path) -> None:
+    """Test that save_reference without tile_stars -> load_reference_stars returns None."""
+    from relphot.io import load_reference_stars
+
+    night, _airmass, _flux0 = make_synthetic_night(n_stars=100, n_frames=30, seed=55)
+
+    settings = Settings()
+    variable_mask = np.zeros(night.n_stars, dtype=bool)
+    candidates = select_candidates(night, variable_mask, settings, aper=0)
+    tilemap = build_tilemap(night, candidates, settings)
+    frame_selection = select_reference_frames_and_stars(
+        night, tilemap, candidates, settings, aper=0
+    )
+    result = build_references(night, tilemap, frame_selection, settings)
+
+    ref_out = tmp_path / "ref.npz"
+    # Save WITHOUT tile_stars
+    save_reference(tilemap, result, settings, ref_out)
+
+    # Load should return None for tile_stars
+    loaded_result = load_reference_stars(ref_out)
+    assert loaded_result is None
+
+
+def test_load_reference_without_tile_stars_load_still_works(tmp_path) -> None:
+    """Test that load_reference still works even without tile_stars."""
+    night, _airmass, _flux0 = make_synthetic_night(n_stars=100, n_frames=30, seed=56)
+
+    settings = Settings()
+    variable_mask = np.zeros(night.n_stars, dtype=bool)
+    candidates = select_candidates(night, variable_mask, settings, aper=0)
+    tilemap = build_tilemap(night, candidates, settings)
+    frame_selection = select_reference_frames_and_stars(
+        night, tilemap, candidates, settings, aper=0
+    )
+    result = build_references(night, tilemap, frame_selection, settings)
+
+    ref_out = tmp_path / "ref.npz"
+    # Save WITHOUT tile_stars
+    save_reference(tilemap, result, settings, ref_out)
+
+    # Full load should still return reference data
+    tilemap2, result2, settings2 = load_reference(ref_out)
+
+    assert tilemap2.n_tiles == tilemap.n_tiles
+    np.testing.assert_array_equal(result2.R, result.R)
+    assert settings2 == settings
