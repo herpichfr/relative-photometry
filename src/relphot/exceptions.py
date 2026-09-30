@@ -7,6 +7,7 @@ __all__ = [
     "ConfigError",
     "IngestError",
     "MatchError",
+    "MembersError",
     "MultiNightError",
     "NightLoadError",
     "ReferenceFrameError",
@@ -55,3 +56,7 @@ class ReprocessError(RelphotError):
 
 class NightLoadError(RelphotError):
     """Raised when a night's relphot output directory cannot be loaded into the results database."""
+
+
+class MembersError(RelphotError):
+    """Raised when reference and comparison members cannot be traced."""

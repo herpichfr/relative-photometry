@@ -29,12 +29,13 @@ from relphot.comparison import select_comparison_stars
 from relphot.config import Settings, load_settings
 from relphot.cotrend import compute_cbvs, detect_systematic_frames, select_star_epochs
 from relphot.eligibility import star_eligibility
-from relphot.exceptions import ComparisonError, RelphotError
+from relphot.exceptions import ComparisonError, MembersError, RelphotError
 from relphot.ingest import read_catalogs
 from relphot.io import (
     load_lightcurves_npz,
     load_night,
     load_reference,
+    load_reference_stars,
     save_decorrelation_report,
     save_lightcurve_table,
     save_lightcurves_npz,
@@ -44,6 +45,12 @@ from relphot.io import (
 )
 from relphot.lightcurve import compute_light_curves
 from relphot.match import match_night
+from relphot.members import (
+    build_members,
+    members_path_for,
+    recover_reference_stars,
+    save_members_npz,
+)
 from relphot.multinight import (
     build_multinight_lightcurves,
     check_compatible,
@@ -289,7 +296,10 @@ def _run_reference(args: argparse.Namespace) -> int:
     logger.info("reference: %.2f s", t4 - t3)
 
     out_path = Path(args.out)
-    save_reference(tilemap, result, settings, out_path)
+    save_reference(
+        tilemap, result, settings, out_path,
+        tile_stars=frame_selection.tile_stars, ref_aper=aper
+    )
 
     tiles_csv = out_path.with_name(f"{out_path.stem}_tiles.csv")
     tilemap.to_csv(tiles_csv)
@@ -453,6 +463,24 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
         out_path,
     )
 
+    # Build and save members unless --no-members
+    if not getattr(args, 'no_members', False):
+        try:
+            tile_stars_loaded = load_reference_stars(args.reference)
+            if tile_stars_loaded is None:
+                logger.warning("reference has no star list; run 'relphot members'")
+            else:
+                tile_stars, ref_aper = tile_stars_loaded
+                members_product = build_members(
+                    night, tilemap, reference_result, tile_stars, ref_aper,
+                    comparison_result, best_aper_per_tile, settings
+                )
+                members_path = members_path_for(out_path)
+                save_members_npz(members_product, members_path)
+                print(f"wrote {members_path}")
+        except MembersError:
+            logger.exception("members traceability failed")
+
     # Save tables
     actual_fmt = settings.lightcurve.output_format
     if actual_fmt == "auto":
@@ -571,6 +599,94 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
     print(f"wrote {starstats_path}")
     print(f"wrote {diag_path}")
 
+    return 0
+
+
+def _run_members(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    # Load night, reference, and light curves
+    try:
+        night, _ingest_settings = load_night(args.night)
+    except (OSError, RelphotError):
+        logger.exception("failed to load %s", args.night)
+        return 1
+
+    try:
+        tilemap, reference_result, _ref_settings = load_reference(args.reference)
+    except (OSError, RelphotError):
+        logger.exception("failed to load %s", args.reference)
+        return 1
+
+    try:
+        lc_npz = Path(args.lc_npz)
+        with np.load(lc_npz, allow_pickle=False) as data:
+            comparison_result_data = {
+                'ensemble': data['comparison_ensemble'],
+                'sigma_ensemble': data['comparison_sigma_ensemble'],
+                'mask': data['comparison_mask'],
+                'n_comparison': data['comparison_n_comparison'],
+                'n_rounds_used': data['comparison_n_rounds_used'],
+            }
+            best_aper_per_tile = data['best_aper_per_tile']
+    except (OSError, RelphotError):
+        logger.exception("failed to load %s", args.lc_npz)
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    # Load or recover reference stars
+    tile_stars_loaded = load_reference_stars(args.reference)
+    if tile_stars_loaded is not None:
+        tile_stars, ref_aper = tile_stars_loaded
+    else:
+        # Recover from reference result
+        use_variables = 'auto' if args.variables == 'auto' else args.variables
+        try:
+            tile_stars, ref_aper = recover_reference_stars(
+                night, tilemap, reference_result, settings,
+                aper=args.aper if args.aper is not None else None,
+                use_variables=use_variables
+            )
+        except MembersError:
+            logger.exception("failed to recover reference stars")
+            return 1
+
+    # Create comparison result from loaded data
+    from relphot.comparison import ComparisonResult
+    comparison_result = ComparisonResult(
+        mask=comparison_result_data['mask'],
+        ensemble=comparison_result_data['ensemble'],
+        sigma_ensemble=comparison_result_data['sigma_ensemble'],
+        sigma_star=np.zeros_like(comparison_result_data['ensemble']),
+        mag=np.zeros_like(comparison_result_data['ensemble']),
+        n_comparison=comparison_result_data['n_comparison'],
+        n_rounds_used=comparison_result_data['n_rounds_used'],
+        method=settings.comparison.ensemble_statistic,
+    )
+
+    # Build members
+    try:
+        members_product = build_members(
+            night, tilemap, reference_result, tile_stars, ref_aper,
+            comparison_result, best_aper_per_tile, settings
+        )
+    except MembersError:
+        logger.exception("failed to build members")
+        return 1
+
+    # Save members
+    out_path = (
+        members_path_for(args.lc_npz) if args.out is None else Path(args.out)
+    )
+    save_members_npz(members_product, out_path)
+    print(f"wrote {out_path}")
     return 0
 
 
@@ -1347,11 +1463,50 @@ def _run_db_load_night(args: argparse.Namespace) -> int:
                 f"detections(transit={report.n_transit_detections},"
                 f"variable={report.n_variable_detections}) "
                 f"catalog_matches={report.n_catalog_matches} "
+                f"members(ref={report.n_reference_members},comp={report.n_comparison_members}) "
                 f"elapsed={report.elapsed_s:.1f}s"
             )
     finally:
         conn.close()
     return exit_code
+
+
+def _run_db_load_members(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect, load_members
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    try:
+        report = load_members(
+            conn, args.night_dir, lc_stem=args.lc_stem,
+        )
+    except RelphotError:
+        logger.exception("failed to load members for %s", args.night_dir)
+        return 1
+    finally:
+        conn.close()
+
+    print(
+        f"{args.night_dir}: night_id={report.night_id} "
+        f"tiles={report.n_tiles} tile_lc={report.n_tile_lc} "
+        f"reference_members={report.n_reference_members} "
+        f"comparison_members={report.n_comparison_members} "
+        f"linked={report.n_linked} unlinked={report.n_unlinked} "
+        f"elapsed={report.elapsed_s:.1f}s"
+    )
+    return 0
 
 
 def _run_db_load_multinight(args: argparse.Namespace) -> int:
@@ -1581,7 +1736,32 @@ def build_parser() -> argparse.ArgumentParser:
             "star (default: the [lightcurve] inflate_errors setting, 'excess')"
         ),
     )
+    lightcurves.add_argument(
+        "--no-members", action="store_true",
+        help="skip building reference and comparison member traceability",
+    )
     lightcurves.set_defaults(func=_run_lightcurves)
+
+    members = subparsers.add_parser(
+        "members", help="trace reference and comparison stars in light curves"
+    )
+    members.add_argument("night", help="input .npz written by `relphot ingest`")
+    members.add_argument("reference", help="input .npz written by `relphot reference`")
+    members.add_argument("lc_npz", help="input .npz written by `relphot lightcurves`")
+    members.add_argument("--config", type=Path, default=None, help="TOML settings file")
+    members.add_argument(
+        "--out", default=None,
+        help="output .npz file for members (default: members_path_for(lc_npz))",
+    )
+    members.add_argument(
+        "--variables", choices=["auto", "yes", "no"], default="auto",
+        help="variable mask for recovering reference stars (default: auto, try both)",
+    )
+    members.add_argument(
+        "--aper", type=int, default=None,
+        help="aperture for recovering reference stars (default: 1 if n_aper>=2 else 0, then all)",
+    )
+    members.set_defaults(func=_run_members)
 
     search = subparsers.add_parser(
         "search", help="single-event transit search and variability characterisation"
@@ -1708,6 +1888,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="TOML settings file (settings.search/settings.db drive the noise cut)",
     )
     db_load_night.set_defaults(func=_run_db_load_night)
+
+    db_load_members = db_subparsers.add_parser(
+        "load-members", help="load reference and comparison members for a night"
+    )
+    db_load_members.add_argument(
+        "night_dir", metavar="NIGHT_RELPHOT_DIR",
+        help="a night's relphot/ directory (holding night.npz, ref.npz, lc/)",
+    )
+    db_load_members.add_argument(
+        "--lc-stem", default=None,
+        help=(
+            "lc/<stem>_*.parquet stem (default: discovered; required if more than "
+            "one *_starstats.parquet is present)"
+        ),
+    )
+    db_load_members.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_load_members.set_defaults(func=_run_db_load_members)
 
     db_analyze = db_subparsers.add_parser(
         "analyze", help="recompute periodograms and PERIOD for candidate objects"

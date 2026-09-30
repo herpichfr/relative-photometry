@@ -38,6 +38,7 @@ __all__ = [
     "FrameSelection",
     "ReferenceResult",
     "build_references",
+    "reference_member_weights",
     "select_candidates",
     "select_reference_frames_and_stars",
 ]
@@ -374,14 +375,15 @@ def _fit_frame_outliers(
     return np.where(np.isfinite(resid), ok, True)
 
 
-def _reference_weighted_fixed(
+def reference_member_weights(
     f_s: np.ndarray, sigma_s: np.ndarray, bjd_tdb_kept: np.ndarray, ref: ReferenceSettings
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fixed-set inverse-variance weighted mean of normalised fluxes.
+    """Compute baseline and inverse-variance weights for fixed reference stars.
 
     Inputs are (|S|, n_kept). Computes baseline iteratively, excluding frame
-    outliers relative to a quadratic fit in time, then returns (R_j, sigma_R_j),
-    each (n_kept,).
+    outliers relative to a quadratic fit in time, then returns (baseline_i, w_i),
+    each (|S|,). baseline_i is the per-star median flux; w_i is the inverse-variance
+    weight normalised to sum to 1.
     """
     # Every entry of a fixed set is valid by construction; the mask is a guard,
     # not per-entry clipping. Errors enter only through the fixed per-star weight.
@@ -405,10 +407,27 @@ def _reference_weighted_fixed(
             np.isfinite(new_baseline) & (new_baseline > 0), new_baseline, baseline_i
         )
 
-    # Final weighted combine
+    # Final weighted combine weights
     with np.errstate(invalid="ignore", divide="ignore"):
         w_i = (baseline_i**2) / nanmedian_quiet(sigma_s**2, axis=1)
     w_i = np.where(np.isfinite(w_i) & (w_i > 0), w_i, 0.0)
+
+    return baseline_i, w_i
+
+
+def _reference_weighted_fixed(
+    f_s: np.ndarray, sigma_s: np.ndarray, bjd_tdb_kept: np.ndarray, ref: ReferenceSettings
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fixed-set inverse-variance weighted mean of normalised fluxes.
+
+    Inputs are (|S|, n_kept). Computes baseline iteratively, excluding frame
+    outliers relative to a quadratic fit in time, then returns (R_j, sigma_R_j),
+    each (n_kept,).
+    """
+    valid0 = np.isfinite(f_s) & (f_s > 0)
+    f_masked = np.where(valid0, f_s, np.nan)
+
+    baseline_i, w_i = reference_member_weights(f_s, sigma_s, bjd_tdb_kept, ref)
 
     with np.errstate(invalid="ignore", divide="ignore"):
         norm_f = f_masked / baseline_i[:, np.newaxis]

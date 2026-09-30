@@ -34,6 +34,7 @@ __all__ = [
     "load_lightcurves_npz",
     "load_night",
     "load_reference",
+    "load_reference_stars",
     "save_decorrelation_report",
     "save_lightcurve_table",
     "save_lightcurves_npz",
@@ -174,10 +175,14 @@ def _flat_to_ragged(flat: np.ndarray, offsets: np.ndarray) -> list[np.ndarray]:
 
 
 def save_reference(
-    tilemap: TileMap, result: ReferenceResult, settings: Settings, path: Path | str
+    tilemap: TileMap, result: ReferenceResult, settings: Settings, path: Path | str,
+    *, tile_stars: list[np.ndarray] | None = None, ref_aper: int | None = None
 ) -> None:
     """Write a :class:`~relphot.tiles.TileMap`/:class:`~relphot.reference.ReferenceResult`
     pair, and the ``settings`` that produced them, to ``path`` (uncompressed).
+
+    If ``tile_stars`` is provided, also saves the reference star indices per tile
+    and the reference aperture used.
     """
     path = Path(path)
     core_flat, core_offsets = _ragged_to_flat(tilemap.core_indices)
@@ -186,26 +191,33 @@ def save_reference(
     dropped_frames = [int(i) for i in result.frame_kept == False]  # noqa: E712
     meta_json = json.dumps({"method": result.method, "dropped_frames": dropped_frames})
 
-    np.savez(
-        path,
-        tile_xmin=tilemap.xmin,
-        tile_xmax=tilemap.xmax,
-        tile_ymin=tilemap.ymin,
-        tile_ymax=tilemap.ymax,
-        tile_n_candidates=tilemap.n_candidates,
-        tile_core_tile=tilemap.core_tile,
-        tile_core_flat=core_flat,
-        tile_core_offsets=core_offsets,
-        tile_extended_flat=ext_flat,
-        tile_extended_offsets=ext_offsets,
-        R=result.R,
-        sigma_R=result.sigma_R,
-        n_used=result.n_used,
-        relative_flux=result.relative_flux,
-        frame_kept=result.frame_kept,
-        config_json=config_json,
-        meta_json=meta_json,
-    )
+    savez_kwargs = {
+        "tile_xmin": tilemap.xmin,
+        "tile_xmax": tilemap.xmax,
+        "tile_ymin": tilemap.ymin,
+        "tile_ymax": tilemap.ymax,
+        "tile_n_candidates": tilemap.n_candidates,
+        "tile_core_tile": tilemap.core_tile,
+        "tile_core_flat": core_flat,
+        "tile_core_offsets": core_offsets,
+        "tile_extended_flat": ext_flat,
+        "tile_extended_offsets": ext_offsets,
+        "R": result.R,
+        "sigma_R": result.sigma_R,
+        "n_used": result.n_used,
+        "relative_flux": result.relative_flux,
+        "frame_kept": result.frame_kept,
+        "config_json": config_json,
+        "meta_json": meta_json,
+    }
+
+    if tile_stars is not None:
+        tile_ref_flat, tile_ref_offsets = _ragged_to_flat(tile_stars)
+        savez_kwargs['tile_ref_flat'] = tile_ref_flat
+        savez_kwargs['tile_ref_offsets'] = tile_ref_offsets
+        savez_kwargs['ref_aper'] = np.int64(-1 if ref_aper is None else ref_aper)
+
+    np.savez(path, **savez_kwargs)
     logger.info("wrote %s (%d tiles, %s method)", path, tilemap.n_tiles, result.method)
 
 
@@ -236,6 +248,22 @@ def load_reference(path: Path | str) -> tuple[TileMap, ReferenceResult, Settings
         )
         settings = settings_from_dict(json.loads(str(data["config_json"])))
     return tilemap, result, settings
+
+
+def load_reference_stars(path: Path | str) -> tuple[list[np.ndarray], int] | None:
+    """Load reference star indices and aperture from a reference file, if present.
+
+    Returns (tile_stars, ref_aper) where tile_stars is a list of arrays and ref_aper
+    is the aperture index. Returns None if the reference file does not contain
+    reference star information (tile_ref_flat key absent).
+    """
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as data:
+        if 'tile_ref_flat' not in data.files:
+            return None
+        tile_stars = _flat_to_ragged(data['tile_ref_flat'], data['tile_ref_offsets'])
+        ref_aper = int(data['ref_aper'])
+        return tile_stars, ref_aper
 
 
 def save_lightcurves_npz(

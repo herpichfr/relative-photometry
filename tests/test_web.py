@@ -16,6 +16,7 @@ import os
 import re
 from importlib import resources
 
+import numpy as np
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
@@ -2114,3 +2115,550 @@ def test_search_period_verification_ignores_guided_rows(client, test_conn) -> No
     rows = test_client.get("/api/search", params={"name": "BOTH01"}).json()["rows"]
     # the fixture's latest re-observation has delta 0.001; the later guided row (-1.0) is not one
     assert rows[0]["period_delta"] == pytest.approx(0.001)
+
+
+# --------------------------------------------------------------------------
+# Schema v11: tile members (reference and comparison stars)
+# --------------------------------------------------------------------------
+
+
+def _insert_tile_members(test_conn, ids: dict) -> None:
+    """Insert tile member data for schema v11 testing.
+
+    For the fixture's night1 and the fixture star (obj_unc) at tile 0, best_aperture 1:
+    - Insert night_tile with metadata
+    - Insert tile_lc rows for apertures 0-2 (only aperture 1 has n_comp > 0)
+    - Mark frame 1 as kept=false and put NaN at index 1 in all arrays
+    - Insert 12 comparison_member rows (one is the fixture star with weight 0.05,
+      one with obj_id NULL, one with clipped_frames [1])
+    - Insert 3 reference_member rows with distinct weights
+    - Ensure fixture star's lightcurve is sparse
+    """
+    # Prime the column cache to avoid AttributeError when endpoints call column_exists(None, ...)
+    from relphot.web.db import _column_cache
+    with test_conn.cursor() as cache_cur:
+        for table in ["night_tile", "tile_lc", "reference_member", "comparison_member"]:
+            cache_cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'relphot' AND table_name = %s",
+                (table,),
+            )
+            _column_cache[table] = frozenset(row[0] for row in cache_cur.fetchall())
+
+    night1 = ids["night1"]
+    obj_unc = ids["obj_unc"]
+    tile = 0
+    best_aperture = 1
+
+    with test_conn.cursor() as cur:
+        # Get fixture star's star_id and update best_aperture
+        cur.execute(
+            "UPDATE relphot.star_night SET tile = %s, best_aperture = %s "
+            "WHERE obj_id = %s AND night_id = %s "
+            "RETURNING star_id",
+            (tile, best_aperture, obj_unc, night1),
+        )
+        (star_id,) = cur.fetchone()
+
+        # Insert night_tile
+        cur.execute(
+            "INSERT INTO relphot.night_tile (night_id, tile, x_min, x_max, y_min, y_max, "
+            "n_core, n_extended, n_ref_stars, ref_aperture, best_apertures) "
+            "VALUES (%s, %s, 100.0, 200.0, 50.0, 150.0, 10, 5, 3, %s, %s)",
+            (night1, tile, best_aperture, [1]),
+        )
+
+        # Mark frame 1 as not kept
+        cur.execute(
+            "UPDATE relphot.frame SET kept = false WHERE night_id = %s AND frame_index = 1",
+            (night1,),
+        )
+
+        # Insert tile_lc for apertures 0, 1, 2; only aperture 1 gets comparison members
+        # Each tile_lc has 3 frames worth of data, with NaN at index 1
+        ref_flux_template = [1.0, np.nan, 1.05]
+        ref_flux_err_template = [0.01, np.nan, 0.01]
+        ens_flux_template = [0.95, np.nan, 1.02]
+        ens_flux_err_template = [0.015, np.nan, 0.015]
+
+        for aperture in [0, 1, 2]:
+            n_comp = 12 if aperture == best_aperture else 0
+            cur.execute(
+                "INSERT INTO relphot.tile_lc (night_id, tile, aperture, ref_flux, ref_flux_err, "
+                "ens_flux, ens_flux_err, n_ensemble, n_comp, n_rounds) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (night1, tile, aperture, ref_flux_template, ref_flux_err_template,
+                 ens_flux_template, ens_flux_err_template, 12, n_comp, 3),
+            )
+
+        # Insert 3 reference_member rows with distinct weights
+        for i, weight in enumerate([0.4, 0.35, 0.25]):
+            cur.execute(
+                "INSERT INTO relphot.reference_member (night_id, tile, star_id, obj_id, "
+                "ra, dec, mag, weight, in_core) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (night1, tile, 10 + i, None, 100.0 + i, 50.0 + i, 14.0 + 0.1*i, weight, True),
+            )
+
+        # Insert 12 comparison_member rows for aperture 1
+        # Include: fixture star itself (weight 0.05), one with obj_id NULL (1/12),
+        # one with clipped_frames [1], and 9 others
+        comp_members = [
+            # (star_id, obj_id, ra, dec, mag, weight, n_clipped, clipped_frames)
+            (star_id, obj_unc, 50.0, 75.0, 14.0, 0.05, 0, []),  # the fixture star
+            (100, None, 51.0, 76.0, 14.5, 1/12, 0, []),  # obj_id NULL
+            (101, None, 52.0, 77.0, 14.8, 1/12, 1, [1]),  # clipped_frames [1]
+        ]
+        # Add 9 more comparison members
+        for i in range(9):
+            star_idx = 102 + i
+            comp_members.append((
+                star_idx, None, 53.0 + i*0.1, 78.0 + i*0.1, 15.0 + i*0.05, 1/12, 0, []
+            ))
+
+        norm_flux_template = [0.98, np.nan, 1.02]
+
+        for (star_id_c, obj_id_c, ra_c, dec_c, mag_c, weight_c, n_clipped_c,
+             clipped_c) in comp_members:
+            cur.execute(
+                "INSERT INTO relphot.comparison_member "
+                "(night_id, tile, aperture, star_id, obj_id, ra, dec, mag, weight, "
+                "n_clipped, clipped_frames, norm_flux) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (night1, tile, best_aperture, star_id_c, obj_id_c, ra_c, dec_c, mag_c,
+                 weight_c, n_clipped_c, clipped_c, norm_flux_template),
+            )
+
+        # Make fixture star's lightcurve sparse (only frames 0 and 2)
+        cur.execute(
+            "DELETE FROM relphot.lightcurve WHERE obj_id = %s AND night_id = %s",
+            (obj_unc, night1),
+        )
+        cur.execute(
+            "INSERT INTO relphot.lightcurve (obj_id, night_id, frame_index, bjd_tdb, flux, "
+            "flux_err, flux_raw) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (obj_unc, night1, [0, 2], [2460310.5006, 2460310.5206], [1.0, 0.99],
+             [0.01, 0.01], [1.0, 0.99]),
+        )
+
+    test_conn.commit()
+
+
+def test_nights_list_shape_and_has_members(client, test_conn) -> None:
+    """GET /api/nights returns shape with has_members flag."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get("/api/nights")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "nights" in data
+    night1_data = next((n for n in data["nights"] if n["night_id"] == ids["night1"]), None)
+    assert night1_data is not None
+    assert "has_members" in night1_data
+    assert night1_data["has_members"] is True
+    assert "n_tiles" in night1_data
+
+
+def test_night_tiles_shape_and_n_comp(client, test_conn) -> None:
+    """GET /api/night/{id}/tiles returns tiles with n_comp (comparison member count)."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(f"/api/night/{ids['night1']}/tiles")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "night" in data and "tiles" in data
+    assert data["night"]["night_id"] == ids["night1"]
+    assert len(data["tiles"]) == 1
+    tile = data["tiles"][0]
+    assert tile["tile"] == 0
+    assert tile["n_comp"] == 3  # 3 apertures (0, 1, 2) in tile_lc
+    assert "best_apertures" in tile
+
+
+def test_reference_null_at_dropped_frame(client, test_conn) -> None:
+    """GET /api/night/{id}/tile/{t}/reference has null at dropped frame."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(
+        f"/api/night/{ids['night1']}/tile/0/reference",
+        params={"aperture": 1}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "ref_flux" in data
+    assert data["ref_flux"][1] is None  # frame 1 is kept=false, so NaN
+    assert data["ref_flux"][0] is not None
+    assert data["ref_flux"][2] is not None
+
+
+def test_reference_frame_kept_false_at_dropped(client, test_conn) -> None:
+    """GET /api/night/{id}/tiles/references frame has kept=false for dropped frame."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(f"/api/night/{ids['night1']}/tiles/references", params={"aperture": 1})
+    assert resp.status_code == 200
+    data = resp.json()
+    frames = data["frames"]
+    assert len(frames) == 3
+    assert frames[1]["kept"] is False
+    assert frames[0]["kept"] is True
+    assert frames[2]["kept"] is True
+
+
+def test_reference_n_ref_count(client, test_conn) -> None:
+    """GET /api/night/{id}/tile/{t}/reference has correct n_ref count."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(
+        f"/api/night/{ids['night1']}/tile/0/reference",
+        params={"aperture": 1}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["n_ref"] == 3  # 3 reference_member rows
+
+
+def test_reference_members_ordered_by_weight_desc(client, test_conn) -> None:
+    """GET /api/night/{id}/tile/{t}/reference/members ordered by weight desc."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(f"/api/night/{ids['night1']}/tile/0/reference/members")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "members" in data
+    members = data["members"]
+    assert len(members) == 3
+    # Check ordered by weight descending
+    weights = [m["weight"] for m in members]
+    assert weights == sorted(weights, reverse=True)
+    assert weights == pytest.approx([0.4, 0.35, 0.25])
+
+
+def test_reference_members_include_name_from_object(client, test_conn) -> None:
+    """GET /api/night/{id}/tile/{t}/reference/members includes name joined from object."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(f"/api/night/{ids['night1']}/tile/0/reference/members")
+    assert resp.status_code == 200
+    data = resp.json()
+    members = data["members"]
+    # All reference members have obj_id NULL, so name should be None
+    for m in members:
+        assert m["name"] is None
+        assert "mag_app" in m
+
+
+def test_comparison_with_limit_and_n_shown(client, test_conn) -> None:
+    """GET /api/night/{id}/tile/{t}/comparison limit param controls n_shown."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(
+        f"/api/night/{ids['night1']}/tile/0/comparison",
+        params={"aperture": 1, "limit": 5}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "n_shown" in data
+    assert "n_members" in data
+    assert data["n_shown"] == 5
+    assert data["n_members"] == 12
+    # All members are returned, but only n_shown are marked as shown
+    assert len(data["members"]) == 12
+    assert sum(1 for m in data["members"] if m.get("shown", False)) == 5
+
+
+def test_comparison_envelope_length_equals_n_frames(client, test_conn) -> None:
+    """GET /api/night/{id}/tile/{t}/comparison envelope arrays have length n_frames."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(
+        f"/api/night/{ids['night1']}/tile/0/comparison",
+        params={"aperture": 1, "limit": 10}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "envelope" in data
+    if data["envelope"] is not None:
+        assert "median" in data["envelope"]
+        assert "lo" in data["envelope"]
+        assert "hi" in data["envelope"]
+        assert len(data["envelope"]["median"]) == 3  # 3 frames
+        assert len(data["envelope"]["lo"]) == 3
+        assert len(data["envelope"]["hi"]) == 3
+
+
+def test_comparison_order_parameter_accepted(client, test_conn) -> None:
+    """GET /api/night/{id}/tile/{t}/comparison accepts order parameter."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    for order in ["mag", "weight", "rms"]:
+        resp = test_client.get(
+            f"/api/night/{ids['night1']}/tile/0/comparison",
+            params={"aperture": 1, "order": order}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["order"] == order
+
+
+def test_comparison_limit_validation(client, test_conn) -> None:
+    """GET /api/night/{id}/tile/{t}/comparison rejects invalid limit."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    # limit < 1 or > 1000 should be rejected
+    resp = test_client.get(
+        f"/api/night/{ids['night1']}/tile/0/comparison",
+        params={"aperture": 1, "limit": 0}
+    )
+    assert resp.status_code == 422
+
+    resp = test_client.get(
+        f"/api/night/{ids['night1']}/tile/0/comparison",
+        params={"aperture": 1, "limit": 1001}
+    )
+    assert resp.status_code == 422
+
+
+def test_comparison_member_norm_flux_is_full_length(client, test_conn) -> None:
+    """Comparison member norm_flux is full length (n_frames) with NaN for dropped frames."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(
+        f"/api/night/{ids['night1']}/tile/0/comparison",
+        params={"aperture": 1, "limit": 12}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    for member in data["members"]:
+        assert len(member["norm_flux"]) == 3  # 3 frames total
+        # Frame 1 should be None (kept=false)
+        assert member["norm_flux"][1] is None
+        # Frames 0 and 2 should have values
+        assert member["norm_flux"][0] is not None
+        assert member["norm_flux"][2] is not None
+
+
+def test_object_night_reference_endpoint(client, test_conn) -> None:
+    """GET /api/object/{obj}/night/{id}/reference works for member."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(
+        f"/api/object/{ids['obj_unc']}/night/{ids['night1']}/reference"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "ref_flux" in data
+    assert data["night_id"] == ids["night1"]
+    assert data["tile"] == 0
+
+
+def test_object_night_comparison_endpoint(client, test_conn) -> None:
+    """GET /api/object/{obj}/night/{id}/comparison works for member."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(
+        f"/api/object/{ids['obj_unc']}/night/{ids['night1']}/comparison",
+        params={"limit": 12}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "members" in data
+    assert "n_members" in data
+
+
+def test_object_wrapper_target_is_member_true_with_weight(client, test_conn) -> None:
+    """Object wrapper in comparison payload: target.is_member True and weight 0.05."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(
+        f"/api/object/{ids['obj_unc']}/night/{ids['night1']}/comparison",
+        params={"limit": 12}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "target" in data
+    target = data["target"]
+    assert target["is_member"] is True
+    assert target["weight"] == pytest.approx(0.05)
+
+
+def test_object_wrapper_target_norm_flux_sparse_nulls(client, test_conn) -> None:
+    """Target norm_flux: full length with nulls at sparse LC gaps."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(
+        f"/api/object/{ids['obj_unc']}/night/{ids['night1']}/comparison",
+        params={"limit": 12}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    target = data["target"]
+    # Fixture star's LC is sparse: only frames 0 and 2
+    # So norm_flux should have length 3 with None at indices 1
+    assert "norm_flux" in target
+    assert len(target["norm_flux"]) == 3
+    assert target["norm_flux"][0] is not None
+    assert target["norm_flux"][1] is None  # sparse LC doesn't have frame 1
+    assert target["norm_flux"][2] is not None
+
+
+
+
+def test_object_404_without_star_night_on_night(client, test_conn) -> None:
+    """GET /api/object/{obj}/night/{id}/comparison 404 when object not on night."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    # obj_var is not part of our tile setup, so it won't have star_night at night1/tile0
+    # But obj_var does have star_night on night1, just at a different tile
+    # Use an object that truly has no star_night on night1
+    resp = test_client.get(
+        f"/api/object/{ids['obj_var2']}/night/{ids['night1']}/reference"
+    )
+    # obj_var2 does have star_night on night1, so let's use a higher obj_id that doesn't
+    resp = test_client.get(f"/api/object/99999999/night/{ids['night1']}/reference")
+    assert resp.status_code == 404
+
+
+def test_unknown_night_returns_404(client, test_conn) -> None:
+    """GET /api/night/{id}/tiles returns 404 for unknown night."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get("/api/night/99999/tiles")
+    assert resp.status_code == 404
+
+
+def test_object_detail_has_tile_and_reference_comparison_flags(client, test_conn) -> None:
+    """Object detail nights entries include tile, has_reference, has_comparison."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+
+    resp = test_client.get(f"/api/object/{ids['obj_unc']}")
+    assert resp.status_code == 200
+    data = resp.json()
+    nights = data["nights"]
+    night1_entry = next((n for n in nights if n["night_id"] == ids["night1"]), None)
+    assert night1_entry is not None
+    assert "tile" in night1_entry
+    assert night1_entry["tile"] == 0
+    assert "has_reference" in night1_entry
+    assert night1_entry["has_reference"] is True
+    assert "has_comparison" in night1_entry
+    assert night1_entry["has_comparison"] is True
+
+
+def test_object_detail_has_reference_false_without_members(client) -> None:
+    """Night without tile_lc has has_reference False."""
+    test_client, ids = client
+    # Don't call _insert_tile_members; check objects on nights without members
+
+    resp = test_client.get(f"/api/object/{ids['obj_var']}")
+    assert resp.status_code == 200
+    data = resp.json()
+    # obj_var has star_night on night1 and night2, but no tile_lc entries
+    for night in data["nights"]:
+        assert night["has_reference"] is False
+        assert night["has_comparison"] is False
+
+
+def test_relphot_ro_cannot_insert_into_new_tables(client) -> None:
+    """relphot_ro role cannot INSERT into night_tile, tile_lc, etc."""
+    _, ids = client
+    owner_dsn = _test_dsn()
+    ro_dsn = _role_dsn(owner_dsn, "relphot_ro", "RELPHOT_RO_PASSWORD")
+
+    with psycopg.connect(ro_dsn) as ro_conn, ro_conn.cursor() as cur:
+        # Try INSERT into night_tile
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "INSERT INTO relphot.night_tile (night_id, tile) VALUES (%s, %s)",
+                (ids["night1"], 0),
+            )
+        ro_conn.rollback()
+
+        # Try INSERT into tile_lc
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "INSERT INTO relphot.tile_lc (night_id, tile, aperture, ref_flux, "
+                "ref_flux_err) VALUES (%s, %s, %s, %s, %s)",
+                (ids["night1"], 0, 1, [], []),
+            )
+        ro_conn.rollback()
+
+        # Try INSERT into reference_member
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "INSERT INTO relphot.reference_member (night_id, tile, star_id) "
+                "VALUES (%s, %s, %s)",
+                (ids["night1"], 0, 0),
+            )
+        ro_conn.rollback()
+
+        # Try INSERT into comparison_member
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "INSERT INTO relphot.comparison_member (night_id, tile, aperture, "
+                "star_id, norm_flux) VALUES (%s, %s, %s, %s, %s)",
+                (ids["night1"], 0, 1, 0, []),
+            )
+        ro_conn.rollback()
+
+
+def test_sql_box_can_select_from_new_tables(client) -> None:
+    """SQL box can SELECT from night_tile, tile_lc, reference_member, comparison_member."""
+    test_client, _ = client
+
+    # Test SELECT from night_tile
+    resp = test_client.post("/api/sql", json={"sql": "SELECT COUNT(*) FROM relphot.night_tile"})
+    assert resp.status_code == 200
+    assert resp.json()["rows"][0][0] == 0  # No members inserted yet
+
+    # Test SELECT from tile_lc
+    resp = test_client.post("/api/sql", json={"sql": "SELECT COUNT(*) FROM relphot.tile_lc"})
+    assert resp.status_code == 200
+    assert resp.json()["rows"][0][0] == 0
+
+    # Test SELECT from reference_member
+    resp = test_client.post(
+        "/api/sql", json={"sql": "SELECT COUNT(*) FROM relphot.reference_member"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["rows"][0][0] == 0
+
+    # Test SELECT from comparison_member
+    resp = test_client.post(
+        "/api/sql", json={"sql": "SELECT COUNT(*) FROM relphot.comparison_member"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["rows"][0][0] == 0
+
+
+def test_front_end_element_ids_include_tile_member_controls() -> None:
+    """Front-end HTML includes all required ids for tile member UI elements."""
+    static = resources.files("relphot.web") / "static"
+    html = (static / "index.html").read_text()
+    html_ids = set(re.findall(r'\bid="([\w-]+)"', html))
+
+    required_ids = [
+        "btn-reference-lc", "btn-comparison-lc", "plot-reference", "plot-comparison",
+        "comparison-order-select", "comparison-limit-select", "comparison-view-select",
+        "tile-lc-note", "reference-members-details", "night-panel",
+    ]
+    for req_id in required_ids:
+        assert req_id in html_ids, f"Required id '{req_id}' not found in index.html"

@@ -19,6 +19,7 @@ from __future__ import annotations
 from relphot.db.analyze import AnalyzeReport, analyze
 from relphot.db.coincidence import CoincidenceReport, update_coincidence
 from relphot.db.connect import connect, default_env_path, read_env_value, resolve_dsn
+from relphot.db.load_members import MembersLoadReport, load_members
 from relphot.db.load_multinight import MultiNightLoadReport, load_multinight
 from relphot.db.load_night import LoadReport, load_night
 from relphot.db.refresh import refresh_objects
@@ -29,6 +30,7 @@ __all__ = [
     "AnalyzeReport",
     "CoincidenceReport",
     "LoadReport",
+    "MembersLoadReport",
     "MultiNightLoadReport",
     "ReprocessReport",
     "analyze",
@@ -36,6 +38,7 @@ __all__ = [
     "current_version",
     "default_env_path",
     "init_schema",
+    "load_members",
     "load_multinight",
     "load_night",
     "migration_files",
