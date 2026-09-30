@@ -459,6 +459,33 @@ class DbSettings:
     #: ... and the binomial probability of that many coincidences by chance (events spread
     #: uniformly over the night) is below this.
     coincidence_max_p: float = 1e-3
+    #: Repeated transit events of one object (``relphot db analyze``, :mod:`relphot.db.families`):
+    #: two eligible events are linked when both the depth / T14 / ingress match probability and the
+    #: probability of a common trapezoid (joint refit of their light curves) are at least this.
+    repeat_p_min: float = 0.05
+    #: Systematic floor on the T14 difference of a link, as a fraction of the mean T14 (the
+    #: ``match_t14_sys_frac`` of the stored ``transit_match`` rows is left at 0).
+    repeat_t14_sys_frac: float = 0.05
+    #: Stellar density (g/cm^3) of the densest star a transit may belong to: the period must be
+    #: at least ``pi^2 G rho T14^3 / 3`` (central transit) for the longest member T14, else the
+    #: period alias is 'vetoed_density'.
+    repeat_rho_max_cgs: float = 5.0
+    #: Whether the events of a loose night (``mn_run.loose_night_ids``) may be family members.
+    #: They are then flagged ``involves_loose``; their light curves are used for the
+    #: non-detection veto either way.
+    repeat_include_loose: bool = True
+    #: A period alias is 'vetoed_nondetection' when, on a night of the object, a transit of the
+    #: family's depth and T14 is disfavoured by more than this delta chi2 at every allowed timing.
+    repeat_veto_dchi2: float = 9.0
+    #: Half-width of a predicted transit window, in 1-sigma timing errors (plus T14 / 2), and the
+    #: tolerance of the members' centre times around a common ephemeris.
+    repeat_n_sigma_window: float = 3.0
+    #: Floor (days) on an event's centre-time error in the ephemeris.
+    repeat_tc_err_floor_days: float = 0.002
+    #: Most period aliases kept per family.
+    repeat_max_aliases: int = 500
+    #: An object with more eligible events than this is skipped (the clique search is exponential).
+    repeat_max_family_events: int = 12
 
     def __post_init__(self) -> None:
         if not isinstance(self.telescope_zp, dict) or not all(
@@ -503,6 +530,31 @@ class DbSettings:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             msg = f"db.coincidence_min_similar must be an integer >= 1, got {value!r}"
             raise ConfigError(msg)
+        for name in (
+            "repeat_p_min", "repeat_rho_max_cgs", "repeat_veto_dchi2",
+            "repeat_n_sigma_window", "repeat_tc_err_floor_days",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool) or not isinstance(value, int | float)
+                or not (math.isfinite(value) and value > 0)
+            ):
+                msg = f"db.{name} must be a positive number, got {value!r}"
+                raise ConfigError(msg)
+        if self.repeat_p_min > 1:
+            msg = f"db.repeat_p_min must be in (0, 1], got {self.repeat_p_min!r}"
+            raise ConfigError(msg)
+        if isinstance(self.repeat_t14_sys_frac, bool) or not (
+            isinstance(self.repeat_t14_sys_frac, int | float)
+            and math.isfinite(self.repeat_t14_sys_frac) and self.repeat_t14_sys_frac >= 0
+        ):
+            msg = f"db.repeat_t14_sys_frac must be >= 0, got {self.repeat_t14_sys_frac!r}"
+            raise ConfigError(msg)
+        for name in ("repeat_max_aliases", "repeat_max_family_events"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+                msg = f"db.{name} must be an integer >= 2, got {value!r}"
+                raise ConfigError(msg)
 
 
 @dataclass(frozen=True, slots=True)

@@ -29,6 +29,10 @@ For each object needing analysis, :func:`analyze` deletes its existing
   with too many look-alikes on the night get ``detection.auto_status = 'REJECTED'`` (the
   person's ``status`` is never touched) and the objects whose automatic verdict changed are
   refreshed;
+- once the coincidence check is done, the repeated-event families of
+  :mod:`relphot.db.families` for the same objects: every pair of an object's eligible transit
+  events (not rejected by the person, not auto-rejected) is scored, mutually linked events form
+  candidate families with their allowed periods. Nothing is merged and no status is changed;
 - for a variable (``is_var``) or an object with a literature variable period,
   a combined Lomb-Scargle period refined by a 2-harmonic Fourier fit with one
   offset per night (``relphot.period_estimate``, one row per set of nights,
@@ -108,6 +112,9 @@ class AnalyzeReport:
     n_coincidence_rejected: int = 0
     #: nights the cross-candidate check re-judged
     n_coincidence_nights: int = 0
+    #: pairs of eligible transit events scored, and families of repeated events found
+    n_repeat_links: int = 0
+    n_repeat_families: int = 0
 
 
 @dataclass(slots=True)
@@ -1718,9 +1725,24 @@ def analyze(
         conn.rollback()
         raise
 
+    # after the coincidence check: an auto-rejected event is not eligible for a family
+    # (imported here: relphot.db.families builds on this module's fitting helpers)
+    from relphot.db.families import update_families
+
+    n_repeat_links = n_repeat_families = 0
+    try:
+        repeat_report = update_families(conn, target_ids, db_settings)
+        n_repeat_links = repeat_report.n_links
+        n_repeat_families = repeat_report.n_families
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
     return AnalyzeReport(
         n_objects=len(target_ids), n_ls_night=n_ls_night, n_ls_combined=n_ls_combined,
         n_bls=n_bls, n_coarsened=n_coarsened, elapsed_s=time.monotonic() - t0,
         n_transit_shapes=n_shapes, n_transit_matches=n_matches, n_period_estimates=n_estimates,
         n_coincidence_rejected=n_coincidence_rejected, n_coincidence_nights=n_coincidence_nights,
+        n_repeat_links=n_repeat_links, n_repeat_families=n_repeat_families,
     )

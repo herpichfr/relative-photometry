@@ -858,6 +858,95 @@ def test_load_night_reload_cascades_transit_rows(test_conn, tmp_path) -> None:
         assert cur.fetchone() == (1,)
 
 
+def test_reload_keeps_repeat_decisions_and_ephemeris_history_and_drops_links(
+    test_conn, tmp_path
+) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT det_id, obj_id FROM relphot.detection WHERE kind = 'transit'")
+        det_id, obj_id = cur.fetchone()
+        # a second event of the same object on the same night (a search detection: reloaded away)
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind, tc_bjd_tdb) "
+            "VALUES (%s, %s, 'transit', 2460000.6) RETURNING det_id",
+            (obj_id, report.night_id),
+        )
+        (det_b,) = cur.fetchone()
+        det_a, det_b = sorted((det_id, det_b))
+        cur.execute(
+            "INSERT INTO relphot.repeat_link (det_a, det_b, obj_id, night_a, night_b, phys_ok, "
+            "linked) VALUES (%s, %s, %s, %s, %s, true, true)",
+            (det_a, det_b, obj_id, report.night_id, report.night_id),
+        )
+        cur.execute(
+            "INSERT INTO relphot.repeat_family (obj_id, family_key, n_members, member_night_ids) "
+            "VALUES (%s, 'k', 2, %s) RETURNING fam_id",
+            (obj_id, [report.night_id]),
+        )
+        (fam_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.repeat_family_member (fam_id, det_id) VALUES (%s, %s)",
+            (fam_id, det_a),
+        )
+        cur.execute(
+            "INSERT INTO relphot.repeat_ephemeris (fam_id, obj_id, family_key, alias_k, period, "
+            "tc0, status) VALUES (%s, %s, 'k', 1, 1.0, 2460000.5, 'allowed')",
+            (fam_id, obj_id),
+        )
+        cur.execute(
+            "INSERT INTO relphot.repeat_decision (obj_id, night_a, night_b, tc_a, tc_b, decision, "
+            "note) VALUES (%s, %s, %s, 2460000.5, 2460000.6, 'SAME', 'planet b')",
+            (obj_id, report.night_id, report.night_id),
+        )
+        cur.execute("SELECT * FROM relphot.repeat_decision")
+        decision_row = cur.fetchall()
+    test_conn.commit()
+
+    again = load_night(test_conn, root, settings=_SETTINGS)
+
+    assert again.night_id == report.night_id
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT * FROM relphot.repeat_decision")
+        assert cur.fetchall() == decision_row  # the person's decision is untouched
+        for table in ("repeat_link", "repeat_family_member", "repeat_family"):
+            cur.execute(f"SELECT count(*) FROM relphot.{table}")
+            assert cur.fetchone() == (0,)  # they go with the reloaded detections
+        cur.execute("SELECT count(*), count(fam_id) FROM relphot.repeat_ephemeris")
+        assert cur.fetchone() == (1, 0)  # kept as history until `db analyze` recomputes
+
+
+def test_reload_spares_an_orphan_object_that_only_has_a_repeat_decision(
+    test_conn, tmp_path
+) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        for i, name in enumerate(("decided_only", "plain")):
+            cur.execute(
+                "INSERT INTO relphot.object (name, ra, dec) VALUES (%s, %s, 50.0) "
+                "RETURNING obj_id",
+                (name, 100.0 + i),
+            )
+            (obj_id,) = cur.fetchone()
+            if name == "decided_only":
+                cur.execute(
+                    "INSERT INTO relphot.repeat_decision "
+                    "(obj_id, night_a, night_b, tc_a, tc_b, decision) "
+                    "VALUES (%s, %s, %s, 1.0, 2.0, 'DIFFERENT')",
+                    (obj_id, report.night_id, report.night_id),
+                )
+    test_conn.commit()
+
+    load_night(test_conn, root, settings=_SETTINGS)  # a reload deletes star_night-less objects
+
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT name FROM relphot.object WHERE dec = 50.0 ORDER BY name")
+        assert [r[0] for r in cur.fetchall()] == ["decided_only"]
+
+
 def test_load_night_reload_is_idempotent(test_conn, tmp_path) -> None:
     root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
     _write_night1(root)

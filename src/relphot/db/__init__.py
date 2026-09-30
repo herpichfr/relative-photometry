@@ -9,6 +9,8 @@ and detections; :mod:`relphot.db.refresh` recomputes derived
 ``relphot.object`` summaries; :mod:`relphot.db.analyze` computes
 periodograms and PERIOD; :mod:`relphot.db.coincidence` marks per-night transit events
 with too many look-alikes on the same night as auto-rejected;
+:mod:`relphot.db.families` scores pairs of repeated transit events of one object and
+forms candidate families with their allowed periods;
 :mod:`relphot.db.reprocess` works off the web's user-guided
 reprocess requests. Requires the ``db`` extra
 (``pip install 'relphot[db]'``).
@@ -19,6 +21,7 @@ from __future__ import annotations
 from relphot.db.analyze import AnalyzeReport, analyze
 from relphot.db.coincidence import CoincidenceReport, update_coincidence
 from relphot.db.connect import connect, default_env_path, read_env_value, resolve_dsn
+from relphot.db.families import FamilyReport, update_families
 from relphot.db.load_members import MembersLoadReport, load_members
 from relphot.db.load_multinight import MultiNightLoadReport, load_multinight
 from relphot.db.load_night import LoadReport, load_night
@@ -29,6 +32,7 @@ from relphot.db.schema import current_version, init_schema, migration_files
 __all__ = [
     "AnalyzeReport",
     "CoincidenceReport",
+    "FamilyReport",
     "LoadReport",
     "MembersLoadReport",
     "MultiNightLoadReport",
@@ -47,4 +51,5 @@ __all__ = [
     "reprocess",
     "resolve_dsn",
     "update_coincidence",
+    "update_families",
 ]

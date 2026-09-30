@@ -389,6 +389,47 @@ detection but `relphot db analyze` marks it `auto_status = 'REJECTED'` with `aut
   verdict: run `relphot db analyze` again afterwards.
 - After migration 009 run `relphot db analyze --all` once to fill the verdicts of the nights already loaded.
 
+## Repeated transit events (schema v12)
+
+Two transit events of one object that look alike (depth, T14, ingress) may be two transits of the same planet.
+`relphot db analyze` (after the coincidence check), `relphot db families` and the reprocess worker score every pair
+of the object's ELIGIBLE events, join mutually linked events into candidate FAMILIES and give each the periods its
+centre times allow (module `relphot.db.families`). Nothing is merged and no status or class changes (R4); an event
+outside every family stays a possible additional signal, and a family only ever records a candidate (R1).
+
+- Eligible: converged `transit_shape` of a per-night transit detection that the person has not REJECTED and that is
+  not auto-REJECTED unless CONFIRMED (the `objflags` rule); loose-night events too when `repeat_include_loose`
+  (default true; they are flagged `involves_loose`). Objects with more than `repeat_max_family_events` are skipped.
+- `repeat_link` (per pair): `p_match` (the `transit_match` z-score probability with T14 floor `repeat_t14_sys_frac`
+  and the cross-telescope depth floor for a NEIGHBOUR_BLEND / APERTURE_INCONSISTENT event; a lower-limit T14 is
+  one-sided, R6), `p_joint` (likelihood-ratio test of ONE common trapezoid fitted to both light curves against their
+  own fits; dof = depth + T14 when neither is a lower limit + ingress when both have one), `n_alias` / `phys_ok`,
+  `diurnal`, `linked` (both p >= `repeat_p_min`, or the person said SAME, and not DIFFERENT).
+- `repeat_family` / `repeat_family_member`: maximal cliques of the link graph whose centre times share an
+  integer-epoch ephemeris (a clique without one is split into its maximal consistent subsets); families may overlap.
+  Families are kept whatever the alias statuses are.
+- `repeat_ephemeris`: one row per alias P = dt/k (k up to P >= `match_period_min_days`), fitted over all members when
+  there are more than two. `status`: `allowed`; `vetoed_density` (P < pi^2 G rho T14^3 / 3 with
+  rho = `repeat_rho_max_cgs` = 5 g/cm^3 and the longest member T14, valid for a lower limit); `vetoed_nondetection`
+  (on a night of the object the light curve disfavours a transit of the family's smallest depth and its T14 by
+  dchi2 > `repeat_veto_dchi2` at EVERY timing within `repeat_n_sigma_window` sigma, where the frames cover it).
+  Keyed by (obj_id, family_key, alias_k) and kept as history when the family is recomputed (R3).
+- `repeat_decision`: the person's SAME / DIFFERENT per pair of events, keyed by night and centre time (no detection
+  FK) so it survives a night reload; the next recompute attaches it to the pair within half a T14. The web role may
+  insert / update / delete these rows only. A night reload deletes the families with an event of the night (and the
+  links); the ephemeris stays as history; run `relphot db analyze` afterwards.
+- `relphot db predict --start D --end D` prints the windows `tc0 + m P +- (n sigma + T14/2)` of the allowed aliases
+  (merged per family; `aliases_predicting / aliases_total` tells which windows separate the aliases), from the stored
+  rows or, with `--recompute`, computed in memory (SELECTs only).
+- Web: `GET /api/object/{id}` carries `repeat_families` (members, links with the person's current decision, every
+  alias with its status, `stale` / `stale_reason`, `accepted`) and `repeat_decisions`. A member the person rejected
+  since (or auto-rejected unless confirmed) is dropped from the family and the family is marked "stale --
+  recomputed at next analyze", as it is after a new verdict; nothing recomputes before `relphot db analyze`.
+  `PUT` / `DELETE /api/object/{id}/repeat_link` (body / query: `det_a`, `det_b`; `decision` SAME | DIFFERENT, `note`)
+  write `repeat_decision` with the `relphot_web` grants only; `GET /api/repeat/predict?start&end&telescope&obj_id&
+  min_alias_frac&accepted_only` (default now .. +10 d) reads the stored ephemerides. `/api/search` has the filter
+  `has_repeat_family` and the column `n_repeat_families`. The web-safe helpers live in `relphot.repeat` (no pandas).
+
 ## Rerunning after schema v6 (order)
 
 1. `relphot db init` (migration 006), then rebuild/restart the web (`deploy/install.sh web`).

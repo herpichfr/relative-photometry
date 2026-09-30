@@ -79,6 +79,7 @@ from relphot.multinight_search import (
 )
 from relphot.numeric import nanmedian_quiet
 from relphot.reference import build_references, select_candidates, select_reference_frames_and_stars
+from relphot.repeat import parse_when as _parse_when
 from relphot.stats import (
     best_aperture_per_star,
     build_diagnostics_table,
@@ -1603,6 +1604,7 @@ def _run_db_analyze(args: argparse.Namespace) -> int:
         f"period_estimates={report.n_period_estimates} "
         f"coincidence_rejected={report.n_coincidence_rejected} "
         f"coincidence_nights={report.n_coincidence_nights} "
+        f"repeat_links={report.n_repeat_links} repeat_families={report.n_repeat_families} "
         f"coarsened={report.n_coarsened} elapsed={report.elapsed_s:.1f}s"
     )
     return 0
@@ -1657,6 +1659,154 @@ def _run_db_reprocess(args: argparse.Namespace) -> int:
     print(
         f"requests done={report.n_done} failed={report.n_failed} elapsed={report.elapsed_s:.1f}s"
     )
+    return 0
+
+
+def _run_db_families(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect
+        from relphot.db.families import compute_families, summarize, update_families
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    t0 = time.monotonic()
+    try:
+        if args.dry_run:
+            # SELECTs only, and the connection says so
+            conn.read_only = True
+            report = summarize(compute_families(conn, args.obj_id, settings.db))
+        else:
+            if args.obj_id is None:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT DISTINCT obj_id FROM relphot.transit_shape")
+                    obj_ids = [row[0] for row in cur.fetchall()]
+            else:
+                obj_ids = args.obj_id
+            report = update_families(conn, obj_ids, settings.db)
+            conn.commit()
+    finally:
+        conn.close()
+
+    status = " ".join(f"{k}={v}" for k, v in sorted(report.alias_status.items()))
+    print(
+        f"objects={report.n_objects} events={report.n_events} links={report.n_links} "
+        f"linked={report.n_linked} families={report.n_families} "
+        f"objects_with_families={report.n_objects_with_families} aliases[{status}] "
+        f"dry_run={args.dry_run} elapsed={time.monotonic() - t0:.1f}s"
+    )
+    return 0
+
+
+def _fmt_utc(jd: float) -> str:
+    from astropy.time import Time
+
+    return Time(jd, format="jd", scale="tdb").utc.strftime("%Y-%m-%d %H:%M")
+
+
+def _run_db_predict(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect
+        from relphot.db.families import (
+            as_family_dicts,
+            compute_families,
+            load_families,
+            predict_windows,
+        )
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+    try:
+        start = _parse_when(args.start, end=False)
+        end = _parse_when(args.end, end=True)
+    except ValueError:
+        logger.exception("cannot read --start / --end")
+        return 1
+    if not end > start:
+        logger.error("--end must be after --start")
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    try:
+        conn.read_only = True  # predicting never writes
+        if args.recompute:
+            families = as_family_dicts(conn, compute_families(conn, None, settings.db))
+            if args.accepted_only:
+                families = [f for f in families if f["accepted"]]
+        else:
+            families = load_families(
+                conn, telescope=args.telescope, accepted_only=args.accepted_only
+            )
+        if args.telescope is not None and args.recompute:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT sn.obj_id FROM relphot.star_night sn "
+                    "JOIN relphot.night n ON n.night_id = sn.night_id WHERE n.telescope = %s",
+                    (args.telescope,),
+                )
+                seen = {row[0] for row in cur.fetchall()}
+            families = [f for f in families if f["obj_id"] in seen]
+    finally:
+        conn.close()
+
+    names = {f["obj_id"]: f["obj_name"] for f in families}
+    windows = [
+        w for w in predict_windows(families, start, end, settings.db)
+        if w.n_aliases >= args.min_alias_frac * w.n_aliases_total
+    ]
+    header = (
+        "obj_id", "obj_name", "fam_id", "start_utc", "end_utc", "start_bjd", "end_bjd",
+        "aliases_predicting", "aliases_total", "depth", "t14_h",
+    )
+    rows = [
+        (
+            w.obj_id, names.get(w.obj_id), "" if w.fam_id is None else w.fam_id,
+            _fmt_utc(w.start), _fmt_utc(w.end), f"{w.start:.4f}", f"{w.end:.4f}", w.n_aliases,
+            w.n_aliases_total, "" if w.depth is None else f"{w.depth:.4f}",
+            ("" if w.t14_h is None else f"{w.t14_h:.2f}") + (">=" if w.t14_lower_limit else ""),
+        )
+        for w in windows
+    ]
+    if args.csv:
+        writer = csv.writer(sys.stdout)
+        writer.writerow(header)
+        writer.writerows(rows)
+    else:
+        print("\t".join(header))
+        for row in rows:
+            print("\t".join(str(x) for x in row))
+        logger.info("%d predicted windows of %d families", len(rows), len(families))
     return 0
 
 
@@ -1939,6 +2089,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="TOML settings file (settings.db drives the period grids and thresholds)",
     )
     db_analyze.set_defaults(func=_run_db_analyze)
+
+    db_families = db_subparsers.add_parser(
+        "families",
+        help="recompute the repeated-transit-event links and families of the objects",
+    )
+    db_families.add_argument(
+        "--obj-id", type=int, action="append", default=None, dest="obj_id",
+        help="only this object id (repeatable); default: every object with a transit shape",
+    )
+    db_families.add_argument(
+        "--dry-run", action="store_true",
+        help="compute and print the counts without writing (SELECTs only)",
+    )
+    db_families.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_families.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.db holds the repeat_* thresholds)",
+    )
+    db_families.set_defaults(func=_run_db_families)
+
+    db_predict = db_subparsers.add_parser(
+        "predict",
+        help="print the windows in which the repeated-event families may transit in a date range",
+    )
+    db_predict.add_argument(
+        "--start", required=True, help="UTC date / date-time (YYYY-MM-DD[THH:MM]) or a BJD",
+    )
+    db_predict.add_argument(
+        "--end", required=True,
+        help="UTC date (the whole day is included) / date-time, or a BJD",
+    )
+    db_predict.add_argument(
+        "--telescope", default=None, help="only objects observed with this telescope",
+    )
+    db_predict.add_argument(
+        "--min-alias-frac", type=float, default=0.0, dest="min_alias_frac",
+        help="only windows predicted by at least this fraction of the allowed aliases",
+    )
+    db_predict.add_argument(
+        "--accepted-only", action="store_true", dest="accepted_only",
+        help="only families the person accepted (SAME on every pair)",
+    )
+    db_predict.add_argument(
+        "--recompute", action="store_true",
+        help="compute the families in memory (SELECTs only) instead of reading the stored ones",
+    )
+    db_predict.add_argument("--csv", action="store_true", help="comma-separated output")
+    db_predict.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_predict.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.db holds the repeat_* thresholds)",
+    )
+    db_predict.set_defaults(func=_run_db_predict)
 
     db_reprocess = db_subparsers.add_parser(
         "reprocess",

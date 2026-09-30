@@ -2731,3 +2731,334 @@ def test_front_end_element_ids_include_tile_member_controls() -> None:
     ]
     for req_id in required_ids:
         assert req_id in html_ids, f"Required id '{req_id}' not found in index.html"
+
+
+# --------------------------------------------------------------------------
+# repeated transit events: /api/object repeat_families, repeat_link, /api/repeat/predict
+# --------------------------------------------------------------------------
+
+_TC_A, _TC_B = 2460310.52, 2460311.52  # the fixture's two events of obj_both (dt = 1 d)
+
+
+def _add_family(test_conn, ids: dict) -> int:
+    """A stored family of obj_both's two events with four aliases of every kind of status."""
+    obj_id, det_a, det_b = ids["obj_both"], ids["det_a"], ids["det_b"]
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.repeat_link (det_a, det_b, obj_id, night_a, night_b, dt_days, "
+            "p_match, p_joint, chi2_joint, dof_joint, phys_ok, n_alias, diurnal, linked) "
+            "VALUES (%s, %s, %s, %s, %s, 1.0, 0.6, 0.4, 2.0, 1, true, 2, true, true)",
+            (det_a, det_b, obj_id, ids["night1"], ids["night2"]),
+        )
+        cur.execute(
+            "INSERT INTO relphot.repeat_family (obj_id, family_key, n_members, member_night_ids, "
+            "depth, depth_err, t14_h, t14_lower_limit, ingress_frac, score, n_alias, n_allowed) "
+            "VALUES (%s, 'k', 2, %s, 0.01, 0.001, 2.0, false, 0.2, 0.4, 4, 2) RETURNING fam_id",
+            (obj_id, [ids["night1"], ids["night2"]]),
+        )
+        (fam_id,) = cur.fetchone()
+        cur.executemany(
+            "INSERT INTO relphot.repeat_family_member (fam_id, det_id) VALUES (%s, %s)",
+            [(fam_id, det_a), (fam_id, det_b)],
+        )
+        for k, period, status, veto_night, dchi2 in (
+            (1, 1.0, "allowed", None, None),
+            (2, 0.5, "allowed", None, None),
+            (3, 1.0 / 3.0, "vetoed_nondetection", ids["night2"], 25.0),
+            (4, 0.25, "vetoed_density", None, None),
+        ):
+            cur.execute(
+                "INSERT INTO relphot.repeat_ephemeris (fam_id, obj_id, family_key, alias_k, "
+                "period, period_err, tc0, tc0_err, status, veto_night_id, veto_dchi2, "
+                "n_nights_tested) VALUES (%s, %s, 'k', %s, %s, 0.0007, %s, 0.0005, %s, %s, %s, 1)",
+                (fam_id, obj_id, k, period, _TC_A, status, veto_night, dchi2),
+            )
+    test_conn.commit()
+    return fam_id
+
+
+def test_object_detail_repeat_families_shape(client, test_conn) -> None:
+    test_client, ids = client
+    fam_id = _add_family(test_conn, ids)
+
+    data = test_client.get(f"/api/object/{ids['obj_both']}").json()
+
+    (fam,) = data["repeat_families"]
+    assert fam["fam_id"] == fam_id
+    assert (fam["n_members"], fam["n_members_stored"], fam["accepted"]) == (2, 2, False)
+    assert (fam["stale"], fam["stale_reason"]) == (False, None)
+    assert (fam["n_alias"], fam["n_allowed"]) == (4, 2)
+    a, b = fam["members"]
+    assert (a["det_id"], b["det_id"]) == (ids["det_a"], ids["det_b"])
+    assert (a["night_label"], a["telescope"], a["loose"]) == ("20250101", "T80S", False)
+    assert a["tc"] == pytest.approx(_TC_A) and a["depth"] == pytest.approx(0.010)
+    assert a["t14_lower_limit"] is True and a["duration_display"] == "≥ 2.00 h"
+    assert a["ingress_frac"] is None and b["ingress_frac"] == pytest.approx(0.2)
+    assert b["duration_display"] == "2.00 h"
+    (link,) = fam["links"]
+    assert (link["det_a"], link["det_b"]) == (ids["det_a"], ids["det_b"])
+    assert (link["p_match"], link["p_joint"], link["phys_ok"], link["diurnal"]) == (
+        pytest.approx(0.6), pytest.approx(0.4), True, True
+    )
+    assert (link["decision"], link["decision_applied"], link["linked"]) == (None, None, True)
+    assert (link["night_label_a"], link["night_label_b"]) == ("20250101", "20250102")
+    # every alias is listed, with its status and the night that vetoed it
+    assert [(x["alias_k"], x["status"]) for x in fam["aliases"]] == [
+        (1, "allowed"), (2, "allowed"), (3, "vetoed_nondetection"), (4, "vetoed_density")
+    ]
+    veto = fam["aliases"][2]
+    assert (veto["veto_night_label"], veto["veto_dchi2"], veto["n_nights_tested"]) == (
+        "20250102", pytest.approx(25.0), 1
+    )
+    assert fam["aliases"][0]["period"] == pytest.approx(1.0)
+    assert fam["aliases"][0]["period_err"] == pytest.approx(0.0007)
+    assert data["repeat_decisions"] == []
+
+    plain = test_client.get(f"/api/object/{ids['obj_unc']}").json()
+    assert plain["repeat_families"] == [] and plain["repeat_decisions"] == []
+
+
+def test_object_detail_marks_a_loose_night_member(client, test_conn) -> None:
+    test_client, ids = client
+    _add_family(test_conn, ids)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.mn_run (stem, labels, anchor, loaded_at, loose_night_ids) "
+            "VALUES ('loose_run', %s, 'a', now(), %s)", (["a", "b"], [ids["night2"]]),
+        )
+    test_conn.commit()
+    (fam,) = test_client.get(f"/api/object/{ids['obj_both']}").json()["repeat_families"]
+    assert [m["loose"] for m in fam["members"]] == [False, True]
+
+
+def test_a_rejected_member_leaves_the_family_marked_stale(client, test_conn) -> None:
+    test_client, ids = client
+    _add_family(test_conn, ids)
+    url = f"/api/object/{ids['obj_both']}"
+
+    test_client.patch(f"/api/detection/{ids['det_b']}", json={"status": "REJECTED"})
+    (fam,) = test_client.get(url).json()["repeat_families"]
+    assert [m["det_id"] for m in fam["members"]] == [ids["det_a"]]
+    assert fam["links"] == [] and fam["n_members_stored"] == 2
+    assert fam["stale"] is True
+    assert fam["stale_reason"].startswith("stale — recomputed at next analyze")
+    assert len(fam["aliases"]) == 4  # nothing is recomputed before the next analyze
+
+    # an auto-rejected member goes the same way unless the person CONFIRMED it
+    test_client.patch(f"/api/detection/{ids['det_b']}", json={"status": "UNCONFIRMED"})
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.detection SET auto_status = 'REJECTED', auto_reason = 'x' "
+            "WHERE det_id = %s", (ids["det_b"],),
+        )
+    test_conn.commit()
+    (fam,) = test_client.get(url).json()["repeat_families"]
+    assert fam["stale"] is True and len(fam["members"]) == 1
+    test_client.patch(f"/api/detection/{ids['det_b']}", json={"status": "CONFIRMED"})
+    (fam,) = test_client.get(url).json()["repeat_families"]
+    assert fam["stale"] is False and len(fam["members"]) == 2
+
+
+def _decisions(test_conn) -> list[tuple]:
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT obj_id, night_a, night_b, tc_a, tc_b, decision, note "
+            "FROM relphot.repeat_decision ORDER BY night_a, night_b, tc_a"
+        )
+        return cur.fetchall()
+
+
+def test_repeat_link_put_and_delete_round_trip(client, test_conn) -> None:
+    test_client, ids = client
+    _add_family(test_conn, ids)
+    obj = ids["obj_both"]
+    link = f"/api/object/{obj}/repeat_link"
+    detail = f"/api/object/{obj}"
+
+    resp = test_client.put(
+        link, json={"det_a": ids["det_b"], "det_b": ids["det_a"], "decision": "DIFFERENT",
+                    "note": "another planet"},  # the pair in either order
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "next `relphot db analyze`" in body["note"]
+    assert (body["det_a"], body["det_b"]) == (ids["det_a"], ids["det_b"])
+    assert body["decision"]["decision"] == "DIFFERENT"
+    assert _decisions(test_conn) == [
+        (obj, ids["night1"], ids["night2"], pytest.approx(_TC_A), pytest.approx(_TC_B),
+         "DIFFERENT", "another planet")
+    ]
+
+    data = test_client.get(detail).json()
+    (fam,) = data["repeat_families"]
+    (lk,) = fam["links"]
+    assert (lk["decision"], lk["decision_applied"]) == ("DIFFERENT", None)
+    assert fam["stale"] is True and "decision" in fam["stale_reason"]
+    assert len(fam["members"]) == 2  # DIFFERENT keeps both events; nothing is merged or rejected
+    (dec,) = data["repeat_decisions"]
+    assert (dec["label_a"], dec["label_b"], dec["decision"], dec["note"]) == (
+        "20250101", "20250102", "DIFFERENT", "another planet"
+    )
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT status FROM relphot.detection WHERE det_id = ANY(%s)",
+                    ([ids["det_a"], ids["det_b"]],))
+        assert {r[0] for r in cur.fetchall()} == {"UNCONFIRMED"}
+
+    # a second verdict on the pair replaces the first
+    resp = test_client.put(link, json={"det_a": ids["det_a"], "det_b": ids["det_b"],
+                                       "decision": "SAME"})
+    assert resp.status_code == 200
+    assert [d[5:] for d in _decisions(test_conn)] == [("SAME", None)]
+
+    resp = test_client.delete(link, params={"det_a": ids["det_b"], "det_b": ids["det_a"]})
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == 1 and "analyze" in resp.json()["note"]
+    assert _decisions(test_conn) == []
+    (fam,) = test_client.get(detail).json()["repeat_families"]
+    assert fam["stale"] is False and fam["links"][0]["decision"] is None
+    assert test_client.delete(link, params={"det_a": ids["det_a"], "det_b": ids["det_b"]}
+                              ).json()["deleted"] == 0
+
+
+def test_repeat_link_validation(client, test_conn) -> None:
+    test_client, ids = client
+    obj = ids["obj_both"]
+    link = f"/api/object/{obj}/repeat_link"
+    ok = {"det_a": ids["det_a"], "det_b": ids["det_b"], "decision": "SAME"}
+
+    assert test_client.put(link, json={**ok, "decision": "MAYBE"}).status_code == 400
+    assert test_client.put(link, json={**ok, "decision": None}).status_code == 422
+    assert test_client.put(link, json={**ok, "note": "x" * 2001}).status_code == 400
+    assert test_client.put(link, json={**ok, "det_b": ids["det_a"]}).status_code == 400
+    # an event of another object, or one with no fit, is not a pair of this object
+    assert test_client.put(
+        f"/api/object/{ids['obj_exop']}/repeat_link", json=ok
+    ).status_code == 404
+    assert test_client.put(link, json={**ok, "det_b": 10**9}).status_code == 404
+    assert test_client.delete(link, params={"det_a": ids["det_a"]}).status_code == 422
+    assert _decisions(test_conn) == []
+
+
+def test_web_role_writes_repeat_decisions_only(client, test_conn) -> None:
+    test_client, ids = client
+    fam_id = _add_family(test_conn, ids)
+    obj = ids["obj_both"]
+    test_client.put(f"/api/object/{obj}/repeat_link", json={
+        "det_a": ids["det_a"], "det_b": ids["det_b"], "decision": "SAME"})
+
+    rw_dsn = _role_dsn(_test_dsn(), "relphot_web", "RELPHOT_WEB_PASSWORD")
+    with psycopg.connect(rw_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE relphot.repeat_decision SET decision = 'DIFFERENT', note = 'n'")
+        for sql in (
+            "UPDATE relphot.repeat_decision SET tc_a = 1.0",
+            "UPDATE relphot.repeat_link SET linked = false",
+            "DELETE FROM relphot.repeat_link",
+            "UPDATE relphot.repeat_family SET accepted = true",
+            "DELETE FROM relphot.repeat_family",
+            "UPDATE relphot.repeat_ephemeris SET status = 'allowed'",
+            "INSERT INTO relphot.repeat_family_member (fam_id, det_id) VALUES (%(f)s, 1)",
+            "INSERT INTO relphot.repeat_link (det_a, det_b, obj_id, night_a, night_b, phys_ok, "
+            "linked) VALUES (1, 2, %(o)s, 1, 1, true, true)",
+        ):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                cur.execute(sql, {"f": fam_id, "o": obj})
+    assert [d[5:] for d in _decisions(test_conn)] == [("DIFFERENT", "n")]
+
+    ro_dsn = _role_dsn(_test_dsn(), "relphot_ro", "RELPHOT_RO_PASSWORD")
+    for sql in (
+        "INSERT INTO relphot.repeat_decision (obj_id, night_a, night_b, tc_a, tc_b, decision) "
+        "VALUES (%(o)s, %(n)s, %(n)s, 1.0, 2.0, 'SAME')",
+        "UPDATE relphot.repeat_decision SET note = 'x'",
+        "DELETE FROM relphot.repeat_decision",
+    ):
+        with (
+            psycopg.connect(ro_dsn, autocommit=True) as conn,
+            conn.cursor() as cur,
+            pytest.raises(psycopg.errors.InsufficientPrivilege),
+        ):
+            cur.execute(sql, {"o": obj, "n": ids["night1"]})
+
+
+def test_repeat_predict_windows_and_filters(client, test_conn) -> None:
+    test_client, ids = client
+    _add_family(test_conn, ids)
+
+    # +5.52 d holds the transit of both allowed aliases (P = 1 and 0.5 d from tc0 = _TC_A)
+    resp = test_client.get("/api/repeat/predict", params={"start": 2460315.3, "end": 2460315.7})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["available"] is True and data["n_families"] == 1
+    (w,) = data["windows"]
+    assert (w["obj_id"], w["obj_name"]) == (ids["obj_both"], "RP BOTH01")
+    assert (w["n_aliases"], w["n_aliases_total"], w["stale"]) == (2, 2, False)
+    assert w["start_bjd"] < _TC_A + 5.0 < w["end_bjd"]
+    assert w["depth"] == pytest.approx(0.01) and w["duration_display"] == "2.00 h"
+    assert len(w["start_utc"]) == 16 and w["fam_id"] is not None
+    assert data["start_bjd"] == pytest.approx(2460315.3)
+
+    # +5.02 d is predicted by the 0.5 d alias only: the window that tells the aliases apart
+    params = {"start": 2460314.9, "end": 2460315.1}
+    (w,) = test_client.get("/api/repeat/predict", params=params).json()["windows"]
+    assert (w["n_aliases"], w["n_aliases_total"]) == (1, 2)
+    assert test_client.get(
+        "/api/repeat/predict", params={**params, "min_alias_frac": 1.0}
+    ).json()["windows"] == []
+
+    # filters: object, telescope, accepted_only
+    for extra, n in (
+        ({"obj_id": ids["obj_both"]}, 1), ({"obj_id": ids["obj_unc"]}, 0),
+        ({"telescope": "T80S"}, 1), ({"telescope": "ROBO43"}, 0), ({"accepted_only": "true"}, 0),
+    ):
+        got = test_client.get("/api/repeat/predict", params={**params, **extra}).json()
+        assert len(got["windows"]) == n, extra
+
+    # UTC dates: the end date is included whole
+    utc = test_client.get(
+        "/api/repeat/predict", params={"start": "2025-01-06", "end": "2025-01-06"}
+    ).json()
+    assert utc["end_bjd"] - utc["start_bjd"] == pytest.approx(1.0)
+
+    # the stored family is stale once a member is rejected
+    test_client.patch(f"/api/detection/{ids['det_b']}", json={"status": "REJECTED"})
+    (w,) = test_client.get("/api/repeat/predict", params=params).json()["windows"]
+    assert w["stale"] is True
+
+
+def test_repeat_predict_defaults_and_bad_input(client) -> None:
+    test_client, _ids = client
+    data = test_client.get("/api/repeat/predict").json()  # now .. now + 10 d
+    assert data["end_bjd"] - data["start_bjd"] == pytest.approx(10.0)
+    assert data["windows"] == [] and data["n_families"] == 0
+    for params in (
+        {"start": "garbage"}, {"start": "2025-01-05", "end": "2025-01-01"},
+        {"start": "2025-01-01", "end": "2027-01-01"}, {"min_alias_frac": 2.0},
+    ):
+        assert test_client.get("/api/repeat/predict", params=params).status_code in (400, 422)
+
+
+def test_search_repeat_family_filter_and_column(client, test_conn) -> None:
+    test_client, ids = client
+    _add_family(test_conn, ids)
+    rows = test_client.get("/api/search", params={"has_repeat_family": "true"}).json()["rows"]
+    assert [r["obj_id"] for r in rows] == [ids["obj_both"]]
+    assert rows[0]["n_repeat_families"] == 1
+    without = test_client.get("/api/search", params={"has_repeat_family": "false"}).json()
+    assert ids["obj_both"] not in {r["obj_id"] for r in without["rows"]}
+    assert all(r["n_repeat_families"] == 0 for r in without["rows"])
+    sort = test_client.get("/api/search", params={"sort": "n_repeat_families", "order": "desc"})
+    assert sort.json()["rows"][0]["obj_id"] == ids["obj_both"]
+    assert "n_repeat_families" in test_client.get("/api/search.csv").text.splitlines()[0]
+
+
+def test_the_web_app_does_not_import_relphot_db_or_pandas() -> None:
+    # the web extra has no pandas: what the repeated-event endpoints use lives in relphot.repeat
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, relphot.web.app, relphot.repeat; "
+        "bad = [m for m in ('relphot.db', 'pandas') if m in sys.modules]; "
+        "sys.exit(1 if bad else 0)"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr

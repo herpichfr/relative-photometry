@@ -20,7 +20,8 @@ worker, which runs on the host with the owner role like the loader, carries it o
   detections take part in ``transit_match`` (events are never merged), survive a night reload
   (which deletes ``origin = 'search'`` only) and never set ``is_exop`` by themselves.
 
-Both kinds then rebuild the object's transit matches and refresh its summary fields.
+Both kinds then rebuild the object's transit matches and repeated-event families
+(:mod:`relphot.db.families`) and refresh its summary fields.
 
 Requests are worked off first-in first-out, one at a time; each is claimed in its own short
 transaction (``status = 'running'``, visible to the web at once) and carried out in a second one
@@ -54,6 +55,7 @@ from relphot.db.analyze import (
     _TransitDet,
     recompute_matches,
 )
+from relphot.db.families import update_families
 from relphot.db.refresh import refresh_objects
 from relphot.exceptions import ReprocessError
 
@@ -209,9 +211,11 @@ def process_request(conn: psycopg.Connection, req: dict, settings: Settings | No
     else:
         msg = f"unknown request kind {req['kind']!r}"
         raise ReprocessError(msg)
-    # both kinds: the object's matching-transit pairs and summary fields are brought up to date
+    # both kinds: the object's matching-transit pairs, repeated-event families and summary
+    # fields are brought up to date
     db = settings.db
     result["n_matches"] = recompute_matches(conn, req["obj_id"], db)
+    update_families(conn, [req["obj_id"]], db)
     refresh_objects(
         conn, [req["obj_id"]], bls_min_snr=db.bls_min_snr, ls_fap_threshold=db.ls_fap_threshold,
         class_multinight_kinds=db.class_multinight_kinds,

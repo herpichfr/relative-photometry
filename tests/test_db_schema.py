@@ -57,6 +57,8 @@ def test_init_schema_creates_tables(test_conn) -> None:
         "catalog_match", "mn_run", "tie", "periodogram", "schema_version",
         "transit_shape", "transit_match", "period_estimate",
         "night_tile", "tile_lc", "reference_member", "comparison_member",
+        "repeat_link", "repeat_family", "repeat_family_member", "repeat_ephemeris",
+        "repeat_decision",
     }
     with test_conn.cursor() as cur:
         cur.execute(
@@ -148,8 +150,8 @@ def test_migration_004_from_v3_maps_class_to_flags(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9, 10, 11]
-    assert current_version(test_conn) == 11
+    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert current_version(test_conn) == 12
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -283,7 +285,7 @@ def test_migration_005_verify_status_backfill_and_check(test_conn) -> None:
             )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [5, 6, 7, 8, 9, 10, 11]
+    assert init_schema(test_conn) == [5, 6, 7, 8, 9, 10, 11, 12]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -306,7 +308,7 @@ def test_migration_007_night_zero_point_defaults_existing_nights_to_assumed(test
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [7, 8, 9, 10, 11]
+    assert init_schema(test_conn) == [7, 8, 9, 10, 11, 12]
 
     with test_conn.cursor() as cur:
         cur.execute("SELECT zp, zp_source FROM relphot.night")
@@ -333,7 +335,7 @@ def test_migration_008_night_zero_point_source_accepts_measured(test_conn) -> No
         cur.execute("UPDATE relphot.night SET zp_source = 'measured'")
     test_conn.rollback()
 
-    assert init_schema(test_conn) == [8, 9, 10, 11]
+    assert init_schema(test_conn) == [8, 9, 10, 11, 12]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -374,7 +376,7 @@ def test_migration_009_coincidence_columns_and_table_from_v8(test_conn) -> None:
         (det_id,) = cur.fetchone()
     test_conn.commit()
 
-    assert init_schema(test_conn) == [9, 10, 11]
+    assert init_schema(test_conn) == [9, 10, 11, 12]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -473,8 +475,8 @@ def test_migration_006_guided_reprocessing_schema_from_v5(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11]
-    assert current_version(test_conn) == 11
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12]
+    assert current_version(test_conn) == 12
 
     with test_conn.cursor() as cur:
         # existing rows: searches' detections, no inflation information, no new estimate info
@@ -568,7 +570,7 @@ def test_migration_006_user_night_review_from_v5_backfills_object_level_flags(te
                 )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11]
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -797,7 +799,7 @@ def test_migration_010_loose_night_ids_from_v9(test_conn) -> None:
             (["a", "b"],),
         )
     test_conn.commit()
-    assert init_schema(test_conn) == [10, 11]
+    assert init_schema(test_conn) == [10, 11, 12]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -839,7 +841,7 @@ def test_migration_011_members_from_v10(test_conn) -> None:
         (obj_id,) = cur.fetchone()
     test_conn.commit()
 
-    assert init_schema(test_conn) == [11]
+    assert init_schema(test_conn) == [11, 12]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -986,4 +988,127 @@ def test_migration_011_members_from_v10(test_conn) -> None:
                 (table,),
             )
             assert cur.fetchone() == (False,), f"relphot_ro should not have INSERT on {table}"
+    test_conn.commit()
+
+
+def test_migration_012_repeat_events_from_v11(test_conn) -> None:
+    _apply_up_to(test_conn, 11)
+    test_conn.commit()
+    assert init_schema(test_conn) == [12]
+    assert current_version(test_conn) == 12
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.object (name, ra, dec) VALUES ('o', 0, 0) RETURNING obj_id"
+        )
+        (obj_id,) = cur.fetchone()
+        night_ids = []
+        for label in ("a", "b"):
+            cur.execute(
+                "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+                "VALUES ('T80S', '2025-01-01', %s, %s) RETURNING night_id",
+                (label, f"/tmp/{label}"),
+            )
+            night_ids.append(cur.fetchone()[0])
+        det_ids = []
+        for night_id in night_ids:
+            cur.execute(
+                "INSERT INTO relphot.detection (obj_id, night_id, kind) "
+                "VALUES (%s, %s, 'transit') RETURNING det_id",
+                (obj_id, night_id),
+            )
+            det_ids.append(cur.fetchone()[0])
+        det_a, det_b = det_ids
+        cur.execute(
+            "INSERT INTO relphot.repeat_link (det_a, det_b, obj_id, night_a, night_b, phys_ok, "
+            "linked, decision) VALUES (%s, %s, %s, %s, %s, true, true, 'SAME')",
+            (det_a, det_b, obj_id, *night_ids),
+        )
+        cur.execute(
+            "INSERT INTO relphot.repeat_family (obj_id, family_key, n_members, member_night_ids) "
+            "VALUES (%s, 'k', 2, %s) RETURNING fam_id",
+            (obj_id, night_ids),
+        )
+        (fam_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.repeat_family_member (fam_id, det_id) VALUES (%s, %s), (%s, %s)",
+            (fam_id, det_a, fam_id, det_b),
+        )
+        cur.execute(
+            "INSERT INTO relphot.repeat_ephemeris (fam_id, obj_id, family_key, alias_k, period, "
+            "tc0, status) VALUES (%s, %s, 'k', 1, 2.0, 2460000.0, 'allowed')",
+            (fam_id, obj_id),
+        )
+        cur.execute(
+            "INSERT INTO relphot.repeat_decision (obj_id, night_a, night_b, tc_a, tc_b, decision) "
+            "VALUES (%s, %s, %s, 1.0, 2.0, 'SAME')",
+            (obj_id, *night_ids),
+        )
+        cur.execute("SELECT decision, updated_at IS NOT NULL FROM relphot.repeat_decision")
+        assert cur.fetchone() == ("SAME", True)
+        for role in ("relphot_ro", "relphot_web"):
+            for table in ("repeat_link", "repeat_family", "repeat_family_member",
+                          "repeat_ephemeris", "repeat_decision"):
+                cur.execute(
+                    "SELECT has_table_privilege(%s, 'relphot.' || %s, 'SELECT'), "
+                    "has_table_privilege(%s, 'relphot.' || %s, 'INSERT')",
+                    (role, table, role, table),
+                )
+                assert cur.fetchone() == (True, False)  # no role has a table-wide INSERT
+        cur.execute(
+            "SELECT has_table_privilege('relphot_web', 'relphot.repeat_decision', 'DELETE'), "
+            "has_column_privilege('relphot_web', 'relphot.repeat_decision', 'decision', 'UPDATE'), "
+            "has_column_privilege('relphot_web', 'relphot.repeat_decision', 'tc_a', 'UPDATE'), "
+            "has_column_privilege('relphot_web', 'relphot.repeat_decision', 'decision', 'INSERT'), "
+            "has_column_privilege('relphot_ro', 'relphot.repeat_decision', 'decision', 'INSERT'), "
+            "has_column_privilege('relphot_web', 'relphot.repeat_link', 'linked', 'INSERT')"
+        )
+        # the web may only write the person's decisions
+        assert cur.fetchone() == (True, True, False, True, False, False)
+    test_conn.commit()
+
+    bad = (
+        (
+            "INSERT INTO relphot.repeat_decision (obj_id, night_a, night_b, tc_a, tc_b, decision) "
+            "VALUES (%s, %s, %s, 1.0, 3.0, 'MAYBE')", (obj_id, *night_ids),
+            psycopg.errors.CheckViolation,
+        ),
+        (
+            "INSERT INTO relphot.repeat_decision (obj_id, night_a, night_b, tc_a, tc_b, decision) "
+            "VALUES (%s, %s, %s, 1.0, 3.0, 'SAME')", (obj_id, night_ids[1], night_ids[0]),
+            psycopg.errors.CheckViolation,
+        ),
+        (
+            "INSERT INTO relphot.repeat_ephemeris (obj_id, family_key, alias_k, period, tc0, "
+            "status) VALUES (%s, 'x', 1, 1.0, 1.0, 'maybe')", (obj_id,),
+            psycopg.errors.CheckViolation,
+        ),
+        (
+            "INSERT INTO relphot.repeat_link (det_a, det_b, obj_id, night_a, night_b, phys_ok, "
+            "linked) VALUES (%s, %s, %s, 1, 2, true, true)", (det_b, det_a, obj_id),
+            psycopg.errors.CheckViolation,
+        ),
+        (
+            "INSERT INTO relphot.repeat_ephemeris (obj_id, family_key, alias_k, period, tc0, "
+            "status) VALUES (%s, 'k', 1, 1.0, 1.0, 'allowed')", (obj_id,),
+            psycopg.errors.UniqueViolation,
+        ),
+    )
+    for sql, params, error in bad:
+        with pytest.raises(error), test_conn.cursor() as cur:
+            cur.execute(sql, params)
+        test_conn.rollback()
+
+    with test_conn.cursor() as cur:
+        # the rows of a reloaded detection go with it; the ephemeris is kept as history
+        cur.execute("DELETE FROM relphot.detection WHERE det_id = %s", (det_a,))
+        cur.execute("SELECT count(*) FROM relphot.repeat_link")
+        assert cur.fetchone() == (0,)
+        cur.execute("SELECT count(*) FROM relphot.repeat_family_member")
+        assert cur.fetchone() == (1,)
+        cur.execute("DELETE FROM relphot.repeat_family WHERE fam_id = %s", (fam_id,))
+        cur.execute("SELECT count(*), count(fam_id) FROM relphot.repeat_ephemeris")
+        assert cur.fetchone() == (1, 0)
+        cur.execute("SELECT count(*) FROM relphot.repeat_decision")
+        assert cur.fetchone() == (1,)
     test_conn.commit()

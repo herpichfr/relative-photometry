@@ -397,3 +397,63 @@ button.rerun-badge.pending:hover {
 .rerun-notice.failed {
     border-left-color: #b00020;
 }
+
+/* Repeated-event candidates: a family block, the stale badge, alias statuses */
+.stale-badge {
+    display: inline-block;
+    padding: 0.1rem 0.5rem;
+    border: 1px solid #e0b84d;
+    border-radius: 999px;
+    background: #fff4d6;
+    color: #7a5200;
+    font-size: 12px;
+    font-weight: bold;
+    vertical-align: middle;
+}
+
+.repeat-family {
+    border: 1px solid #ccc;
+    padding: 0.5rem 0.75rem;
+    margin: 0.6rem 0;
+}
+
+.repeat-family.stale {
+    border-color: #e0b84d;
+}
+
+.repeat-family h4 {
+    margin: 0 0 0.3rem 0;
+}
+
+.repeat-family table {
+    margin-bottom: 0.4rem;
+}
+
+.repeat-family .alias-allowed {
+    color: #1b6b2c;
+    font-weight: bold;
+}
+
+.repeat-family tr.alias-vetoed td {
+    color: #777;
+}
+
+.repeat-flag {
+    display: inline-block;
+    margin-right: 0.3rem;
+    padding: 0 0.35rem;
+    border: 1px solid #bbb;
+    border-radius: 4px;
+    font-size: 0.85em;
+}
+
+.repeat-flag.warn-flag {
+    border-color: #e0b84d;
+    background: #fff4d6;
+}
+
+.loose-mark {
+    margin-left: 0.3rem;
+    font-size: 0.85em;
+    color: #7a5200;
+}
