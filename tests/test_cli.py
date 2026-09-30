@@ -105,7 +105,7 @@ def test_lightcurves_smoke(fits_files, tmp_path) -> None:
         pass  # astropy not available, skip check
 
     # Check that members file exists (it has the path based on lc_out which is stem only)
-    members_npz = lc_out.parent / "_members.npz"
+    members_npz = lc_out.parent / f"{lc_out.name}_members.npz"
     assert members_npz.is_file(), f"Members file should be written by default at {members_npz}"
 
 
