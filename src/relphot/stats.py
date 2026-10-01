@@ -24,14 +24,43 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: The bright-star-floor magnitude bin starts at this percentile (0-100, brightest
+#: first) of the magnitudes of all stars with a light curve, and is
+#: ``BRIGHT_FLOOR_WIDTH_MAG`` wide. A percentile of the whole population, not the
+#: brightest comparison star, so that a night whose brightest stars are lost to the
+#: non-linearity flag (sharp seeing) is measured on nearly the same bin as the others.
+BRIGHT_FLOOR_PERCENTILE = 0.25
+BRIGHT_FLOOR_WIDTH_MAG = 1.0
+
+# 1 mmag = 1.0857e-3 in flux ratio; rms is a fractional scatter.
+_MMAG_PER_FRAC = 1085.7
+
 __all__ = [
+    "BRIGHT_FLOOR_PERCENTILE",
+    "BRIGHT_FLOOR_WIDTH_MAG",
+    "BrightFloor",
     "StarStats",
     "best_aperture_per_star",
+    "bright_star_floor",
     "build_diagnostics_table",
     "compute_star_stats",
     "plot_rms_vs_magnitude",
     "select_best_aperture",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class BrightFloor:
+    """Bright-star floor of one aperture: median comparison-star RMS in one magnitude bin.
+
+    ``floor_mmag`` is in mmag; the bin is ``mag_lo <= mag < mag_hi`` and holds ``n``
+    comparison stars.
+    """
+
+    floor_mmag: float
+    mag_lo: float
+    mag_hi: float
+    n: int
 
 
 @dataclass(slots=True)
@@ -60,6 +89,46 @@ class StarStats:
     blended: np.ndarray | None = None
     near_edge: np.ndarray | None = None
     tailed: np.ndarray | None = None
+
+
+def bright_star_floor(
+    mag: np.ndarray,
+    rms: np.ndarray,
+    is_comp: np.ndarray,
+    percentile: float = BRIGHT_FLOOR_PERCENTILE,
+    width: float = BRIGHT_FLOOR_WIDTH_MAG,
+) -> BrightFloor | None:
+    """Median RMS of the comparison stars in the bright magnitude bin of one aperture.
+
+    The bin is ``[lo, lo + width)`` with ``lo`` the ``percentile``-th percentile of
+    ``mag`` over all stars with a finite magnitude and RMS (pass NaN for stars without
+    a light curve). The floor is the median ``rms`` of the comparison stars (``is_comp``)
+    in the bin, converted to mmag. Returns ``None`` when no star has a finite magnitude
+    and RMS or no comparison star falls in the bin.
+
+    Parameters
+    ----------
+    mag, rms, is_comp : np.ndarray
+        ``(n_stars,)`` magnitude, fractional RMS, and comparison-star mask.
+    percentile : float
+        Start of the bin, percent of the stars, brightest first.
+    width : float
+        Bin width in magnitudes.
+    """
+    mag = np.asarray(mag, dtype=float)
+    rms = np.asarray(rms, dtype=float)
+    valid = np.isfinite(mag) & np.isfinite(rms)
+    if not np.any(valid):
+        return None
+    lo = float(np.percentile(mag[valid], percentile))
+    hi = lo + float(width)
+    sel = valid & np.asarray(is_comp, dtype=bool) & (mag >= lo) & (mag < hi)
+    n = int(sel.sum())
+    if n == 0:
+        return None
+    return BrightFloor(
+        floor_mmag=float(np.median(rms[sel]) * _MMAG_PER_FRAC), mag_lo=lo, mag_hi=hi, n=n
+    )
 
 
 def compute_star_stats(
