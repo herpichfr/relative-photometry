@@ -5,8 +5,8 @@ Every read goes through the ``relphot_ro`` role (SELECT only); the manual-edit
 endpoints (``PATCH /api/object/{obj_id}``, ``PATCH /api/detection/{det_id}``,
 ``PUT /api/object/{obj_id}/night/{night_id}/review``,
 ``PUT`` / ``DELETE /api/object/{obj_id}/repeat_link``, and
-``POST /api/object/{obj_id}/adopt_period``) and the reprocess-request endpoint
-(``POST /api/object/{obj_id}/reprocess``, an INSERT into the queue
+``POST /api/object/{obj_id}/adopt_period``, ``POST /api/detections/review``) and the
+reprocess-request endpoint (``POST /api/object/{obj_id}/reprocess``, an INSERT into the queue
 ``relphot db reprocess`` works off) go through ``relphot_web`` (SELECT plus UPDATE on a
 fixed set of ``relphot.object`` / ``relphot.detection`` / ``relphot.user_night_review``
 columns, plus INSERT on a fixed set of ``relphot.reprocess_request`` columns, plus
@@ -23,6 +23,7 @@ import io
 import math
 from datetime import date
 from importlib import resources
+from typing import Literal
 
 import numpy as np
 import psycopg
@@ -101,6 +102,9 @@ def _effective_status(status: str | None, auto_status: str | None) -> str:
 
 #: Most look-alike events listed with a transit event (its ``n_similar`` is the full count).
 _MAX_SIMILAR_SHOWN = 20
+#: Look-alike events one stack plot carries (default and hard cap), and one bulk review changes.
+_STACK_DEFAULT = 40
+_STACK_MAX = 100
 
 
 def _select_columns(
@@ -518,6 +522,68 @@ _OBJECT_BASE_COLUMNS = [
 _OBJECT_OPTIONAL_COLUMNS = ["data_updated_at", "n_review_pending", "n_nights_reviewed"]
 
 
+def _similar_info(cur, det_ids: list[int], *, stack: bool = False) -> dict[int, dict]:
+    """The transit events behind ``det_ids``, keyed by det_id: object, centre time, depth and T14
+    (the shape fit's where there is one, else the detection's own).
+
+    ``stack`` adds what the similar-events plot and its bulk review need: the night, the
+    verdicts and notes, and the trapezoid's ingress fraction and convergence.
+    """
+    if not det_ids:
+        return {}
+    extra = (
+        ", d.night_id, n.label AS night_label, d.status, d.auto_status, d.notes, "
+        "ts.ingress_frac, ts.converged, ts.incomplete_reason"
+        if stack else ""
+    )
+    night_join = "LEFT JOIN relphot.night n ON n.night_id = d.night_id " if stack else ""
+    cur.execute(
+        "SELECT d.det_id, d.obj_id, o.name AS obj_name, "
+        "COALESCE(ts.tc, d.tc_bjd_tdb) AS tc, COALESCE(ts.depth, d.depth) AS depth, "
+        "COALESCE(ts.t14_h, d.duration_h) AS t14_h, "
+        "(COALESCE(ts.t14_lower_limit, false) OR d.duration_lower_limit) "
+        f"AS t14_lower_limit{extra} "
+        "FROM relphot.detection d JOIN relphot.object o ON o.obj_id = d.obj_id "
+        f"{night_join}"
+        "LEFT JOIN relphot.transit_shape ts ON ts.det_id = d.det_id "
+        "WHERE d.det_id = ANY(%s) AND d.kind = 'transit'",
+        (det_ids,),
+    )
+    info: dict[int, dict] = {}
+    for sim in _rows_to_dicts(cur, cur.fetchall()):
+        sim["duration_display"] = _fmt_duration(sim["t14_h"], sim["t14_lower_limit"])
+        if stack:
+            sim["effective_status"] = _effective_status(sim["status"], sim["auto_status"])
+        info[sim["det_id"]] = sim
+    return info
+
+
+def _rejected_ids(cur, det_ids: list[int]) -> set[int]:
+    """The ``det_ids`` a person REJECTED (``status``; the automatic ``auto_status`` is not one)."""
+    if not det_ids:
+        return set()
+    cur.execute(
+        "SELECT det_id FROM relphot.detection WHERE det_id = ANY(%s) AND status = 'REJECTED'",
+        (det_ids,),
+    )
+    return {row[0] for row in cur.fetchall()}
+
+
+def _visible_similar(
+    det_ids: list[int], rejected: set[int], *, limit: int, include_rejected: bool = False
+) -> tuple[list[int], int]:
+    """``(the look-alikes to list, how many rejected ones are hidden)``.
+
+    ``det_ids`` is the stored list, nearest in time first. A look-alike a person REJECTED leaves
+    the list (unless ``include_rejected``); the first ``limit`` of the rest are kept. The
+    coincidence veto's own counts (``n_similar``, ``auto_status``) are not touched by this.
+    """
+    if include_rejected:
+        return det_ids[:limit], 0
+    kept = [j for j in det_ids if j not in rejected]
+    return kept[:limit], len(det_ids) - len(kept)
+
+
 @app.get("/api/object/{obj_id}")
 def object_detail(obj_id: int):
     with get_ro_conn() as conn:
@@ -650,28 +716,18 @@ def object_detail(obj_id: int):
                 ev["effective_status"] = _effective_status(ev["status"], ev["auto_status"])
 
             # the look-alikes of each event (other objects' events of the same night): the
-            # nearest in time, capped; n_similar is the full count
-            similar_ids = {
-                ev["det_id"]: (ev.pop("similar_det_ids") or [])[:_MAX_SIMILAR_SHOWN]
-                for ev in transit_events
-            }
-            wanted = sorted({j for ids in similar_ids.values() for j in ids})
-            similar_info: dict[int, dict] = {}
-            if wanted:
-                cur.execute(
-                    "SELECT d.det_id, d.obj_id, o.name AS obj_name, "
-                    "COALESCE(ts.tc, d.tc_bjd_tdb) AS tc, COALESCE(ts.depth, d.depth) AS depth, "
-                    "COALESCE(ts.t14_h, d.duration_h) AS t14_h, "
-                    "(COALESCE(ts.t14_lower_limit, false) OR d.duration_lower_limit) "
-                    "AS t14_lower_limit "
-                    "FROM relphot.detection d JOIN relphot.object o ON o.obj_id = d.obj_id "
-                    "LEFT JOIN relphot.transit_shape ts ON ts.det_id = d.det_id "
-                    "WHERE d.det_id = ANY(%s)",
-                    (wanted,),
+            # nearest in time, capped; n_similar is the full count. One a person REJECTED is no
+            # longer listed (n_similar_rejected counts those); the veto's own numbers stand.
+            all_similar = {ev["det_id"]: ev.pop("similar_det_ids") or [] for ev in transit_events}
+            rejected = _rejected_ids(cur, sorted({j for ids in all_similar.values() for j in ids}))
+            similar_ids: dict[int, list[int]] = {}
+            for ev in transit_events:
+                similar_ids[ev["det_id"]], ev["n_similar_rejected"] = _visible_similar(
+                    all_similar[ev["det_id"]], rejected, limit=_MAX_SIMILAR_SHOWN
                 )
-                for sim in _rows_to_dicts(cur, cur.fetchall()):
-                    sim["duration_display"] = _fmt_duration(sim["t14_h"], sim["t14_lower_limit"])
-                    similar_info[sim["det_id"]] = sim
+            similar_info = _similar_info(
+                cur, sorted({j for ids in similar_ids.values() for j in ids})
+            )
             for ev in transit_events:
                 ev["similar_events"] = [
                     similar_info[j] for j in similar_ids[ev["det_id"]] if j in similar_info
@@ -748,6 +804,73 @@ def object_detail(obj_id: int):
             "repeat_families": repeat_families,
             "repeat_decisions": repeat_decisions,
             "period_estimates": period_estimates,
+        }
+    )
+
+
+def _stack_lcs(cur, det_ids: list[int]) -> dict[int, dict]:
+    """The light curve of each event's own night, keyed by det_id: ``flux`` and ``flux_err`` over
+    the curve's median flux (rounded), one query for all. An event without a usable curve is
+    left out."""
+    cur.execute(
+        "SELECT d.det_id, lc.bjd_tdb, lc.flux, lc.flux_err FROM relphot.detection d "
+        "JOIN relphot.lightcurve lc ON lc.obj_id = d.obj_id AND lc.night_id = d.night_id "
+        "WHERE d.det_id = ANY(%s)",
+        (det_ids,),
+    )
+    curves: dict[int, dict] = {}
+    for det_id, bjd_tdb, flux, flux_err in cur.fetchall():
+        flux = np.asarray(flux, dtype=float)
+        finite = flux[np.isfinite(flux)]
+        median = float(np.median(finite)) if finite.size else float("nan")
+        if not median > 0:
+            continue
+        curves[det_id] = {
+            "bjd_tdb": np.round(np.asarray(bjd_tdb, dtype=float), 6).tolist(),
+            "flux": np.round(flux / median, 5).tolist(),
+            "flux_err": np.round(np.asarray(flux_err, dtype=float) / median, 5).tolist(),
+        }
+    return curves
+
+
+@app.get("/api/detection/{det_id}/similar")
+def detection_similar(
+    det_id: int,
+    limit: int = Query(default=_STACK_DEFAULT, ge=1, le=_STACK_MAX),
+    include_rejected: bool = Query(default=False),
+):
+    """A transit event (the ``anchor``) and its coincidence look-alikes, nearest in time first,
+    each with its own night's light curve over its median -- the data of the stack plot.
+
+    Look-alikes a person REJECTED are left out unless ``include_rejected`` (``n_rejected_hidden``
+    says how many); the anchor is always returned.
+    """
+    with get_ro_conn() as conn, conn.cursor() as cur:
+        anchor = _similar_info(cur, [det_id], stack=True).get(det_id)
+        if anchor is None:
+            raise HTTPException(status_code=404, detail="transit detection not found")
+        cur.execute(
+            "SELECT similar_det_ids FROM relphot.transit_coincidence WHERE det_id = %s", (det_id,)
+        )
+        row = cur.fetchone()
+        similar_ids = (row[0] if row else None) or []
+        rejected = _rejected_ids(cur, similar_ids)
+        shown, hidden = _visible_similar(
+            similar_ids, rejected, limit=limit, include_rejected=include_rejected
+        )
+        info = _similar_info(cur, shown, stack=True)
+        events = [info[j] for j in shown if j in info]
+        curves = _stack_lcs(cur, [det_id, *shown])
+    for ev in (anchor, *events):
+        ev["lc"] = curves.get(ev["det_id"])
+    return _json(
+        {
+            "anchor": anchor,
+            "n_total": len(similar_ids),
+            "n_rejected": len(rejected),
+            "n_rejected_hidden": hidden,
+            "n_returned": len(events),
+            "events": events,
         }
     )
 
@@ -2185,6 +2308,138 @@ def delete_night_review(obj_id: int, night_id: int):
     """Delete a per-night review (same as PUT with all null)."""
     body = NightReviewBody(exop=None, var=None, note=None)
     return put_night_review(obj_id, night_id, body)
+
+
+# --------------------------------------------------------------------------
+# POST /api/detections/review - one verdict (and note) on several transit events at once
+# --------------------------------------------------------------------------
+
+_BULK_VERBS = {"CONFIRMED": "CONFIRM", "REJECTED": "REJECT", "UNCONFIRMED": "UNCONFIRM"}
+
+
+class DetectionsReviewBody(BaseModel):
+    """A bulk verdict from the similar-events window.
+
+    ``det_ids`` (1..100) get ``status`` and, when ``note`` is not empty, the note: appended on a
+    new line of their ``notes`` (``note_mode = 'append'``) or replacing them (``'replace'``). The
+    viewed event ``anchor_det_id`` may be among them. Either way a summary line of the action is
+    appended to the anchor's notes (after the user note, if the anchor got one).
+    """
+
+    anchor_det_id: int
+    det_ids: list[int] = Field(min_length=1, max_length=_STACK_MAX)
+    status: str
+    note: str | None = None
+    note_mode: Literal["append", "replace"] = "append"
+
+
+def _append_note_sql(param: str) -> str:
+    """SQL of ``notes`` with the text of ``%(param)s`` on a new last line."""
+    return (
+        f"CASE WHEN notes IS NULL OR notes = '' THEN %({param})s "
+        f"ELSE notes || chr(10) || %({param})s END"
+    )
+
+
+def _bulk_summary(
+    status: str, others: list[tuple[int, str]], with_anchor: bool, note: str | None
+) -> str:
+    """The line recorded on the viewed event: the date, the action, who it covered (the viewed
+    event itself and/or its look-alikes by name and det_id) and the user's note after an em dash."""
+    who = ["viewed event"] if with_anchor else []
+    if others:
+        who.append(f"{len(others)} look-alike{'s' if len(others) != 1 else ''}")
+    text = f"{date.today().isoformat()} {_BULK_VERBS[status]} ALL {' + '.join(who)}"
+    if others:
+        text += ": " + ", ".join(f"{name} (det {det_id})" for det_id, name in others)
+    if note:
+        text += f" \u2014 {note}"
+    return text
+
+
+@app.post("/api/detections/review")
+def post_detections_review(body: DetectionsReviewBody):
+    if body.status not in _STATUS_VALUES:
+        raise HTTPException(status_code=400, detail=f"invalid status: {body.status!r}")
+    note = (body.note or "").strip() or None
+    if note is not None and len(note) > _REVIEW_NOTE_MAX:
+        raise HTTPException(
+            status_code=400, detail=f"note too long (max {_REVIEW_NOTE_MAX} characters)"
+        )
+    order = list(dict.fromkeys(body.det_ids))  # as sent (nearest first), without repeats
+    anchor_id = body.anchor_det_id
+    set_parts = ["status = %(status)s"]
+    params: dict[str, object] = {"status": body.status, "ids": sorted(order)}
+    if note is not None:
+        set_parts.append(
+            "notes = %(note)s" if body.note_mode == "replace"
+            else f"notes = {_append_note_sql('note')}"
+        )
+        params["note"] = note
+
+    with get_rw_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE relphot.detection SET {', '.join(set_parts)} "
+            "WHERE det_id = ANY(%(ids)s) AND kind = 'transit' "
+            "RETURNING det_id, obj_id, night_id, status, auto_status, notes",
+            params,
+        )
+        updated = {row["det_id"]: row for row in _rows_to_dicts(cur, cur.fetchall())}
+        missing = [j for j in order if j not in updated]
+        anchor_obj = updated[anchor_id]["obj_id"] if anchor_id in updated else None
+        if anchor_obj is None:
+            cur.execute(
+                "SELECT obj_id FROM relphot.detection WHERE det_id = %s AND kind = 'transit'",
+                (anchor_id,),
+            )
+            found = cur.fetchone()
+            if found is None:
+                missing.append(anchor_id)
+            else:
+                anchor_obj = found[0]
+        if missing:
+            conn.rollback()
+            raise HTTPException(
+                status_code=404, detail=f"transit detections not found: {missing}"
+            )
+        other_ids = [j for j in order if j != anchor_id]
+        names: dict[int, str] = {}
+        if other_ids:
+            cur.execute(
+                "SELECT d.det_id, o.name FROM relphot.detection d "
+                "JOIN relphot.object o ON o.obj_id = d.obj_id WHERE d.det_id = ANY(%s)",
+                (other_ids,),
+            )
+            names = dict(cur.fetchall())
+        line = _bulk_summary(
+            body.status, [(j, names.get(j, "?")) for j in other_ids], anchor_id in updated, note
+        )
+        cur.execute(
+            f"UPDATE relphot.detection SET notes = {_append_note_sql('line')} "
+            "WHERE det_id = %(det_id)s RETURNING status, notes",
+            {"line": line, "det_id": anchor_id},
+        )
+        anchor_status, anchor_notes = cur.fetchone()
+        if anchor_id in updated:
+            updated[anchor_id]["notes"] = anchor_notes
+        # a verdict on an event changes the night's automatic evidence: re-derive the flags
+        refresh_flags(
+            conn, sorted({row["obj_id"] for row in updated.values()} | {anchor_obj}),
+            class_multinight_kinds=DbSettings().class_multinight_kinds,
+        )
+        conn.commit()
+    rows = [updated[j] for j in sorted(updated)]
+    for row in rows:
+        row["effective_status"] = _effective_status(row["status"], row["auto_status"])
+    return _json(
+        {
+            "updated": rows,
+            "anchor": {
+                "det_id": anchor_id, "obj_id": anchor_obj, "status": anchor_status,
+                "notes": anchor_notes,
+            },
+        }
+    )
 
 
 # --------------------------------------------------------------------------

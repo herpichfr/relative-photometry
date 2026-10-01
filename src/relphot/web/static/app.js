@@ -27,6 +27,8 @@ const state = {
   tileView: null, // plotted tile lc {kind, nightId, tile, aperture, lc, type} type in [reference, comparison]
   repeatWindows: null, // last /api/repeat/predict response for the loaded object
   timeMarker: null, // x (BJD_TDB - 2460000) of the dashed line a click on the light curve set, or null
+  similar: null, // the similar-events window {detId, data, rows, checked}; rows[0] is the viewed event
+  similarSeq: 0, // bumped by every load/clear of that window: a response of an older one is dropped
 };
 
 function $(id) {
@@ -481,20 +483,32 @@ function detectionStatusSelect(det) {
 // The events of other objects on the same night that made an event look like a systematic:
 // links to their objects (the nearest in time; the list is capped, n_similar is the total).
 function similarEventsDetails(ev) {
-  if (!ev.similar_events || ev.similar_events.length === 0) return null;
+  const listed = ev.similar_events || [];
+  const hidden = ev.n_similar_rejected || 0;
+  if (listed.length === 0 && hidden === 0) return null;
   const details = document.createElement("details");
   details.className = "similar-events";
   const total = ev.n_similar === null || ev.n_similar === undefined
-    ? ev.similar_events.length : ev.n_similar;
+    ? listed.length + hidden : ev.n_similar;
   const summary = document.createElement("summary");
   summary.textContent = `${total} similar event${total === 1 ? "" : "s"}`
-    + (ev.similar_events.length < total ? ` (nearest ${ev.similar_events.length} listed)` : "");
+    + (hidden ? `, ${hidden} rejected hidden` : "")
+    + (listed.length + hidden < total ? ` (nearest ${listed.length} listed)` : "");
   const expected = ev.n_expected === null || ev.n_expected === undefined
     ? "" : `expected ${fmtValue(ev.n_expected, 3)} by chance, p = ${fmtValue(ev.p_chance, 2)}`;
   summary.title = expected;
   details.appendChild(summary);
+  const plotAll = document.createElement("button");
+  plotAll.type = "button";
+  plotAll.textContent = "Plot all";
+  plotAll.title = "this event and its look-alikes, one light curve each, with a bulk verdict";
+  plotAll.addEventListener("click", async () => {
+    await loadSimilar(ev.det_id, false);
+    $("similar-window").scrollIntoView({ behavior: "smooth" });
+  });
+  details.appendChild(plotAll);
   const list = document.createElement("div");
-  for (const s of ev.similar_events) {
+  for (const s of listed) {
     const a = document.createElement("a");
     a.href = "#";
     const dt = ev.tc !== null && ev.tc !== undefined && s.tc !== null && s.tc !== undefined
@@ -553,6 +567,14 @@ function renderTransitEvents(events) {
       if (ev.incomplete_reason) td.title = `incomplete: ${ev.incomplete_reason}`;
       tr.appendChild(td);
     }
+    const tdNotes = document.createElement("td");
+    if (ev.notes) {
+      const notes = document.createElement("div");
+      notes.className = "event-notes";
+      notes.textContent = ev.notes;
+      tdNotes.appendChild(notes);
+    }
+    tr.appendChild(tdNotes);
     const tdStatus = document.createElement("td");
     tdStatus.appendChild(detectionStatusSelect(ev));
     const similar = similarEventsDetails(ev);
@@ -585,6 +607,7 @@ async function patchDetection(detId, body, ev) {
   }
   // the event changed the night's automatic evidence: pull the re-derived flags and reviews
   await refreshObject();
+  if (state.similar) loadSimilar(state.similar.detId, true);
   $("edit-status-msg").textContent = `event ${detId}: ${data.status}`;
 }
 
@@ -1037,19 +1060,57 @@ async function adoptPeriod(estId) {
   loadPhase(null);
 }
 
+// Buttons for the newest nights only; the older ones are in a select to the left of them.
+const RECENT_NIGHT_BUTTONS = 7;
+
+function nightLabel(night) {
+  return `${night.label} (${night.telescope || ""})`;
+}
+
 function renderNightButtons(obj, nights) {
   const container = $("night-buttons");
   container.innerHTML = "";
-  for (const night of nights) {
+  const byDate = nights.slice().sort(
+    (a, b) => String(a.night_date).localeCompare(String(b.night_date))
+  );
+  const older = byDate.slice(0, Math.max(0, byDate.length - RECENT_NIGHT_BUTTONS));
+  const recent = byDate.slice(older.length);
+  let olderSel = null;
+  if (older.length) {
+    olderSel = document.createElement("select");
+    olderSel.id = "lc-older-nights";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = `Older nights (${older.length})\u2026`;
+    olderSel.appendChild(placeholder);
+    for (const night of older.slice().reverse()) {
+      const opt = document.createElement("option");
+      opt.value = String(night.night_id);
+      opt.textContent = nightLabel(night);
+      opt.disabled = !night.has_lc;
+      olderSel.appendChild(opt);
+    }
+    olderSel.addEventListener("change", () => {
+      if (olderSel.value) loadNightLc(parseInt(olderSel.value));
+    });
+    container.appendChild(olderSel);
+  }
+  for (const night of recent) {
     const btn = document.createElement("button");
-    btn.textContent = `${night.label} (${night.telescope || ""})`;
-    btn.addEventListener("click", () => loadNightLc(night.night_id));
+    btn.textContent = nightLabel(night);
+    btn.addEventListener("click", () => {
+      if (olderSel) olderSel.value = "";
+      loadNightLc(night.night_id);
+    });
     container.appendChild(btn);
   }
   if (obj.n_nights >= 2) {
     const btn = document.createElement("button");
     btn.textContent = "All nights";
-    btn.addEventListener("click", loadCombinedLc);
+    btn.addEventListener("click", () => {
+      if (olderSel) olderSel.value = "";
+      loadCombinedLc();
+    });
     container.appendChild(btn);
   }
 }
@@ -1134,7 +1195,21 @@ async function saveNightReview(index, exopSel, varSel, noteInput, msgSpan) {
   renderNightReviews(nights, obj, `Saved night ${night.label}.`);
 }
 
+// The table of night reviews scrolls in a box tall enough for its header and exactly this many rows.
+const NIGHT_REVIEW_ROWS_SHOWN = 10;
+
+function sizeNightReviewScroll(box, nRows) {
+  box.style.maxHeight = "";
+  if (nRows <= NIGHT_REVIEW_ROWS_SHOWN) return;
+  const row = qsa("#detail-night-reviews tbody tr", box)[NIGHT_REVIEW_ROWS_SHOWN - 1];
+  // offsetTop counts from the top of the table, whose header row is part of it
+  const bottom = row ? row.offsetTop + row.offsetHeight : 0;
+  if (bottom > 0) box.style.maxHeight = `${bottom + 1}px`;
+}
+
 function renderNightReviews(nights, obj, message) {
+  const box = $("night-reviews-scroll");
+  const scrollTop = box.scrollTop; // a save re-renders the table: stay on the row being edited
   const tbody = qs("#detail-night-reviews tbody");
   tbody.innerHTML = "";
   nights.forEach((night, index) => {
@@ -1178,6 +1253,8 @@ function renderNightReviews(nights, obj, message) {
     tbody.appendChild(tr);
   });
   renderNightReviewSummary(nights, obj, message);
+  sizeNightReviewScroll(box, nights.length);
+  box.scrollTop = scrollTop;
 }
 
 function populatePeriodogramSelectors(periodograms) {
@@ -1247,9 +1324,11 @@ async function loadObject(objId) {
   renderRepeatFamilies(data);
   renderPeriodEstimates(data.period_estimates);
   renderNightButtons(data.object, data.nights);
+  $("night-reviews-scroll").scrollTop = 0; // another object: its table starts at the top
   renderNightReviews(data.nights, data.object);
   populatePeriodogramSelectors(data.periodograms);
   prefillEditBox(data.object);
+  clearSimilar();
   Plotly.purge("plot-lightcurve");
   Plotly.purge("plot-reference");
   Plotly.purge("plot-comparison");
@@ -1372,6 +1451,27 @@ function ownCurveRange(lc, yOf, useMag) {
   return useMag ? [hi + pad, lo - pad] : [lo - pad, hi + pad];
 }
 
+// The fitted trapezoid of a transit event (tc, T14, depth, ingress fraction) as a line trace of the
+// flux `baseline * (1 - depth * shape)`, mapped by `yOf`; for the night curve and the similar stack.
+function trapezoidTrace(ev, baseline, yOf) {
+  const t14 = ev.t14_h / 24.0;
+  const tau = Math.max(ev.ingress_frac * t14, 1e-3 * t14);
+  const xs = [];
+  const ys = [];
+  for (let k = 0; k <= 240; k++) {
+    const t = ev.tc + (k / 240 - 0.5) * 3.0 * t14;
+    const s = Math.min(1, Math.max(0, (t14 / 2 - Math.abs(t - ev.tc)) / tau));
+    xs.push(t - 2460000);
+    ys.push(yOf(baseline * (1 - ev.depth * s)));
+  }
+  return {
+    x: xs, y: ys, type: "scatter", mode: "lines", line: { color: "rgb(200,30,30)" },
+    name: `trapezoid fit (${ev.converged ? "converged" : "not converged"})`,
+    text: xs.map(() => `T14 ${ev.duration_display || ""}${ev.incomplete_reason ? " (incomplete: " + ev.incomplete_reason + ")" : ""}`),
+    hoverinfo: "x+y+text",
+  };
+}
+
 function plotNightLc(nightId, lc) {
   const x = lc.bjd_tdb.map((t) => t - 2460000);
   const finiteFlux = lc.flux.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
@@ -1420,24 +1520,7 @@ function plotNightLc(nightId, lc) {
       text: `T14 ${ev.duration_display || ""}${ev.incomplete_reason ? " (incomplete)" : ""}`,
     });
   }
-  for (const ev of fitted) {
-    const t14 = ev.t14_h / 24.0;
-    const tau = Math.max(ev.ingress_frac * t14, 1e-3 * t14);
-    const xs = [];
-    const ys = [];
-    for (let k = 0; k <= 240; k++) {
-      const t = ev.tc + (k / 240 - 0.5) * 3.0 * t14;
-      const s = Math.min(1, Math.max(0, (t14 / 2 - Math.abs(t - ev.tc)) / tau));
-      xs.push(t - 2460000);
-      ys.push(yOf(baseline * (1 - ev.depth * s)));
-    }
-    traces.push({
-      x: xs, y: ys, type: "scatter", mode: "lines", line: { color: "rgb(200,30,30)" },
-      name: `trapezoid fit (${ev.converged ? "converged" : "not converged"})`,
-      text: xs.map(() => `T14 ${ev.duration_display || ""}${ev.incomplete_reason ? " (incomplete: " + ev.incomplete_reason + ")" : ""}`),
-      hoverinfo: "x+y+text",
-    });
-  }
+  for (const ev of fitted) traces.push(trapezoidTrace(ev, baseline, yOf));
   const transit = nightEvents.length ? null : bestTransitForNight(nightId);
   if (transit) {
     const tc = transit.tc_bjd_tdb - 2460000;
@@ -1956,6 +2039,272 @@ function attachLightcurveEvents() {
   }
   gd.on("plotly_click", onLightcurveClick);
   gd.on("plotly_selected", fillRerunFromDrag);
+}
+
+// ---------------------------------------------------------------------
+// Similar events: the viewed transit event and its look-alikes (other objects' events of the same
+// night, nearest in time first) as a stack of light curves, with a bulk verdict on the ticked ones
+// ---------------------------------------------------------------------
+
+const SIMILAR_ROW_PX = 110; // height of one light curve of the stack
+const SIMILAR_MARGIN = { t: 24, b: 44, l: 60, r: 12 };
+const SIMILAR_GAP_PX = 10; // between two light curves, inside their row
+
+function clearSimilar() {
+  state.similarSeq += 1;
+  state.similar = null;
+  $("similar-window").hidden = true;
+  Plotly.purge("plot-similar");
+  $("similar-side").innerHTML = "";
+  $("similar-msg").textContent = "";
+  $("similar-show-rejected").checked = false;
+}
+
+// `keepChecked`: keep the ticks of the rows still listed (a reload for a changed verdict), else none.
+async function loadSimilar(detId, keepChecked) {
+  if (!state.currentObject) return;
+  const objId = state.currentObject.object.obj_id;
+  const same = state.similar !== null && state.similar.detId === detId;
+  if (!same) $("similar-show-rejected").checked = false;
+  const ticked = keepChecked && same ? state.similar.checked : new Set();
+  const seq = ++state.similarSeq;
+  const include = $("similar-show-rejected").checked ? 1 : 0;
+  $("similar-window").hidden = false;
+  const resp = await fetch(`/api/detection/${detId}/similar?include_rejected=${include}`);
+  let data = null;
+  try {
+    data = await resp.json();
+  } catch (err) {
+    data = null;
+  }
+  // another event, another object or a newer load took over while this one was on its way
+  if (seq !== state.similarSeq || !state.currentObject
+      || state.currentObject.object.obj_id !== objId) return;
+  if (!resp.ok) {
+    $("similar-msg").className = "warn";
+    $("similar-msg").textContent = errorText(data, `similar events failed (${resp.status})`);
+    return;
+  }
+  const rows = [data.anchor, ...data.events];
+  const listed = new Set(rows.map((r) => r.det_id));
+  state.similar = {
+    detId, data, rows, checked: new Set(Array.from(ticked).filter((id) => listed.has(id))),
+  };
+  renderSimilar();
+}
+
+function escapeLabel(text) {
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+}
+
+function renderSimilar() {
+  const s = state.similar;
+  const data = s.data;
+  const rows = s.rows;
+  const n = rows.length;
+  const anchor = rows[0];
+  const height = SIMILAR_MARGIN.t + n * SIMILAR_ROW_PX + SIMILAR_MARGIN.b;
+  const half = (SIMILAR_GAP_PX / 2) / (n * SIMILAR_ROW_PX); // half the gap, as a fraction
+  const traces = [];
+  const shapes = [];
+  const annotations = [];
+  const layout = {
+    height,
+    margin: { t: SIMILAR_MARGIN.t, b: SIMILAR_MARGIN.b, l: SIMILAR_MARGIN.l, r: SIMILAR_MARGIN.r },
+    showlegend: false,
+    hovermode: "closest",
+    shapes,
+    annotations,
+  };
+  rows.forEach((ev, i) => {
+    const ax = i === 0 ? "" : String(i + 1);
+    const top = 1 - i / n - half;
+    const bottom = 1 - (i + 1) / n + half;
+    layout[`yaxis${ax}`] = {
+      domain: [bottom, top], anchor: `x${ax}`, zeroline: false, showline: true, mirror: true,
+      tickfont: { size: 9 }, nticks: 4,
+    };
+    layout[`xaxis${ax}`] = {
+      domain: [0, 1], anchor: `y${ax}`, showline: true, mirror: true, showticklabels: i === n - 1,
+      ...(i === 0 ? {} : { matches: "x" }),
+      ...(i === n - 1 ? { title: { text: "BJD_TDB - 2460000" } } : {}),
+    };
+    if (ev.lc) {
+      traces.push({
+        x: ev.lc.bjd_tdb.map((t) => t - 2460000), y: ev.lc.flux, type: "scatter",
+        mode: "markers", marker: { size: 4 }, xaxis: `x${ax}`, yaxis: `y${ax}`,
+        error_y: { type: "data", array: ev.lc.flux_err, visible: true, thickness: 1, width: 0 },
+        name: ev.obj_name, hoverinfo: "x+y",
+      });
+    }
+    const fitted = ev.tc !== null && ev.depth !== null && ev.t14_h !== null
+      && ev.ingress_frac !== null && ev.ingress_frac !== undefined;
+    if (fitted) {
+      traces.push({ ...trapezoidTrace(ev, 1, (f) => f), xaxis: `x${ax}`, yaxis: `y${ax}` });
+    }
+    if (ev.tc !== null && ev.tc !== undefined) {
+      shapes.push({
+        type: "line", xref: `x${ax}`, yref: `y${ax} domain`, x0: ev.tc - 2460000,
+        x1: ev.tc - 2460000, y0: 0, y1: 1, line: { color: "rgba(200,30,30,0.6)", dash: "dot", width: 1 },
+      });
+    }
+    // the object's name (a link to it, but for the viewed event's own) and its offset in time
+    const dt = i > 0 && ev.tc !== null && anchor.tc !== null
+      ? `  dt ${((ev.tc - anchor.tc) * 1440).toFixed(1)} min` : "";
+    annotations.push({
+      xref: "paper", yref: "paper", x: 0.005, y: top, xanchor: "left", yanchor: "top",
+      showarrow: false, captureevents: i > 0, bgcolor: "rgba(255,255,255,0.75)",
+      font: { size: 11, color: i > 0 ? "#06c" : "#1a1a1a" },
+      text: `<b>${escapeLabel(ev.obj_name || `obj ${ev.obj_id}`)}</b>${dt}`
+        + (ev.lc ? "" : "  (no light curve)"),
+    });
+  });
+  const gd = $("plot-similar");
+  gd.style.height = `${height}px`;
+  Plotly.purge("plot-similar");
+  Plotly.newPlot("plot-similar", traces, layout, { responsive: true });
+  if (gd.on) {
+    // annotation i is row i
+    gd.on("plotly_clickannotation", (e) => {
+      const row = state.similar && state.similar.rows[e.index];
+      if (row && e.index > 0) loadObject(row.obj_id);
+    });
+  }
+  renderSimilarSide();
+
+  const capped = data.n_returned < data.n_total - data.n_rejected_hidden;
+  $("similar-count").textContent = data.n_total === 0
+    ? "No similar events for this one."
+    : `Showing ${capped ? "the nearest " : ""}${data.n_returned} of ${data.n_total} similar events`
+      + (data.n_rejected_hidden ? `; ${data.n_rejected_hidden} rejected hidden` : "") + ".";
+  $("similar-show-rejected-label").hidden = !(data.n_rejected > 0
+    || $("similar-show-rejected").checked);
+  $("similar-show-rejected-text").textContent = `show rejected (${data.n_rejected})`;
+}
+
+// One cell per row, positioned beside it: the status box (with the viewed event's notes) and a tick.
+function renderSimilarSide() {
+  const s = state.similar;
+  const side = $("similar-side");
+  side.innerHTML = "";
+  side.style.height = `${SIMILAR_MARGIN.t + s.rows.length * SIMILAR_ROW_PX + SIMILAR_MARGIN.b}px`;
+  s.rows.forEach((ev, i) => {
+    const cell = document.createElement("div");
+    cell.className = "similar-cell";
+    cell.style.top = `${SIMILAR_MARGIN.t + i * SIMILAR_ROW_PX}px`;
+    cell.style.height = `${SIMILAR_ROW_PX}px`;
+    const effective = ev.effective_status || "UNCONFIRMED";
+    const box = document.createElement("div");
+    box.className = `similar-status ${effective.split(" ")[0].toLowerCase()}`;
+    box.textContent = effective;
+    if (ev.auto_status === "REJECTED") {
+      box.title = effective === "REJECTED (auto)"
+        ? "rejected by the cross-candidate check; a person's CONFIRMED overrides it"
+        : `rejected by the cross-candidate check; the verdict ${ev.status} stands`;
+    }
+    if (i === 0) {
+      const tag = document.createElement("small");
+      tag.textContent = "viewed event";
+      box.appendChild(tag);
+    }
+    cell.appendChild(box);
+    const label = document.createElement("label");
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.checked = s.checked.has(ev.det_id);
+    check.addEventListener("change", () => {
+      if (check.checked) s.checked.add(ev.det_id);
+      else s.checked.delete(ev.det_id);
+      updateSimilarCheckAll();
+    });
+    label.appendChild(check);
+    label.appendChild(document.createTextNode(" select"));
+    cell.appendChild(label);
+    if (i === 0 && ev.notes) {
+      const notes = document.createElement("div");
+      notes.className = "similar-notes";
+      notes.textContent = ev.notes;
+      notes.title = ev.notes;
+      cell.appendChild(notes);
+    }
+    side.appendChild(cell);
+  });
+  updateSimilarCheckAll();
+}
+
+// The check-all box: checked when every row is ticked, indeterminate when only some are.
+function updateSimilarCheckAll() {
+  const s = state.similar;
+  const all = $("similar-check-all");
+  const count = s ? s.rows.filter((r) => s.checked.has(r.det_id)).length : 0;
+  all.checked = s !== null && count > 0 && count === s.rows.length;
+  all.indeterminate = s !== null && count > 0 && count < s.rows.length;
+}
+
+function onSimilarCheckAll() {
+  const s = state.similar;
+  if (!s) return;
+  s.checked = new Set($("similar-check-all").checked ? s.rows.map((r) => r.det_id) : []);
+  renderSimilarSide();
+}
+
+async function applySimilarReview() {
+  const s = state.similar;
+  const msg = $("similar-msg");
+  if (!s) return;
+  const status = $("similar-action").value;
+  const ticked = s.rows.filter((r) => s.checked.has(r.det_id));
+  msg.className = "warn";
+  if (!status) {
+    msg.textContent = "Choose an action first.";
+    return;
+  }
+  if (ticked.length === 0) {
+    msg.textContent = "Select at least one event.";
+    return;
+  }
+  const autoRejected = ticked.filter((r) => r.auto_status === "REJECTED").length;
+  if (status === "CONFIRMED" && autoRejected > 0 && !window.confirm(
+    `${autoRejected} of the ${ticked.length} selected event(s) were rejected automatically by the`
+    + " cross-candidate check (too many similar events on their night). CONFIRM them anyway?"
+  )) return;
+  const detId = s.detId;
+  $("similar-apply").disabled = true;
+  msg.className = "";
+  msg.textContent = "Applying...";
+  let resp = null;
+  let data = null;
+  try {
+    resp = await fetch("/api/detections/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        anchor_det_id: detId,
+        det_ids: ticked.map((r) => r.det_id),
+        status,
+        note: $("similar-notes").value.trim() || null,
+        note_mode: $("similar-notes-replace").checked ? "replace" : "append",
+      }),
+    });
+    data = await resp.json();
+  } catch (err) {
+    data = null;
+  } finally {
+    $("similar-apply").disabled = false;
+  }
+  if (!state.similar || state.similar.detId !== detId) return; // another event took over
+  if (!resp || !resp.ok) {
+    msg.className = "warn";
+    msg.textContent = errorText(data, `review failed (${resp ? resp.status : "no response"})`);
+    return;
+  }
+  msg.className = "";
+  msg.textContent = `${status} on ${data.updated.length} event(s).`;
+  $("similar-action").value = "";
+  $("similar-notes").value = "";
+  // the server is the truth: the rejected look-alikes drop out of the list and the Transit
+  // events table (the similar lists and the viewed event's notes) is redrawn
+  await Promise.all([loadSimilar(detId, false), refreshObject()]);
 }
 
 // ---------------------------------------------------------------------
@@ -2784,6 +3133,11 @@ function init() {
       }
     }
     plotPhase();
+  });
+  $("similar-check-all").addEventListener("change", onSimilarCheckAll);
+  $("similar-apply").addEventListener("click", applySimilarReview);
+  $("similar-show-rejected").addEventListener("change", () => {
+    if (state.similar) loadSimilar(state.similar.detId, true);
   });
   $("rerun-check").addEventListener("change", onRerunToggle);
   $("btn-rerun-list").addEventListener("click", () => {

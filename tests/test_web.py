@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import date
 from importlib import resources
 
 import numpy as np
@@ -822,6 +823,331 @@ def test_object_detail_carries_the_automatic_rejection_and_the_similar_events(
     assert event_a()["effective_status"] == "REJECTED"
     test_client.patch(f"/api/detection/{ids['det_a']}", json={"status": "UNCONFIRMED"})
     assert event_a()["effective_status"] == "REJECTED (auto)"
+
+
+# --------------------------------------------------------------------------
+# similar events: GET /api/detection/{det_id}/similar, POST /api/detections/review
+# --------------------------------------------------------------------------
+
+
+def _add_stack_lcs(test_conn, night_id: int, det_ids: list[int]) -> None:
+    """A night light curve (flux 2.0 / 2.2 / 1.8, error 0.01) for the object of each event."""
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT obj_id FROM relphot.detection WHERE det_id = ANY(%s) ORDER BY det_id",
+            (det_ids,),
+        )
+        for k, (obj_id,) in enumerate(cur.fetchall()):
+            cur.execute(
+                "INSERT INTO relphot.star_night (obj_id, night_id, star_id, tile, mag, "
+                "best_aperture, rms, expected_noise, chi2_reduced, n_epochs, is_comparison) "
+                "VALUES (%s, %s, %s, 0, 14.0, 1, 0.01, 0.01, 1.0, 3, false) "
+                "ON CONFLICT (obj_id, night_id) DO NOTHING",
+                (obj_id, night_id, 100 + k),
+            )
+            cur.execute(
+                "INSERT INTO relphot.lightcurve (obj_id, night_id, frame_index, bjd_tdb, flux, "
+                "flux_err, flux_raw) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (
+                    obj_id, night_id, [0, 1, 2], [2460310.5006, 2460310.5106, 2460310.5206],
+                    [2.0, 2.2, 1.8], [0.01, 0.01, 0.01], [2.0, 2.2, 1.8],
+                ),
+            )
+    test_conn.commit()
+
+
+def _det_state(test_conn, det_id: int) -> tuple[str, str | None, str | None]:
+    """``(status, notes, auto_status)`` of one detection, straight from the table."""
+    test_conn.rollback()
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, notes, auto_status FROM relphot.detection WHERE det_id = %s",
+            (det_id,),
+        )
+        return cur.fetchone()
+
+
+def _review(test_client, anchor: int, det_ids: list[int], status: str, **extra):
+    body = {"anchor_det_id": anchor, "det_ids": det_ids, "status": status, **extra}
+    return test_client.post("/api/detections/review", json=body)
+
+
+def test_similar_endpoint_shape_cap_order_and_anchor_first(client, test_conn) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids)
+    _add_stack_lcs(test_conn, ids["night1"], [ids["det_a"], similar[0], similar[1]])
+    url = f"/api/detection/{ids['det_a']}/similar"
+
+    resp = test_client.get(url)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert (data["n_total"], data["n_returned"], data["n_rejected_hidden"]) == (25, 25, 0)
+    # the viewed event first, with its own state; the look-alikes follow, nearest in tc first
+    anchor = data["anchor"]
+    assert (anchor["det_id"], anchor["obj_name"]) == (ids["det_a"], "RP BOTH01")
+    assert (anchor["status"], anchor["auto_status"]) == ("UNCONFIRMED", "REJECTED")
+    assert anchor["effective_status"] == "REJECTED (auto)"
+    assert anchor["night_label"] == "20250101"
+    assert anchor["ingress_frac"] is None  # the incomplete event has no full trapezoid
+    assert anchor["duration_display"] == "\u2265 2.00 h"
+    assert [e["det_id"] for e in data["events"]] == similar
+    first = data["events"][0]
+    assert (first["obj_name"], first["night_id"], first["night_label"]) == (
+        "RP SIM00", ids["night1"], "20250101"
+    )
+    assert first["tc"] == pytest.approx(2460310.52)
+    assert (first["depth"], first["t14_h"]) == (pytest.approx(0.011), pytest.approx(2.1))
+    assert (first["converged"], first["status"], first["notes"]) == (True, "UNCONFIRMED", None)
+    assert first["effective_status"] == "UNCONFIRMED"
+    # the light curve of the event's own night, flux over its median (2.0), one for each event
+    assert first["lc"]["flux"] == pytest.approx([1.0, 1.1, 0.9])
+    assert first["lc"]["flux_err"] == pytest.approx([0.005, 0.005, 0.005])
+    assert first["lc"]["bjd_tdb"][0] == pytest.approx(2460310.5006)
+    assert anchor["lc"]["flux"] == pytest.approx([1.0, 1.1, 0.9])
+    assert data["events"][2]["lc"] is None  # no light curve stored
+
+    capped = test_client.get(url, params={"limit": 10}).json()
+    assert (capped["n_total"], capped["n_returned"]) == (25, 10)
+    assert [e["det_id"] for e in capped["events"]] == similar[:10]
+    assert test_client.get(url, params={"limit": 0}).status_code == 422
+    assert test_client.get(url, params={"limit": 101}).status_code == 422
+
+    # an event with no coincidence row has no look-alikes; an unknown or non-transit id is a 404
+    lone = test_client.get(f"/api/detection/{ids['det_b']}/similar").json()
+    assert (lone["anchor"]["det_id"], lone["events"], lone["n_total"]) == (ids["det_b"], [], 0)
+    assert test_client.get("/api/detection/999999/similar").status_code == 404
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT det_id FROM relphot.detection WHERE kind = 'variable' LIMIT 1")
+        (variable_det,) = cur.fetchone()
+    assert test_client.get(f"/api/detection/{variable_det}/similar").status_code == 404
+
+
+def test_similar_hides_events_a_person_rejected_not_the_auto_veto(client, test_conn) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids)
+    url = f"/api/detection/{ids['det_a']}/similar"
+    # one look-alike a person rejected, one the check rejected automatically (stays listed)
+    test_client.patch(f"/api/detection/{similar[1]}", json={"status": "REJECTED"})
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.detection SET auto_status = 'REJECTED' WHERE det_id = %s",
+            (similar[3],),
+        )
+    test_conn.commit()
+
+    data = test_client.get(url).json()
+    assert [e["det_id"] for e in data["events"]] == similar[:1] + similar[2:]
+    assert (data["n_total"], data["n_returned"]) == (25, 24)
+    assert (data["n_rejected"], data["n_rejected_hidden"]) == (1, 1)
+    assert next(e for e in data["events"] if e["det_id"] == similar[3])["effective_status"] == (
+        "REJECTED (auto)"
+    )
+    shown = test_client.get(url, params={"include_rejected": 1}).json()
+    assert [e["det_id"] for e in shown["events"]] == similar
+    assert (shown["n_rejected"], shown["n_rejected_hidden"]) == (1, 0)
+    assert shown["events"][1]["status"] == "REJECTED"
+    # the cap counts what is listed, not what is hidden
+    assert test_client.get(url, params={"limit": 5}).json()["events"][1]["det_id"] == similar[2]
+
+    # the viewed event stays the first row even when it is the rejected one
+    test_client.patch(f"/api/detection/{ids['det_a']}", json={"status": "REJECTED"})
+    again = test_client.get(url).json()
+    assert (again["anchor"]["det_id"], again["anchor"]["status"]) == (ids["det_a"], "REJECTED")
+    assert [e["det_id"] for e in again["events"]] == similar[:1] + similar[2:]
+
+    # the Transit events table drops the rejected look-alike too (the next one moves up under
+    # the cap of 20) and counts it; the veto's own numbers stand
+    ev_a = test_client.get(f"/api/object/{ids['obj_both']}").json()["transit_events"][0]
+    assert [e["det_id"] for e in ev_a["similar_events"]] == similar[:1] + similar[2:21]
+    assert ev_a["n_similar_rejected"] == 1
+    assert (ev_a["n_similar"], ev_a["auto_status"]) == (25, "REJECTED")
+    assert ev_a["status"] == "REJECTED"
+
+
+def test_bulk_review_sets_status_notes_and_a_summary_on_the_viewed_event(
+    client, test_conn
+) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids, n=3)
+    today = date.today().isoformat()
+
+    resp = _review(test_client, ids["det_a"], similar, "REJECTED")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert [r["det_id"] for r in data["updated"]] == sorted(similar)
+    assert {r["status"] for r in data["updated"]} == {"REJECTED"}
+    assert {r["effective_status"] for r in data["updated"]} == {"REJECTED"}
+    for det_id in similar:
+        assert _det_state(test_conn, det_id) == ("REJECTED", None, None)  # no note given
+    # the viewed event: its own verdict untouched, a line about the action appended
+    status, notes, _auto = _det_state(test_conn, ids["det_a"])
+    assert status == "UNCONFIRMED"
+    names = ", ".join(f"RP SIM{k:02d} (det {d})" for k, d in enumerate(similar))
+    line = f"{today} REJECT ALL 3 look-alikes: {names}"
+    assert notes == line
+    assert data["anchor"] == {
+        "det_id": ids["det_a"], "obj_id": ids["obj_both"], "status": "UNCONFIRMED", "notes": line,
+    }
+    # the summary is appended, also to existing notes and with the user's note after a dash
+    resp = _review(test_client, ids["det_a"], similar[:1], "UNCONFIRMED", note="looked again")
+    assert resp.status_code == 200
+    assert _det_state(test_conn, ids["det_a"])[1] == (
+        f"{line}\n{today} UNCONFIRM ALL 1 look-alike: RP SIM00 (det {similar[0]}) "
+        "\u2014 looked again"
+    )
+    assert _det_state(test_conn, similar[0])[:2] == ("UNCONFIRMED", "looked again")
+    # a note on the viewed event shows in the Transit events table
+    ev_a = test_client.get(f"/api/object/{ids['obj_both']}").json()["transit_events"][0]
+    assert ev_a["notes"].startswith(line)
+
+
+def test_bulk_review_note_modes(client, test_conn) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids, n=3)
+    test_client.patch(f"/api/detection/{similar[0]}", json={"notes": "old"})
+
+    def notes() -> list[str | None]:
+        return [_det_state(test_conn, d)[1] for d in similar]
+
+    # append: after the old notes on a new line, alone where there are none
+    resp = _review(test_client, ids["det_a"], similar, "CONFIRMED", note="by eye")
+    assert resp.status_code == 200
+    assert notes() == ["old\nby eye", "by eye", "by eye"]
+    assert {_det_state(test_conn, d)[0] for d in similar} == {"CONFIRMED"}
+    # an empty note leaves the notes alone, in either mode
+    for extra in ({}, {"note": ""}, {"note": "  "}, {"note": None, "note_mode": "replace"},
+                  {"note": "", "note_mode": "replace"}):
+        resp = _review(test_client, ids["det_a"], similar, "UNCONFIRMED", **extra)
+        assert resp.status_code == 200
+        assert notes() == ["old\nby eye", "by eye", "by eye"]
+    # replace overwrites
+    resp = _review(test_client, ids["det_a"], similar, "REJECTED", note="fresh",
+                   note_mode="replace")
+    assert resp.status_code == 200
+    assert notes() == ["fresh", "fresh", "fresh"]
+    assert {_det_state(test_conn, d)[0] for d in similar} == {"REJECTED"}
+    # every action left its line on the viewed event, the replace did not touch it
+    anchor_notes = _det_state(test_conn, ids["det_a"])[1].splitlines()
+    assert len(anchor_notes) == 7
+    assert anchor_notes[-1].endswith("\u2014 fresh")
+    assert [line.split(" ")[1] for line in anchor_notes] == [
+        "CONFIRM", "UNCONFIRM", "UNCONFIRM", "UNCONFIRM", "UNCONFIRM", "UNCONFIRM", "REJECT",
+    ]
+
+
+def test_bulk_review_confirm_overrides_the_auto_rejection_and_refreshes_flags(
+    client, test_conn
+) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids, n=3)
+    obj = f"/api/object/{ids['obj_both']}"
+
+    def state() -> tuple:
+        o = test_client.get(obj).json()["object"]
+        return o["is_exop"], o["class"], o["n_review_pending"], o["n_nights_reviewed"]
+
+    # the viewed event (auto-rejected by the check) is among the ids: a CONFIRMED stands
+    resp = _review(test_client, ids["det_a"], [ids["det_a"], *similar], "CONFIRMED", note="real")
+    assert resp.status_code == 200
+    updated = {r["det_id"]: r for r in resp.json()["updated"]}
+    assert updated[ids["det_a"]]["effective_status"] == "CONFIRMED"
+    assert updated[ids["det_a"]]["auto_status"] == "REJECTED"
+    assert _det_state(test_conn, ids["det_a"])[2] == "REJECTED"  # the check's verdict stays
+    assert state()[:2] == (True, "EXOP")
+    night1 = next(
+        n for n in test_client.get(obj).json()["nights"] if n["night_id"] == ids["night1"]
+    )
+    assert night1["auto_exop"] is True  # evidence again, as for a single PATCH
+
+    # the viewed event in the ids: its status changes, and its notes are the user's note and
+    # then the one summary line (no second append), the others carry the user's note alone
+    today = date.today().isoformat()
+    resp = _review(test_client, ids["det_a"], [ids["det_a"], *similar[:2]], "REJECTED",
+                   note="dup", note_mode="replace")
+    assert resp.status_code == 200
+    status, notes, _auto = _det_state(test_conn, ids["det_a"])
+    names = f"RP SIM00 (det {similar[0]}), RP SIM01 (det {similar[1]})"
+    assert status == "REJECTED"
+    assert notes == f"dup\n{today} REJECT ALL viewed event + 2 look-alikes: {names} \u2014 dup"
+    assert resp.json()["anchor"]["notes"] == notes
+    assert next(r for r in resp.json()["updated"] if r["det_id"] == ids["det_a"])["notes"] == notes
+    assert _det_state(test_conn, similar[0])[:2] == ("REJECTED", "dup")
+    assert _det_state(test_conn, similar[2])[0] == "CONFIRMED"  # not in this request
+    assert state() == (True, "EXOP", 1, 1)  # the other event of the object still stands
+    # the viewed event is still the first row, now rejected; the rejected look-alikes are hidden
+    stack = test_client.get(f"/api/detection/{ids['det_a']}/similar").json()
+    assert (stack["anchor"]["det_id"], stack["anchor"]["status"]) == (ids["det_a"], "REJECTED")
+    assert [e["det_id"] for e in stack["events"]] == similar[2:]
+    assert stack["n_rejected_hidden"] == 2
+
+    # alone, the viewed event leaves no look-alike list; both events of the object rejected
+    resp = _review(test_client, ids["det_a"], [ids["det_b"], ids["det_a"]], "REJECTED")
+    assert resp.status_code == 200
+    assert _det_state(test_conn, ids["det_a"])[1].endswith(
+        f"{today} REJECT ALL viewed event + 1 look-alike: RP BOTH01 (det {ids['det_b']})"
+    )
+    assert state() == (False, "UNC", 0, 2)
+    resp = _review(test_client, ids["det_a"], [ids["det_a"]], "UNCONFIRMED")
+    assert resp.json()["anchor"]["notes"].endswith(f"{today} UNCONFIRM ALL viewed event")
+    assert state() == (False, "UNC", 0, 1)  # unconfirmed, the automatic rejection counts again
+    assert _review(test_client, ids["det_a"], [ids["det_a"]], "CONFIRMED").status_code == 200
+    assert state()[:2] == (True, "EXOP")
+
+
+def test_bulk_review_validation_and_atomicity(client, test_conn) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids, n=3)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT det_id FROM relphot.detection WHERE kind = 'variable' LIMIT 1")
+        (variable_det,) = cur.fetchone()
+
+    def untouched() -> bool:
+        return all(_det_state(test_conn, d) == ("UNCONFIRMED", None, a) for d, a in (
+            [(ids["det_a"], "REJECTED")] + [(d, None) for d in similar]
+        ))
+
+    anchor = ids["det_a"]
+    assert _review(test_client, anchor, similar, "MAYBE").status_code == 400
+    assert _review(test_client, anchor, similar, "REJECTED", note="x" * 2001).status_code == 400
+    # an unknown id, a non-transit id or an unknown viewed event: 404 naming it, nothing changes
+    resp = _review(test_client, anchor, [*similar, 999999], "REJECTED", note="n")
+    assert resp.status_code == 404
+    assert "999999" in resp.json()["detail"]
+    assert untouched()
+    resp = _review(test_client, anchor, [similar[0], variable_det], "REJECTED")
+    assert resp.status_code == 404
+    assert str(variable_det) in resp.json()["detail"]
+    assert untouched()
+    resp = _review(test_client, 999998, similar, "REJECTED")
+    assert resp.status_code == 404
+    assert "999998" in resp.json()["detail"]
+    assert untouched()
+    # malformed bodies
+    assert _review(test_client, anchor, [], "REJECTED").status_code == 422
+    assert _review(test_client, anchor, list(range(1, 102)), "REJECTED").status_code == 422
+    assert _review(test_client, anchor, similar, "REJECTED", note_mode="merge").status_code == 422
+    assert test_client.post("/api/detections/review", json={"det_ids": similar}).status_code == 422
+    assert untouched()
+    # 100 ids is the most; repeats count once
+    assert _review(test_client, anchor, similar + similar, "REJECTED").status_code == 200
+    assert _det_state(test_conn, anchor)[1].count("REJECT ALL 3 look-alikes") == 1
+
+
+def test_bulk_review_runs_as_the_web_role(client, test_conn, monkeypatch) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids, n=2)
+    ro_dsn = _role_dsn(_test_dsn(), "relphot_ro", "RELPHOT_RO_PASSWORD")
+    with (
+        psycopg.connect(ro_dsn, autocommit=True) as conn,
+        conn.cursor() as cur,
+        pytest.raises(psycopg.errors.InsufficientPrivilege),
+    ):
+        cur.execute("UPDATE relphot.detection SET notes = 'x'")
+    # the same request over the read-only role cannot write
+    monkeypatch.setenv("RELPHOT_WEB_RW_DSN", ro_dsn)
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        _review(test_client, ids["det_a"], similar, "REJECTED")
+    assert {_det_state(test_conn, d)[0] for d in similar} == {"UNCONFIRMED"}
 
 
 def _review_rows(test_conn, obj_id: int) -> list[tuple]:
@@ -1867,6 +2193,25 @@ def test_front_end_element_ids_exist() -> None:
         assert new_id in html_ids
 
 
+def test_front_end_has_the_similar_events_window_and_scroll_boxes() -> None:
+    """The similar-events window, the night-review scroll box and the older-nights select."""
+    static = resources.files("relphot.web") / "static"
+    html = (static / "index.html").read_text()
+    js = (static / "app.js").read_text()
+    html_ids = set(re.findall(r'\bid="([\w-]+)"', html))
+    for new_id in ("similar-window", "plot-similar", "similar-side", "similar-action",
+                   "similar-check-all", "similar-notes", "similar-notes-replace",
+                   "similar-apply", "similar-msg", "similar-count", "similar-show-rejected",
+                   "similar-show-rejected-label", "similar-show-rejected-text",
+                   "night-reviews-scroll"):
+        assert new_id in html_ids, new_id
+    # the window sits below the periodogram plot
+    assert html.index('id="plot-periodogram"') < html.index('id="similar-window"')
+    # the older-nights select is built by app.js (it exists only when there are older nights)
+    assert "lc-older-nights" in js
+    assert "/api/detection/" in js and "/api/detections/review" in js
+
+
 def _insert_guided_estimate(test_conn, obj_id: int, **kw) -> int:
     values = {
         "method": "LS-guided", "input": "tied", "night_ids": [1, 2], "n_nights": 2,
@@ -2728,6 +3073,7 @@ def test_front_end_element_ids_include_tile_member_controls() -> None:
         "btn-reference-lc", "btn-comparison-lc", "plot-reference", "plot-comparison",
         "comparison-order-select", "comparison-limit-select", "comparison-view-select",
         "tile-lc-note", "reference-members-details", "night-panel",
+        "night-reviews-scroll", "similar-window", "plot-similar",
     ]
     for req_id in required_ids:
         assert req_id in html_ids, f"Required id '{req_id}' not found in index.html"

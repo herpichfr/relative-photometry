@@ -269,7 +269,7 @@
         <thead>
           <tr><th>Night</th><th>tc (BJD-2460000)</th><th>Depth</th><th>T14</th>
               <th>Ingress T12/T14</th><th>Tier</th><th>Flags</th><th>Fit</th>
-              <th>Status</th><th></th></tr>
+              <th>Notes</th><th>Status</th><th></th></tr>
         </thead>
         <tbody></tbody>
       </table>
@@ -364,7 +364,7 @@
       evaluated automatically. Blank = use the automatic result. Literature (known planet/variable)
       always counts.</div>
     <div id="night-review-summary" class="note"></div>
-    <div class="table-scroll">
+    <div id="night-reviews-scroll" class="table-scroll">
       <table id="detail-night-reviews">
         <thead>
           <tr><th>Night</th><th>Auto EXOP</th><th>Auto VAR</th><th>EXOP</th><th>VAR</th>
@@ -585,6 +585,42 @@
     </div>
     <div id="periodogram-message"></div>
     <div id="plot-periodogram" class="plot"></div>
+
+    <div id="similar-window" hidden>
+      <h3>Similar events</h3>
+      <div class="note">The viewed transit event (first) and the look-alikes the cross-candidate check
+        found for it (other objects' events of the same night, nearest in time first), one light
+        curve each. A bulk verdict applies to the selected events; a look-alike you REJECT leaves
+        this list and the Transit events table. A line about the action is added to the viewed
+        event's notes.</div>
+      <div class="button-row similar-controls">
+        <div class="similar-action-box">
+          <select id="similar-action">
+            <option value="">-</option>
+            <option value="CONFIRMED">CONFIRM ALL</option>
+            <option value="REJECTED">REJECT ALL</option>
+            <option value="UNCONFIRMED">UNCONFIRM ALL</option>
+          </select>
+          <label><input type="checkbox" id="similar-check-all"> all / none</label>
+        </div>
+        <label class="similar-notes-box">Notes
+          <textarea id="similar-notes" rows="2" maxlength="2000"
+            placeholder="added to every selected event"></textarea>
+        </label>
+        <label><input type="checkbox" id="similar-notes-replace"> replace existing notes</label>
+        <button type="button" id="similar-apply">Apply</button>
+        <label id="similar-show-rejected-label" hidden>
+          <input type="checkbox" id="similar-show-rejected">
+          <span id="similar-show-rejected-text"></span>
+        </label>
+      </div>
+      <div id="similar-msg"></div>
+      <div id="similar-count" class="note"></div>
+      <div class="similar-body">
+        <div id="plot-similar"></div>
+        <div id="similar-side"></div>
+      </div>
+    </div>
   </section>
 </main>
 
