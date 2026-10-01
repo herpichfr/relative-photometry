@@ -2317,6 +2317,107 @@ def test_front_end_pins_every_per_night_time_axis_to_the_nights_window() -> None
     assert "nightXRange" not in body("plotCombinedLc") + body("plotPhase")
 
 
+def _js_function_body(js: str, name: str) -> str:
+    start = js.index(f"function {name}(")
+    return js[start : js.index("\nfunction ", start + 1)]
+
+
+def test_front_end_draws_a_residual_panel_under_fitted_light_curves() -> None:
+    """Both the night's light curve and the similar-events stack draw the trapezoid's residuals
+    (obs - model) in a panel whose x axis is matched to the curve's, with dashed mean/P16/P84."""
+    js = (resources.files("relphot.web") / "static" / "app.js").read_text()
+
+    def body(name: str) -> str:
+        return _js_function_body(js, name)
+
+    # one residual helper, one drawn model: the drawn curve and the residuals share the shape
+    assert "trapezoidShape(ev, t)" in body("trapezoidTrace")
+    assert "trapezoidShape(ev, t)" in body("trapezoidModelFlux")
+    assert "trapezoidModelFlux(events, baseline, bjd[i])" in body("lcResiduals")
+    assert "yOf(flux[i]) - yOf(trapezoidModelFlux" in body("lcResiduals")
+    # the night curve: the drawn events, the plot's own transform and errors, a matched x axis
+    night = body("plotNightLc")
+    assert "lcResiduals(lc.bjd_tdb, lc.flux, yErr, fitted, baseline, yOf" in night
+    assert "residualTraces(res" in night and "residualXAxis(xRange" in night
+    assert "residualYAxis(" in night and "useMag" in night.split("residualYAxis(")[1]
+    assert "error_y: { type: \"data\", visible: true, array: yErr }" in night
+    # the stack: only rows with a fit and a light curve get a panel, from the same layout numbers
+    sim = body("renderSimilar")
+    assert "similarResidual" in sim and "residualTraces(res" in sim and "residualXAxis(" in sim
+    assert "similarRowLayout(s.resid)" in sim
+    assert "similarRowLayout(s.resid)" in body("renderSimilarSide")
+    side = body("renderSimilarSide")
+    assert "rl.tops[i]" in side and "rl.heights[i]" in side
+    assert "!ev.lc || !similarHasFit(ev)" in body("similarResidual")
+    assert "similarHasFit(ev)" in sim
+    # the x axis is matched to the light curve's and pinned like it; ticks only on the bottom panel
+    assert 'matches: "x"' in body("residualXAxis")
+    assert "range: xRange" in body("residualXAxis")
+    assert "showticklabels: bottom" in body("residualXAxis")
+    assert "zeroline: true" in body("residualYAxis")
+    # percentiles by linear interpolation; the three dashed lines, the mean darker
+    assert "q * (sorted.length - 1)" in body("quantileSorted")
+    assert "(pos - lo)" in body("quantileSorted")
+    stats = body("residualStats")
+    assert "quantileSorted(sorted, 0.16)" in stats and "quantileSorted(sorted, 0.84)" in stats
+    lines = body("residualTraces")
+    assert 'dash: "dash"' in lines
+    for label in ('"mean"', '"P16"', '"P84"'):
+        assert label in lines
+    assert "rgb(20,20,20)" in lines and "rgb(130,130,130)" in lines
+    # the time marker spans the whole figure (paper), so it also crosses the residual panel
+    assert 'yref: "paper"' in body("applyTimeMarker")
+
+
+def test_front_end_residual_statistics_are_numerically_right() -> None:
+    """Run the percentile / residual helpers of app.js under node (skipped without node)."""
+    import json
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    js = (resources.files("relphot.web") / "static" / "app.js").read_text()
+    names = ("trapezoidShape", "trapezoidModelFlux", "quantileSorted", "residualStats",
+             "lcResiduals")
+    src = "\n".join(_js_function_body(js, name) for name in names)
+    script = src + """
+const ev = { tc: 10.0, t14_h: 2.4, ingress_frac: 0.25, depth: 0.01 };
+const ev2 = { tc: 10.0, t14_h: 2.4, ingress_frac: 0.25, depth: 0.02 };
+const out = {
+  q: [0, 0.16, 0.5, 0.84, 1].map((q) => quantileSorted([1, 2, 3, 4], q)),
+  stats: residualStats([4, 1, 3, 2]),
+  few: residualStats([1]),
+  centre: trapezoidModelFlux([ev], 1, 10.0),
+  edge: trapezoidModelFlux([ev], 2, 10.0 + 0.0501),
+  both: trapezoidModelFlux([ev, ev2], 1, 10.0),
+  res: lcResiduals([10.0, 11.0, NaN, 12.0], [0.99, 1.002, 1.0, null], [0.001, 0.001, 0.001, 0.001],
+                   [ev], 1, (f) => f, ["a", "b", "c", "d"]),
+  mag: lcResiduals([11.0], [1.0], [0.001], [ev], 1, (f) => 20 - 2.5 * Math.log10(f), null),
+};
+console.log(JSON.stringify(out));
+"""
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
+    out = json.loads(done.stdout)
+    assert out["q"] == pytest.approx([1.0, 1.48, 2.5, 3.52, 4.0])
+    assert out["stats"]["mean"] == pytest.approx(2.5)
+    assert out["stats"]["p16"] == pytest.approx(1.48)
+    assert out["stats"]["p84"] == pytest.approx(3.52)
+    assert out["few"] is None
+    assert out["centre"] == pytest.approx(0.99)  # baseline * (1 - depth) on the flat bottom
+    assert out["edge"] == pytest.approx(2.0, rel=0.01)  # outside / on the ramp: near the baseline
+    assert out["both"] == pytest.approx(0.99 * 0.98)  # overlapping events multiply
+    res = out["res"]  # the NaN epoch and the null flux are skipped
+    assert res["x"] == pytest.approx([-2459990.0, -2459989.0])
+    assert res["y"] == pytest.approx([0.99 - 0.99, 1.002 - 1.0])
+    assert res["text"] == ["a", "b"]
+    assert res["stats"]["mean"] == pytest.approx(0.001)
+    assert out["mag"]["y"] == pytest.approx([0.0], abs=1e-12)  # same transform on obs and model
+
+
 def _insert_guided_estimate(test_conn, obj_id: int, **kw) -> int:
     values = {
         "method": "LS-guided", "input": "tied", "night_ids": [1, 2], "n_nights": 2,

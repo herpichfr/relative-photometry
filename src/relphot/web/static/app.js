@@ -1484,18 +1484,25 @@ function ownCurveRange(lc, yOf, useMag) {
   return useMag ? [hi + pad, lo - pad] : [lo - pad, hi + pad];
 }
 
+// The fitted trapezoid's shape at time `t` (BJD_TDB): 0 outside the transit, 1 on its flat bottom,
+// a linear ramp of width ingress_frac * T14 on each side. The model flux is
+// `baseline * (1 - depth * shape)`; the drawn curve and the residuals both come from this.
+function trapezoidShape(ev, t) {
+  const t14 = ev.t14_h / 24.0;
+  const tau = Math.max(ev.ingress_frac * t14, 1e-3 * t14);
+  return Math.min(1, Math.max(0, (t14 / 2 - Math.abs(t - ev.tc)) / tau));
+}
+
 // The fitted trapezoid of a transit event (tc, T14, depth, ingress fraction) as a line trace of the
 // flux `baseline * (1 - depth * shape)`, mapped by `yOf`; for the night curve and the similar stack.
 function trapezoidTrace(ev, baseline, yOf) {
   const t14 = ev.t14_h / 24.0;
-  const tau = Math.max(ev.ingress_frac * t14, 1e-3 * t14);
   const xs = [];
   const ys = [];
   for (let k = 0; k <= 240; k++) {
     const t = ev.tc + (k / 240 - 0.5) * 3.0 * t14;
-    const s = Math.min(1, Math.max(0, (t14 / 2 - Math.abs(t - ev.tc)) / tau));
     xs.push(t - 2460000);
-    ys.push(yOf(baseline * (1 - ev.depth * s)));
+    ys.push(yOf(baseline * (1 - ev.depth * trapezoidShape(ev, t))));
   }
   return {
     x: xs, y: ys, type: "scatter", mode: "lines", line: { color: "rgb(200,30,30)" },
@@ -1505,6 +1512,125 @@ function trapezoidTrace(ev, baseline, yOf) {
   };
 }
 
+// ---------------------------------------------------------------------
+// Residuals (obs - model) of the fitted trapezoid, in a small panel under the light curve
+// ---------------------------------------------------------------------
+
+// The model flux at time `t` (BJD_TDB) of the events drawn on a light curve: the product of their
+// transmissions `1 - depth * shape`, times `baseline`. For one event this is exactly the curve
+// `trapezoidTrace` draws; events that do not overlap in time do not disturb each other, and two
+// that overlap multiply (the star is dimmed by both).
+function trapezoidModelFlux(events, baseline, t) {
+  return events.reduce((m, ev) => m * (1 - ev.depth * trapezoidShape(ev, t)), baseline);
+}
+
+// The q-th quantile (0 to 1) of an ascending array, by linear interpolation between the order
+// statistics at position q * (n - 1) (numpy's default method). Needs at least one value.
+function quantileSorted(sorted, q) {
+  const pos = q * (sorted.length - 1);
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+// Mean and the 16th and 84th percentiles (the +-1 sigma band of a normal distribution) of the
+// residuals; null with fewer than two of them.
+function residualStats(values) {
+  if (values.length < 2) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  return {
+    mean: values.reduce((a, b) => a + b, 0) / values.length,
+    p16: quantileSorted(sorted, 0.16),
+    p84: quantileSorted(sorted, 0.84),
+  };
+}
+
+// The residuals obs - model of a light curve at its own epochs, in the plot's units: `yOf` maps a
+// flux to the plotted value (relative flux, or magnitude), so the model goes through the same
+// transform as the curve, `baseline` and `events` being the ones the overlay uses. `bjd` is
+// BJD_TDB, `yErr` the plotted errors, `labels` optional hover text. Points whose flux, epoch or
+// residual is not finite are skipped. Returns {x (BJD_TDB - 2460000), y, err, text, stats}.
+function lcResiduals(bjd, flux, yErr, events, baseline, yOf, labels) {
+  const out = { x: [], y: [], err: [], text: labels ? [] : null, stats: null };
+  for (let i = 0; i < bjd.length; i++) {
+    if (!Number.isFinite(bjd[i]) || !Number.isFinite(flux[i])) continue;
+    const r = yOf(flux[i]) - yOf(trapezoidModelFlux(events, baseline, bjd[i]));
+    if (!Number.isFinite(r)) continue;
+    out.x.push(bjd[i] - 2460000);
+    out.y.push(r);
+    out.err.push(Number.isFinite(yErr[i]) ? yErr[i] : null);
+    if (labels) out.text.push(labels[i]);
+  }
+  out.stats = residualStats(out.y);
+  return out;
+}
+
+// The traces of a residual panel on `axes` ({x: "x2", y: "y2"}): the points with their errors and,
+// when there are at least two, three dashed horizontal lines across `xRange` (the night window, else
+// the points' extent): the mean (dark, thicker) and the 16th and 84th percentiles (grey). The lines
+// carry their value in the name (legend) and on hover. `opts`: markerSize, legend (show legend
+// entries), meta (for the click handler).
+function residualTraces(res, axes, xRange, opts) {
+  const where = { type: "scatter", xaxis: axes.x, yaxis: axes.y };
+  const traces = [{
+    ...where, x: res.x, y: res.y, mode: "markers", marker: { size: opts.markerSize, color: "#555" },
+    error_y: {
+      type: "data", visible: true, array: res.err, thickness: 1, width: 0,
+      color: "rgba(85,85,85,0.5)",
+    },
+    text: res.text || undefined, hoverinfo: res.text ? "x+y+text" : "x+y",
+    name: "O−C (obs − model)", legendgroup: "residuals", showlegend: opts.legend, meta: opts.meta,
+  }];
+  if (res.stats) {
+    const lo = xRange ? xRange[0] : Math.min(...res.x);
+    const hi = xRange ? xRange[1] : Math.max(...res.x);
+    // 41 vertices, so a hover finds the line anywhere along it
+    const xs = Array.from({ length: 41 }, (_, k) => lo + (hi - lo) * k / 40);
+    const lines = [
+      ["mean", res.stats.mean, { color: "rgb(20,20,20)", width: 1.6 }],
+      ["P16", res.stats.p16, { color: "rgb(130,130,130)", width: 1 }],
+      ["P84", res.stats.p84, { color: "rgb(130,130,130)", width: 1 }],
+    ];
+    for (const [label, value, line] of lines) {
+      traces.push({
+        ...where, x: xs, y: xs.map(() => value), mode: "lines", line: { ...line, dash: "dash" },
+        name: `${label} ${value.toPrecision(3)}`, legendgroup: "residuals",
+        showlegend: opts.legend, hoverinfo: "name+x", meta: opts.meta,
+      });
+    }
+  }
+  return traces;
+}
+
+// x axis of a residual panel: matched to the light curve's x axis (shared zoom and pan), the same
+// pinned night window; tick labels and the title only on the bottom panel of the figure.
+function residualXAxis(xRange, anchorY, bottom) {
+  return {
+    domain: [0, 1], anchor: anchorY, matches: "x", showline: true, mirror: true,
+    showticklabels: bottom,
+    ...(bottom ? { title: { text: "BJD_TDB - 2460000" } } : {}),
+    ...(xRange ? { range: xRange, autorange: false } : {}),
+  };
+}
+
+// y axis of a residual panel: the zero line (kept in view) marks a perfect fit. In magnitudes the
+// axis is reversed like the light curve's (brighter than the model is up).
+function residualYAxis(domain, anchorX, title, reversed, small) {
+  return {
+    domain, anchor: anchorX, title: { text: title, standoff: small ? 2 : 6, font: { size: small ? 9 : 12 } },
+    showline: true, mirror: true, zeroline: true, zerolinecolor: "rgba(0,0,0,0.5)",
+    zerolinewidth: 1, rangemode: "tozero", nticks: small ? 3 : 4,
+    tickfont: { size: small ? 8 : 10 },
+    ...(reversed ? { autorange: "reversed" } : {}),
+  };
+}
+
+// The night's light curve with a residual panel: total plot height, and the panel's share of the
+// plot area and the gap above it (fractions of the plot area, bottom up).
+const NIGHT_LC_RESIDUAL_HEIGHT_PX = 560;
+const NIGHT_RESIDUAL_FRAC = 0.23;
+const NIGHT_RESIDUAL_GAP = 0.04;
+
 function plotNightLc(nightId, lc) {
   const x = lc.bjd_tdb.map((t) => t - 2460000);
   const finiteFlux = lc.flux.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
@@ -1512,12 +1638,10 @@ function plotNightLc(nightId, lc) {
   // magnitudes: the night's apparent mean magnitude + delta mag = -2.5 log10(flux / median)
   const useMag = lcUnit() === "mag" && lc.app_mag !== null && lc.app_mag !== undefined;
   const yOf = (f) => (useMag ? lc.app_mag - 2.5 * Math.log10(f / baseline) : f);
+  const yErr = useMag ? lc.flux.map((f, i) => 1.0857 * lc.flux_err[i] / f) : lc.flux_err;
   const trace = {
     x, y: lc.flux.map(yOf), type: "scatter", mode: "markers",
-    error_y: {
-      type: "data", visible: true,
-      array: useMag ? lc.flux.map((f, i) => 1.0857 * lc.flux_err[i] / f) : lc.flux_err,
-    },
+    error_y: { type: "data", visible: true, array: yErr },
     text: lc.frame_index.map((fi, i) => `frame ${fi}<br>${lc.file_name[i] || ""}<br>airmass ${lc.airmass[i]}`
       + `<br>flux ${(lc.flux[i] / baseline).toFixed(4)} (${(-2.5 * Math.log10(lc.flux[i] / baseline)).toFixed(4)} mag)`),
     hoverinfo: "x+y+text",
@@ -1578,7 +1702,7 @@ function plotNightLc(nightId, lc) {
     yaxis.autorange = false;
   }
   const xRange = nightXRange(lc.t_first, lc.t_last);
-  Plotly.newPlot("plot-lightcurve", traces, {
+  const layout = {
     xaxis: nightXAxis(xRange),
     yaxis,
     shapes,
@@ -1586,7 +1710,25 @@ function plotNightLc(nightId, lc) {
     margin: { t: 20 },
     dragmode: lightcurveDragmode(),
     selectdirection: "h",
-  }, nightPlotConfig(xRange));
+  };
+  // with a trapezoid fit: a residual panel (obs - model of the drawn events) under the curve,
+  // sharing its x axis; without one the plot is as it was
+  const res = fitted.length
+    ? lcResiduals(lc.bjd_tdb, lc.flux, yErr, fitted, baseline, yOf,
+      lc.frame_index.map((fi) => `frame ${fi}`))
+    : null;
+  if (res && res.x.length) {
+    traces.push(...residualTraces(res, { x: "x2", y: "y2" }, xRange,
+      { markerSize: 5, legend: true, meta: { night_id: nightId } }));
+    layout.height = NIGHT_LC_RESIDUAL_HEIGHT_PX;
+    delete layout.xaxis.title;
+    layout.xaxis.showticklabels = false;
+    yaxis.domain = [NIGHT_RESIDUAL_FRAC + NIGHT_RESIDUAL_GAP, 1];
+    layout.xaxis2 = residualXAxis(xRange, "y2", true);
+    layout.yaxis2 = residualYAxis([0, NIGHT_RESIDUAL_FRAC], "x2",
+      useMag ? "O−C (mag)" : "O−C (flux)", useMag, false);
+  }
+  Plotly.newPlot("plot-lightcurve", traces, layout, nightPlotConfig(xRange));
   attachLightcurveEvents();
   applyTimeMarker("plot-lightcurve");
 }
@@ -2085,6 +2227,9 @@ function attachLightcurveEvents() {
 const SIMILAR_ROW_PX = 110; // height of one light curve of the stack
 const SIMILAR_MARGIN = { t: 24, b: 44, l: 60, r: 12 };
 const SIMILAR_GAP_PX = 10; // between two light curves, inside their row
+// a row with a trapezoid fit and a light curve is this much taller: a residual panel of
+// SIMILAR_RES_PX - SIMILAR_GAP_PX / 2 under the curve, half a gap above it
+const SIMILAR_RES_PX = 45;
 
 function clearSimilar() {
   state.similarSeq += 1;
@@ -2133,14 +2278,48 @@ function escapeLabel(text) {
   return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;");
 }
 
+// An event's trapezoid is fully known (it is drawn in the stack).
+function similarHasFit(ev) {
+  return ev.tc !== null && ev.depth !== null && ev.t14_h !== null
+    && ev.ingress_frac !== null && ev.ingress_frac !== undefined;
+}
+
+// The residuals (obs - model, relative flux) of a row of the stack, or null when it has no fit, no
+// light curve or no finite residual: then it has no residual panel. The stack's curves are the
+// flux over the night's median, so the drawn trapezoid has baseline 1.
+function similarResidual(ev) {
+  if (!ev.lc || !similarHasFit(ev)) return null;
+  const res = lcResiduals(ev.lc.bjd_tdb, ev.lc.flux, ev.lc.flux_err, [ev], 1, (f) => f, null);
+  return res.x.length ? res : null;
+}
+
+// Where each row of the stack sits, in px from the top of the plot area: a row is
+// SIMILAR_ROW_PX tall, SIMILAR_RES_PX more with a residual panel. `resid` is one entry per row
+// (null: no panel). The plot's domains and the right-hand cells are both computed from this.
+function similarRowLayout(resid) {
+  const heights = resid.map((r) => SIMILAR_ROW_PX + (r ? SIMILAR_RES_PX : 0));
+  const tops = [];
+  let acc = 0;
+  for (const h of heights) {
+    tops.push(acc);
+    acc += h;
+  }
+  return { heights, tops, plot: acc, total: SIMILAR_MARGIN.t + acc + SIMILAR_MARGIN.b };
+}
+
 function renderSimilar() {
   const s = state.similar;
   const data = s.data;
   const rows = s.rows;
   const n = rows.length;
   const anchor = rows[0];
-  const height = SIMILAR_MARGIN.t + n * SIMILAR_ROW_PX + SIMILAR_MARGIN.b;
-  const half = (SIMILAR_GAP_PX / 2) / (n * SIMILAR_ROW_PX); // half the gap, as a fraction
+  s.resid = rows.map(similarResidual);
+  const rl = similarRowLayout(s.resid);
+  const height = rl.total;
+  const half = SIMILAR_GAP_PX / 2;
+  const lcPx = SIMILAR_ROW_PX - SIMILAR_GAP_PX; // the curve itself, in a row of either height
+  const frac = (px) => 1 - px / rl.plot; // px from the top of the plot area -> paper fraction
+  let nextAxis = n + 1; // axis numbers n + 1, ... go to the residual panels
   // all rows share the anchor's night: every row spans that night's window (first to last frame)
   const xRange = nightXRange(data.t_first, data.t_last);
   const traces = [];
@@ -2156,18 +2335,30 @@ function renderSimilar() {
   };
   rows.forEach((ev, i) => {
     const ax = i === 0 ? "" : String(i + 1);
-    const top = 1 - i / n - half;
-    const bottom = 1 - (i + 1) / n + half;
+    const res = s.resid[i];
+    const top = frac(rl.tops[i] + half);
+    const bottom = frac(rl.tops[i] + half + lcPx);
     layout[`yaxis${ax}`] = {
       domain: [bottom, top], anchor: `x${ax}`, zeroline: false, showline: true, mirror: true,
       tickfont: { size: 9 }, nticks: 4,
     };
+    // the bottom panel of the figure carries the tick labels and the title
+    const lastHere = i === n - 1 && !res;
     layout[`xaxis${ax}`] = {
-      domain: [0, 1], anchor: `y${ax}`, showline: true, mirror: true, showticklabels: i === n - 1,
+      domain: [0, 1], anchor: `y${ax}`, showline: true, mirror: true, showticklabels: lastHere,
       ...(i === 0 ? {} : { matches: "x" }),
-      ...(i === n - 1 ? { title: { text: "BJD_TDB - 2460000" } } : {}),
+      ...(lastHere ? { title: { text: "BJD_TDB - 2460000" } } : {}),
       ...(xRange ? { range: xRange, autorange: false } : {}),
     };
+    if (res) {
+      const rax = String(nextAxis++);
+      const resTop = frac(rl.tops[i] + 2 * half + lcPx);
+      layout[`yaxis${rax}`] = residualYAxis(
+        [frac(rl.tops[i] + rl.heights[i] - half), resTop], `x${rax}`, "O−C", false, true);
+      layout[`xaxis${rax}`] = residualXAxis(xRange, `y${rax}`, i === n - 1);
+      traces.push(...residualTraces(res, { x: `x${rax}`, y: `y${rax}` }, xRange,
+        { markerSize: 3, legend: false }));
+    }
     if (ev.lc) {
       traces.push({
         x: ev.lc.bjd_tdb.map((t) => t - 2460000), y: ev.lc.flux, type: "scatter",
@@ -2176,9 +2367,7 @@ function renderSimilar() {
         name: ev.obj_name, hoverinfo: "x+y",
       });
     }
-    const fitted = ev.tc !== null && ev.depth !== null && ev.t14_h !== null
-      && ev.ingress_frac !== null && ev.ingress_frac !== undefined;
-    if (fitted) {
+    if (similarHasFit(ev)) {
       traces.push({ ...trapezoidTrace(ev, 1, (f) => f), xaxis: `x${ax}`, yaxis: `y${ax}` });
     }
     if (ev.tc !== null && ev.tc !== undefined) {
@@ -2226,12 +2415,13 @@ function renderSimilarSide() {
   const s = state.similar;
   const side = $("similar-side");
   side.innerHTML = "";
-  side.style.height = `${SIMILAR_MARGIN.t + s.rows.length * SIMILAR_ROW_PX + SIMILAR_MARGIN.b}px`;
+  const rl = similarRowLayout(s.resid);
+  side.style.height = `${rl.total}px`;
   s.rows.forEach((ev, i) => {
     const cell = document.createElement("div");
     cell.className = "similar-cell";
-    cell.style.top = `${SIMILAR_MARGIN.t + i * SIMILAR_ROW_PX}px`;
-    cell.style.height = `${SIMILAR_ROW_PX}px`;
+    cell.style.top = `${SIMILAR_MARGIN.t + rl.tops[i]}px`;
+    cell.style.height = `${rl.heights[i]}px`;
     const effective = ev.effective_status || "UNCONFIRMED";
     const box = document.createElement("div");
     box.className = `similar-status ${effective.split(" ")[0].toLowerCase()}`;
