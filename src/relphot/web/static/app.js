@@ -1368,6 +1368,39 @@ function lcUnit() {
   return $("lc-unit-select").value;
 }
 
+// Every per-night time axis (the night's light curve with its ratio curves, the reference and
+// comparison curves, the similar-events stack) spans the same window: from the time of the night's
+// first frame to its last one (`t_first` / `t_last` of the payload, BJD_TDB), not the extent of
+// a star's own points, which can have gaps or lack the first and last epochs. The window is padded
+// by 2 % of its span on each side (at least a minute) so the end points are off the frame edge.
+// Returns [lo, hi] in BJD_TDB - 2460000, or null when the night has no frame times.
+const NIGHT_X_PAD = 0.02;
+
+function nightXRange(tFirst, tLast) {
+  if (!Number.isFinite(tFirst) || !Number.isFinite(tLast)) return null;
+  const pad = Math.max(NIGHT_X_PAD * (tLast - tFirst), 1 / 1440);
+  return [tFirst - 2460000 - pad, tLast - 2460000 + pad];
+}
+
+// The x axis of a per-night plot: pinned to `range` (autorange off). A double click, like the
+// mode bar's "Reset axes", returns to the range the plot was drawn with; Plotly's default
+// ("reset+autosize") would autorange to the data the second time, so the plot asks for "reset",
+// and the mode bar's "Autoscale", which would do the same, is left out.
+function nightXAxis(range) {
+  const axis = { title: { text: "BJD_TDB - 2460000" } };
+  if (range) {
+    axis.range = range;
+    axis.autorange = false;
+  }
+  return axis;
+}
+
+function nightPlotConfig(range) {
+  return range
+    ? { responsive: true, doubleClick: "reset", modeBarButtonsToRemove: ["autoScale2d"] }
+    : { responsive: true };
+}
+
 function replotLightcurve() {
   const v = state.lcView;
   if (!v) return;
@@ -1544,15 +1577,16 @@ function plotNightLc(nightId, lc) {
     yaxis.range = ownRange;
     yaxis.autorange = false;
   }
+  const xRange = nightXRange(lc.t_first, lc.t_last);
   Plotly.newPlot("plot-lightcurve", traces, {
-    xaxis: { title: { text: "BJD_TDB - 2460000" } },
+    xaxis: nightXAxis(xRange),
     yaxis,
     shapes,
     annotations,
     margin: { t: 20 },
     dragmode: lightcurveDragmode(),
     selectdirection: "h",
-  }, { responsive: true });
+  }, nightPlotConfig(xRange));
   attachLightcurveEvents();
   applyTimeMarker("plot-lightcurve");
 }
@@ -1698,8 +1732,9 @@ function plotReferenceLc(p) {
     showlegend: true,
   });
 
+  const xRange = nightXRange(p.t_first, p.t_last);
   const layout = {
-    xaxis: { title: { text: "BJD_TDB - 2460000" } },
+    xaxis: nightXAxis(xRange),
     yaxis: {
       title: { text: useMag ? "apparent mag (+ zp)" : "reference flux" },
       autorange: useMag ? "reversed" : true,
@@ -1708,7 +1743,7 @@ function plotReferenceLc(p) {
     margin: { t: 40 },
   };
 
-  Plotly.newPlot("plot-reference", traces, layout, { responsive: true });
+  Plotly.newPlot("plot-reference", traces, layout, nightPlotConfig(xRange));
   applyTimeMarker("plot-reference");
 
   // Update note
@@ -1839,8 +1874,9 @@ function plotComparisonLc(p) {
     });
   }
 
+  const xRange = nightXRange(p.t_first, p.t_last);
   const layout = {
-    xaxis: { title: { text: "BJD_TDB - 2460000" } },
+    xaxis: nightXAxis(xRange),
     yaxis: {
       title: { text: useMag ? "residual flux (mag)" : (view === "normalised" ? "normalised flux" : "flux / ensemble") },
       autorange: useMag ? "reversed" : true,
@@ -1848,7 +1884,7 @@ function plotComparisonLc(p) {
     margin: { t: 40 },
   };
 
-  Plotly.newPlot("plot-comparison", traces, layout, { responsive: true });
+  Plotly.newPlot("plot-comparison", traces, layout, nightPlotConfig(xRange));
   applyTimeMarker("plot-comparison");
   $("plot-comparison").hidden = false;
 
@@ -2105,6 +2141,8 @@ function renderSimilar() {
   const anchor = rows[0];
   const height = SIMILAR_MARGIN.t + n * SIMILAR_ROW_PX + SIMILAR_MARGIN.b;
   const half = (SIMILAR_GAP_PX / 2) / (n * SIMILAR_ROW_PX); // half the gap, as a fraction
+  // all rows share the anchor's night: every row spans that night's window (first to last frame)
+  const xRange = nightXRange(data.t_first, data.t_last);
   const traces = [];
   const shapes = [];
   const annotations = [];
@@ -2128,6 +2166,7 @@ function renderSimilar() {
       domain: [0, 1], anchor: `y${ax}`, showline: true, mirror: true, showticklabels: i === n - 1,
       ...(i === 0 ? {} : { matches: "x" }),
       ...(i === n - 1 ? { title: { text: "BJD_TDB - 2460000" } } : {}),
+      ...(xRange ? { range: xRange, autorange: false } : {}),
     };
     if (ev.lc) {
       traces.push({
@@ -2162,7 +2201,7 @@ function renderSimilar() {
   const gd = $("plot-similar");
   gd.style.height = `${height}px`;
   Plotly.purge("plot-similar");
-  Plotly.newPlot("plot-similar", traces, layout, { responsive: true });
+  Plotly.newPlot("plot-similar", traces, layout, nightPlotConfig(xRange));
   if (gd.on) {
     // annotation i is row i
     gd.on("plotly_clickannotation", (e) => {

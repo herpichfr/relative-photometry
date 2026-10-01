@@ -457,6 +457,89 @@ def test_lc_with_file_names(client) -> None:
     assert len(data["flux"]) == 3
 
 
+def _frame_window(test_conn, night_id: int) -> tuple[float, float]:
+    """``(first, last)`` frame BJD_TDB of a night straight from the table (its window)."""
+    test_conn.rollback()
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT min(bjd_tdb), max(bjd_tdb) FROM relphot.frame WHERE night_id = %s",
+            (night_id,),
+        )
+        return cur.fetchone()
+
+
+def test_lc_carries_the_nights_frame_window(client, test_conn) -> None:
+    test_client, ids = client
+    url = f"/api/object/{ids['obj_var']}/lc"
+    window = _frame_window(test_conn, ids["night1"])
+    assert window == pytest.approx((2460310.5006, 2460310.5206))
+
+    data = test_client.get(url, params={"night_id": ids["night1"]}).json()
+    assert (data["t_first"], data["t_last"]) == pytest.approx(window)
+    own = (min(data["bjd_tdb"]), max(data["bjd_tdb"]))  # a complete star spans the same window
+    assert (data["t_first"], data["t_last"]) == pytest.approx(own)
+
+    # a star that lacks the night's first and last epochs still gets the whole night's window
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.lightcurve SET frame_index = '{1}', bjd_tdb = '{2460310.5106}', "
+            "flux = '{1.0}', flux_err = '{0.01}', flux_raw = '{1.0}' "
+            "WHERE obj_id = %s AND night_id = %s",
+            (ids["obj_var"], ids["night1"]),
+        )
+    test_conn.commit()
+    sparse = test_client.get(url, params={"night_id": ids["night1"]}).json()
+    assert sparse["bjd_tdb"] == pytest.approx([2460310.5106])
+    assert (sparse["t_first"], sparse["t_last"]) == pytest.approx(window)
+
+    # the window is that of ALL the night's frames: dropping the first (and the last) one, or all
+    # of them, does not move it
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.frame SET kept = false WHERE night_id = %s AND frame_index = 0",
+            (ids["night1"],),
+        )
+    test_conn.commit()
+    dropped = test_client.get(url, params={"night_id": ids["night1"]}).json()
+    assert (dropped["t_first"], dropped["t_last"]) == pytest.approx(window)
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.frame SET kept = false WHERE night_id = %s", (ids["night1"],))
+    test_conn.commit()
+    none_kept = test_client.get(url, params={"night_id": ids["night1"]}).json()
+    assert (none_kept["t_first"], none_kept["t_last"]) == pytest.approx(window)
+
+    # the other night is not affected
+    other = test_client.get(url, params={"night_id": ids["night2"]}).json()
+    assert (other["t_first"], other["t_last"]) == pytest.approx(
+        _frame_window(test_conn, ids["night2"])
+    )
+
+
+def test_lc_window_is_null_for_a_night_without_frame_times(client, test_conn) -> None:
+    test_client, ids = client
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.frame SET bjd_tdb = 'NaN' WHERE night_id = %s AND frame_index = 0",
+            (ids["night1"],),
+        )
+        cur.execute(
+            "UPDATE relphot.frame SET bjd_tdb = NULL WHERE night_id = %s AND frame_index = 2",
+            (ids["night1"],),
+        )
+    test_conn.commit()
+    url = f"/api/object/{ids['obj_var']}/lc"
+    one = test_client.get(url, params={"night_id": ids["night1"]}).json()
+    # the NaN and the NULL time are skipped
+    assert (one["t_first"], one["t_last"]) == pytest.approx((2460310.5106, 2460310.5106))
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.frame SET bjd_tdb = NULL WHERE night_id = %s", (ids["night1"],)
+        )
+    test_conn.commit()
+    none = test_client.get(url, params={"night_id": ids["night1"]}).json()
+    assert (none["t_first"], none["t_last"]) == (None, None)
+
+
 def _add_members(test_conn, ids: dict, *, target_is_member: bool, median: bool) -> np.ndarray:
     """Tile 0 / aperture 1 of night 1: ``tile_lc`` + comparison members around ``obj_var`` (star 2).
 
@@ -906,6 +989,10 @@ def test_similar_endpoint_shape_cap_order_and_anchor_first(client, test_conn) ->
     assert anchor["lc"]["flux"] == pytest.approx([1.0, 1.1, 0.9])
     assert data["events"][2]["lc"] is None  # no light curve stored
 
+    # every row is on the anchor's night: its observation window, not the rows' own points
+    window = _frame_window(test_conn, ids["night1"])
+    assert (data["t_first"], data["t_last"]) == pytest.approx(window)
+
     capped = test_client.get(url, params={"limit": 10}).json()
     assert (capped["n_total"], capped["n_returned"]) == (25, 10)
     assert [e["det_id"] for e in capped["events"]] == similar[:10]
@@ -915,6 +1002,7 @@ def test_similar_endpoint_shape_cap_order_and_anchor_first(client, test_conn) ->
     # an event with no coincidence row has no look-alikes; an unknown or non-transit id is a 404
     lone = test_client.get(f"/api/detection/{ids['det_b']}/similar").json()
     assert (lone["anchor"]["det_id"], lone["events"], lone["n_total"]) == (ids["det_b"], [], 0)
+    assert (lone["t_first"], lone["t_last"]) == pytest.approx(window)
     assert test_client.get("/api/detection/999999/similar").status_code == 404
     with test_conn.cursor() as cur:
         cur.execute("SELECT det_id FROM relphot.detection WHERE kind = 'variable' LIMIT 1")
@@ -2212,6 +2300,23 @@ def test_front_end_has_the_similar_events_window_and_scroll_boxes() -> None:
     assert "/api/detection/" in js and "/api/detections/review" in js
 
 
+def test_front_end_pins_every_per_night_time_axis_to_the_nights_window() -> None:
+    """The per-night plots set an explicit x range (first to last frame) that a double
+    click returns to, not the data extent; the multi-night and phase plots do not."""
+    js = (resources.files("relphot.web") / "static" / "app.js").read_text()
+
+    def body(name: str) -> str:
+        start = js.index(f"function {name}(")
+        return js[start : js.index("\nfunction ", start + 1)]
+
+    for name in ("plotNightLc", "plotReferenceLc", "plotComparisonLc", "renderSimilar"):
+        assert "nightXRange(" in body(name), name
+        assert "nightPlotConfig(xRange)" in body(name), name
+    assert "nightXAxis(xRange)" in body("plotNightLc")
+    assert 'doubleClick: "reset"' in body("nightPlotConfig")
+    assert "nightXRange" not in body("plotCombinedLc") + body("plotPhase")
+
+
 def _insert_guided_estimate(test_conn, obj_id: int, **kw) -> int:
     values = {
         "method": "LS-guided", "input": "tied", "night_ids": [1, 2], "n_nights": 2,
@@ -2891,6 +2996,37 @@ def test_object_night_comparison_endpoint(client, test_conn) -> None:
     data = resp.json()
     assert "members" in data
     assert "n_members" in data
+
+
+def test_reference_and_comparison_carry_the_nights_frame_window(client, test_conn) -> None:
+    """The fixture star's own light curve lacks frame 1, which is also the one dropped frame; the
+    window is that of all the frames, on the object's and on the night's endpoints."""
+    test_client, ids = client
+    _insert_tile_members(test_conn, ids)
+    window = _frame_window(test_conn, ids["night1"])
+    assert window == pytest.approx((2460310.5006, 2460310.5206))
+    night, obj = ids["night1"], ids["obj_unc"]
+
+    for url, params in (
+        (f"/api/object/{obj}/night/{night}/reference", {}),
+        (f"/api/object/{obj}/night/{night}/comparison", {"limit": 12}),
+        (f"/api/night/{night}/tile/0/reference", {"aperture": 1}),
+        (f"/api/night/{night}/tile/0/comparison", {"limit": 12}),
+    ):
+        resp = test_client.get(url, params=params)
+        assert resp.status_code == 200, (url, resp.text)
+        data = resp.json()
+        assert (data["t_first"], data["t_last"]) == pytest.approx(window), url
+
+    # dropped first and last frames stay inside the window (their lines are drawn on the plot)
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.frame SET kept = false WHERE night_id = %s AND frame_index IN (0, 2)",
+            (night,),
+        )
+    test_conn.commit()
+    data = test_client.get(f"/api/object/{obj}/night/{night}/reference").json()
+    assert (data["t_first"], data["t_last"]) == pytest.approx(window)
 
 
 def test_object_wrapper_target_is_member_true_with_weight(client, test_conn) -> None:

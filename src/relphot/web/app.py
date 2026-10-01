@@ -808,6 +808,28 @@ def object_detail(obj_id: int):
     )
 
 
+def _night_windows(cur, night_ids: list[int]) -> dict[int, tuple[float, float]]:
+    """Observation window ``(t_first, t_last)`` (BJD_TDB) of each night, in one query: the time of
+    its first and last frame (kept or dropped), which every per-night time axis of the page spans
+    whatever gaps or missing epochs a star's own points have. A night with no usable frame time
+    is left out."""
+    cur.execute(
+        "SELECT night_id, min(bjd_tdb), max(bjd_tdb) FROM relphot.frame "
+        "WHERE night_id = ANY(%s) AND bjd_tdb IS NOT NULL AND bjd_tdb <> 'NaN' "
+        "GROUP BY night_id",
+        (night_ids,),
+    )
+    return {nid: (t_first, t_last) for nid, t_first, t_last in cur.fetchall()}
+
+
+def _window_fields(cur, night_id: int | None) -> dict:
+    """``t_first`` / ``t_last`` (:func:`_night_windows`) of one night, for a payload; both
+    ``None`` when the night is unknown or has no frame times."""
+    window = _night_windows(cur, [night_id]) if night_id is not None else {}
+    t_first, t_last = window.get(night_id, (None, None))
+    return {"t_first": t_first, "t_last": t_last}
+
+
 def _stack_lcs(cur, det_ids: list[int]) -> dict[int, dict]:
     """The light curve of each event's own night, keyed by det_id: ``flux`` and ``flux_err`` over
     the curve's median flux (rounded), one query for all. An event without a usable curve is
@@ -843,7 +865,8 @@ def detection_similar(
     each with its own night's light curve over its median -- the data of the stack plot.
 
     Look-alikes a person REJECTED are left out unless ``include_rejected`` (``n_rejected_hidden``
-    says how many); the anchor is always returned.
+    says how many); the anchor is always returned. ``t_first`` / ``t_last`` are the observation
+    window (BJD_TDB) of the anchor's night, which all the rows share (:func:`_night_windows`).
     """
     with get_ro_conn() as conn, conn.cursor() as cur:
         anchor = _similar_info(cur, [det_id], stack=True).get(det_id)
@@ -861,6 +884,7 @@ def detection_similar(
         info = _similar_info(cur, shown, stack=True)
         events = [info[j] for j in shown if j in info]
         curves = _stack_lcs(cur, [det_id, *shown])
+        window = _window_fields(cur, anchor.get("night_id"))
     for ev in (anchor, *events):
         ev["lc"] = curves.get(ev["det_id"])
     return _json(
@@ -870,6 +894,7 @@ def detection_similar(
             "n_rejected": len(rejected),
             "n_rejected_hidden": hidden,
             "n_returned": len(events),
+            **window,
             "events": events,
         }
     )
@@ -902,6 +927,7 @@ def object_lc(obj_id: int, night_id: int):
             (night_id, list(frame_index)),
         )
         frame_map = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+        window = _window_fields(cur, night_id)
 
     file_name = [frame_map.get(i, (None, None))[0] for i in frame_index]
     airmass = [frame_map.get(i, (None, None))[1] for i in frame_index]
@@ -919,6 +945,7 @@ def object_lc(obj_id: int, night_id: int):
             "zp": zp,
             "zp_source": zp_source,
             "app_mag": None if app_mag is None else round(app_mag, 4),
+            **window,
         }
     )
 
@@ -1112,6 +1139,7 @@ def _reference_payload(
     frames = _tile_frames(cur, night_id)
     return {
         "night_id": night_id,
+        **_window_fields(cur, night_id),
         "tile": tile,
         "aperture": aperture,
         "apertures": apertures,
@@ -1173,6 +1201,7 @@ def _comparison_payload(
             "order": order,
             "limit": limit,
             "frames": _tile_frames(cur, night_id),
+            **_window_fields(cur, night_id),
             "ens_flux": ens_flux,
             "ens_flux_err": ens_flux_err,
             "envelope": None,
@@ -1333,6 +1362,7 @@ def _comparison_payload(
     return {
         "tile": tile,
         "aperture": aperture,
+        **_window_fields(cur, night_id),
         "n_members": n_members,
         "n_shown": len(shown_set),
         "order": order,
