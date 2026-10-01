@@ -13,7 +13,12 @@ from relphot.reference import (
     select_candidates,
     select_reference_frames_and_stars,
 )
-from relphot.stats import best_aperture_per_star, compute_star_stats, select_best_aperture
+from relphot.stats import (
+    best_aperture_per_star,
+    bright_star_floor,
+    compute_star_stats,
+    select_best_aperture,
+)
 from relphot.tiles import build_tilemap
 
 
@@ -228,3 +233,67 @@ def test_compute_star_stats_tailed_passthrough() -> None:
     assert stats.tailed is not None
     np.testing.assert_array_equal(stats.tailed, tailed)
     assert compute_star_stats(lc_result).tailed is None
+
+
+def _floor_catalogue() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """1000 stars, 0.01 mag apart, flat 2 mmag-ish RMS below mag 2, rising above."""
+    mag = 0.005 + 0.01 * np.arange(1000)
+    rms = np.where(mag < 2.0, 0.002, 0.01)
+    return mag, rms, np.ones(mag.size, dtype=bool)
+
+
+def test_bright_star_floor_hand_built() -> None:
+    """The bin starts at the given percentile of all stars; the floor is the bin's median RMS."""
+    mag, rms, is_comp = _floor_catalogue()
+    res = bright_star_floor(mag, rms, is_comp, percentile=1.0)
+    assert res is not None
+    assert np.isclose(res.mag_lo, 0.005 + 0.01 * 9.99)
+    assert np.isclose(res.mag_hi, res.mag_lo + 1.0)
+    assert res.n == 100
+    assert np.isclose(res.floor_mmag, 0.002 * 1085.7)
+
+
+def test_bright_star_floor_default_percentile() -> None:
+    """The default anchor is the 0.25th percentile."""
+    mag, rms, is_comp = _floor_catalogue()
+    res = bright_star_floor(mag, rms, is_comp)
+    assert res is not None
+    assert np.isclose(res.mag_lo, 0.005 + 0.01 * 2.4975)
+    assert res.n == 100
+
+
+def test_bright_star_floor_ignores_a_few_very_bright_stars() -> None:
+    """A handful of far brighter stars must not drag the bin to them (the old min anchor did)."""
+    mag, rms, is_comp = _floor_catalogue()
+    mag = np.concatenate([np.full(5, -5.0), mag])
+    rms = np.concatenate([np.full(5, 0.0005), rms])
+    is_comp = np.concatenate([np.ones(5, dtype=bool), is_comp])
+    res = bright_star_floor(mag, rms, is_comp, percentile=1.0)
+    assert res is not None
+    assert res.mag_lo > 0.0
+    assert res.n >= 95
+    assert np.isclose(res.floor_mmag, 0.002 * 1085.7)
+
+
+def test_bright_star_floor_uses_comparison_stars_only_for_the_median() -> None:
+    """Non-comparison stars set the anchor but not the median."""
+    mag, rms, is_comp = _floor_catalogue()
+    is_comp[::2] = False
+    rms[::2] = 0.05
+    res = bright_star_floor(mag, rms, is_comp, percentile=1.0)
+    assert res is not None
+    assert res.n == 50
+    assert np.isclose(res.floor_mmag, 0.002 * 1085.7)
+
+
+def test_bright_star_floor_skips_nan_and_returns_none_when_empty() -> None:
+    """NaN magnitudes or RMS never count; no comparison star in the bin gives None."""
+    mag, rms, is_comp = _floor_catalogue()
+    mag_nan = mag.copy()
+    mag_nan[:20] = np.nan
+    res = bright_star_floor(mag_nan, rms, is_comp)
+    assert res is not None
+    assert np.isfinite(res.floor_mmag)
+    all_nan = np.full(10, np.nan)
+    assert bright_star_floor(all_nan, np.full(10, 0.01), np.ones(10, dtype=bool)) is None
+    assert bright_star_floor(mag, rms, np.zeros(mag.size, dtype=bool)) is None

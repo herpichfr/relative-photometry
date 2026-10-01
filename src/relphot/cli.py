@@ -82,6 +82,7 @@ from relphot.reference import build_references, select_candidates, select_refere
 from relphot.repeat import parse_when as _parse_when
 from relphot.stats import (
     best_aperture_per_star,
+    bright_star_floor,
     build_diagnostics_table,
     compute_star_stats,
     plot_rms_vs_magnitude,
@@ -568,25 +569,32 @@ def _run_lightcurves(args: argparse.Namespace) -> int:
         [f"aper{int(a)}: {int(c)}" for a, c in zip(unique_best, counts, strict=False)]
     )
 
-    # Bright star floor (median RMS of brightest 1-mag bin of comparison stars)
+    # Bright star floor: median RMS of the comparison stars in a 1-mag bin that starts at
+    # a percentile of all stars with light curves (not at the brightest comparison star,
+    # which moves with the non-linearity cut), see relphot.stats.bright_star_floor
+    has_lc = tilemap.core_tile >= 0
     bright_floors = []
+    bright_bins = []
     for a in range(night.n_aper):
-        comp_mag_a = comparison_result.mag[comparison_result.mask[:, a], a]
-        comp_rms_a = star_stats.rms[comparison_result.mask[:, a], a]
-        if comp_mag_a.size > 0:
-            bright_mag = np.min(comp_mag_a)
-            bright_mask = comp_mag_a < (bright_mag + 1.0)
-            if np.any(bright_mask):
-                # rms is a fractional scatter; 1 mmag = 1.0857e-3 in flux ratio
-                bright_floor_mmag = nanmedian_quiet(comp_rms_a[bright_mask]) * 1085.7
-                bright_floors.append(f"aper{a}: {bright_floor_mmag:.1f} mmag")
+        floor_a = bright_star_floor(
+            np.where(has_lc, comparison_result.mag[:, a], np.nan),
+            star_stats.rms[:, a],
+            comparison_result.mask[:, a],
+        )
+        if floor_a is not None:
+            bright_floors.append(f"aper{a}: {floor_a.floor_mmag:.1f} mmag")
+            bright_bins.append(
+                f"aper{a}: mag {floor_a.mag_lo:.2f}..{floor_a.mag_hi:.2f}, N={floor_a.n}"
+            )
     bright_floor_str = ", ".join(bright_floors) if bright_floors else "N/A"
+    bright_bin_str = "; ".join(bright_bins) if bright_bins else "N/A"
 
     print(f"stars with light curves: {with_lc}")
     print(f"frames kept: {kept_frames}/{total_frames}")
     print(f"comparison count range: {int(n_comp_min)}-{int(n_comp_max)}")
     print(f"best aperture histogram: {best_hist}")
     print(f"bright-star floor: {bright_floor_str}")
+    print(f"bright-star floor bins: {bright_bin_str}")
     if lc_result.err_scale is not None:
         scaled = lc_result.err_scale[np.arange(night.n_stars), np.maximum(star_best_aper, 0)]
         scaled = scaled[(star_best_aper >= 0) & (scaled > 1.0)]
