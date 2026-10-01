@@ -229,6 +229,120 @@ details.similar-events summary {
     font-size: 0.85em;
 }
 
+/* the notes of a transit event, in the Transit events table */
+.event-notes {
+    white-space: pre-wrap;
+    max-width: 22rem;
+    max-height: 7rem;
+    overflow-y: auto;
+    font-size: 0.85em;
+}
+
+/* the night reviews scroll in a box; the script sizes it to the header and ten rows */
+#night-reviews-scroll {
+    max-height: 440px;
+}
+
+/* the similar-events window: the stack of light curves with, beside each, a cell of the
+   status box and a tick (positioned by the script to line up with its row) */
+.similar-controls {
+    align-items: flex-start;
+}
+
+.similar-action-box {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+}
+
+.similar-action-box label,
+.similar-controls > label {
+    display: inline-flex;
+    gap: 0.3rem;
+    align-items: center;
+}
+
+.similar-controls .similar-notes-box {
+    align-items: flex-start;
+}
+
+#similar-notes {
+    width: 22rem;
+    max-width: 100%;
+}
+
+.similar-body {
+    display: flex;
+    align-items: flex-start;
+    margin-top: 0.5rem;
+}
+
+#plot-similar {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+#similar-side {
+    flex: 0 0 170px;
+    position: relative;
+}
+
+.similar-cell {
+    position: absolute;
+    left: 0;
+    right: 0;
+    box-sizing: border-box;
+    padding: 4px 6px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.similar-cell label {
+    display: flex;
+    gap: 0.3rem;
+    align-items: center;
+    font-size: 12px;
+}
+
+.similar-status {
+    border: 2px solid #999;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 12px;
+    font-weight: bold;
+    text-align: center;
+    color: #555;
+}
+
+.similar-status small {
+    display: block;
+    font-weight: normal;
+    color: #666;
+}
+
+.similar-status.confirmed {
+    border-color: #2e7d32;
+    color: #2e7d32;
+    background: #e8f5e9;
+}
+
+.similar-status.rejected {
+    border-color: #b00020;
+    color: #b00020;
+    background: #fdecee;
+}
+
+.similar-cell .similar-notes {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    font-size: 11px;
+    color: #444;
+}
+
 .rerun-entry label, #rerun-toggle {
     display: inline-flex;
     gap: 0.3rem;
