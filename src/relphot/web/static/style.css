@@ -382,6 +382,20 @@ details.similar-events summary {
     border-color: #06c;
 }
 
+/* the From/To/Predict row of the predicted transit windows: looks like a rerun entry, but must not be
+   one (app.js walks every .rerun-entry as a rerun form) */
+.repeat-predict-row {
+    border: 1px solid #ccc;
+    padding: 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+}
+
+.repeat-predict-row label {
+    display: inline-flex;
+    gap: 0.3rem;
+    align-items: center;
+}
+
 #phase-aliases {
     display: flex;
     gap: 0.4rem;
