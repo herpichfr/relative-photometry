@@ -2341,7 +2341,9 @@ def test_front_end_draws_a_residual_panel_under_fitted_light_curves() -> None:
     assert "yOf(flux[i]) - yOf(trapezoidModelFlux" in body("lcResiduals")
     # the night curve: the drawn events, the plot's own transform and errors, a matched x axis
     night = body("plotNightLc")
-    assert "lcResiduals(lc.bjd_tdb, lc.flux, yErr, fitted, baseline, yOf" in night
+    # (only the active events: a superseded event's fit is drawn grey and dashed, not modelled)
+    assert "lcResiduals(lc.bjd_tdb, lc.flux, yErr, activeFitted, baseline, yOf" in night
+    assert "fitted.filter((ev) => !isSuperseded(ev))" in night
     assert "residualTraces(res" in night and "residualXAxis(xRange" in night
     assert "residualYAxis(" in night and "useMag" in night.split("residualYAxis(")[1]
     assert "error_y: { type: \"data\", visible: true, array: yErr }" in night
@@ -3871,3 +3873,147 @@ def test_front_end_shows_the_transit_event_status_read_only() -> None:
     events = js[js.index("function renderTransitEvents"):js.index("async function patchDetection")]
     assert "detectionStatusText(ev)" in events and "detectionStatusSelect" not in events
     assert 'r.kind === "transit" ? detectionStatusText(r) : detectionStatusSelect(r)' in js
+
+
+# --------------------------------------------------------------------------
+# a RERUN's event supersedes an older event of the same light curve ("Keep this")
+# --------------------------------------------------------------------------
+
+
+def _add_rerun(test_conn, ids: dict, *, tc: float = 2460310.525, dur: float = 1.0) -> int:
+    """A RERUN (``origin = 'user'``) event of ``obj_both`` on night 1, overlapping ``det_a``."""
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind, depth, tc_bjd_tdb, duration_h, "
+            "flags, origin) VALUES (%s, %s, 'transit', 0.012, %s, %s, 'USER', 'user') "
+            "RETURNING det_id",
+            (ids["obj_both"], ids["night1"], tc, dur),
+        )
+        (det_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.transit_shape (det_id, obj_id, tc, tc_err, depth, depth_err, "
+            "t14_h, t14_err, ingress_frac, ingress_err, chi2_red, n_points, input, converged, "
+            "computed_at) VALUES (%s, %s, %s, 0.0005, 0.012, 0.001, %s, 0.1, 0.2, 0.05, 1.0, 80, "
+            "'night', true, now())",
+            (det_id, ids["obj_both"], tc, dur),
+        )
+    test_conn.commit()
+    return det_id
+
+
+def _events(test_client, obj_id: int) -> dict[int, dict]:
+    events = test_client.get(f"/api/object/{obj_id}").json()["transit_events"]
+    return {e["det_id"]: e for e in events}
+
+
+def _keep(test_client, det_id: int):
+    return test_client.post(f"/api/detection/{det_id}/keep")
+
+
+def test_detail_marks_the_events_that_compete_and_keep_this_swaps_them(client, test_conn) -> None:
+    test_client, ids = client
+    obj, det_a, det_b = ids["obj_both"], ids["det_a"], ids["det_b"]
+    rerun = _add_rerun(test_conn, ids)
+
+    events = _events(test_client, obj)
+    # the RERUN and the search event of night 1 compete; the event of night 2 stands alone
+    assert events[det_a]["competing_det_ids"] == [rerun]
+    assert events[rerun]["competing_det_ids"] == [det_a]
+    assert events[det_b]["competing_det_ids"] == []
+    assert {e["superseded_by"] for e in events.values()} == {None}
+
+    resp = _keep(test_client, rerun)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["det_id"], body["obj_id"], body["night_id"]) == (rerun, obj, ids["night1"])
+    assert body["changed"] == [det_a]
+    assert body["night_reviews"] == [{"obj_id": obj, "night_id": ids["night1"], "exop": None}]
+    events = _events(test_client, obj)
+    assert (events[det_a]["superseded_by"], events[rerun]["superseded_by"]) == (rerun, None)
+    assert events[det_a]["competing_det_ids"] == [rerun]  # still offers the swap back
+
+    # the object's own counts and matching-transit pairs follow the active events
+    row = test_client.get("/api/search", params={"name": "BOTH01"}).json()["rows"][0]
+    assert row["n_transit_events"] == 2  # det_b and the RERUN
+    data = test_client.get(f"/api/object/{obj}").json()
+    assert data["transit_matches"] == []  # the only pair involved the superseded event
+    night1 = next(n for n in data["nights"] if n["night_id"] == ids["night1"])
+    assert night1["exop_open"] is True  # the RERUN event stands for the search event
+
+    # keep this on the superseded event swaps them; again is a no-op
+    body = _keep(test_client, det_a).json()
+    assert body["changed"] == sorted([det_a, rerun])
+    events = _events(test_client, obj)
+    assert (events[det_a]["superseded_by"], events[rerun]["superseded_by"]) == (None, det_a)
+    assert _keep(test_client, det_a).json()["changed"] == []
+    assert len(test_client.get(f"/api/object/{obj}").json()["transit_matches"]) == 1
+
+    # only per-night transit events can be kept
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT det_id FROM relphot.detection WHERE kind = 'variable' LIMIT 1")
+        (variable,) = cur.fetchone()
+        cur.execute("SELECT det_id FROM relphot.detection WHERE kind = 'bls' LIMIT 1")
+        (multinight,) = cur.fetchone()
+    assert _keep(test_client, variable).status_code == 404
+    assert _keep(test_client, multinight).status_code == 404
+    assert _keep(test_client, 999999).status_code == 404
+
+
+def test_the_night_verdict_acts_on_the_active_event_and_follows_a_swap(client, test_conn) -> None:
+    test_client, ids = client
+    obj, night1, det_a = ids["obj_both"], ids["night1"], ids["det_a"]
+    rerun = _add_rerun(test_conn, ids)
+    assert _keep(test_client, rerun).status_code == 200  # det_a is superseded
+    url = f"/api/object/{obj}/night/{night1}/review"
+
+    # REJECT the night: only the active (RERUN) event takes the verdict
+    data = test_client.put(url, json={"exop": "REJECTED"}).json()
+    assert data["events_updated"] == [rerun]
+    assert _event_statuses(test_client, obj)[det_a] == "UNCONFIRMED"
+    assert _event_statuses(test_client, obj)[rerun] == "REJECTED"
+    assert data["night"]["exop_effective"] is False and data["night"]["pending"] is False
+
+    # a verdict on the superseded event does not reach the night
+    test_client.patch(f"/api/detection/{det_a}", json={"status": "CONFIRMED"})
+    assert _night_review(test_client, obj, night1)["exop"] == "REJECTED"
+
+    # swap: the search event (CONFIRMED) is the active one, so the night is CONFIRMED
+    assert _keep(test_client, det_a).json()["night_reviews"] == [
+        {"obj_id": obj, "night_id": night1, "exop": "CONFIRMED"}
+    ]
+    assert _night_review(test_client, obj, night1)["exop"] == "CONFIRMED"
+    # swap back: the RERUN event's own rejection stands again
+    assert _keep(test_client, rerun).json()["night_reviews"][0]["exop"] == "REJECTED"
+    assert _event_statuses(test_client, obj)[det_a] == "CONFIRMED"  # kept on the superseded event
+
+
+def test_two_stars_of_one_night_are_never_linked_and_get_no_keep_this(client, test_conn) -> None:
+    test_client, ids = client
+    lookalikes = _add_lookalikes(test_conn, ids, n=2)  # other stars' events, same night, same tc
+    obj, det_a = ids["obj_both"], ids["det_a"]
+
+    # no event of obj_both competes with another star's event: no "Keep this" is offered
+    events = _events(test_client, obj)
+    assert [e["competing_det_ids"] for e in events.values()] == [[], []]
+    # pressing it anyway (the API) changes nothing, on either star
+    assert _keep(test_client, det_a).json()["changed"] == []
+    assert _keep(test_client, lookalikes[0]).json()["changed"] == []
+    # nor does a bulk verdict on the look-alikes link anything
+    assert _review(test_client, det_a, [det_a, *lookalikes], "REJECTED").status_code == 200
+    with test_conn.cursor() as cur:
+        test_conn.rollback()
+        cur.execute("SELECT count(*) FROM relphot.detection WHERE superseded_by IS NOT NULL")
+        assert cur.fetchone() == (0,)
+
+    # and the database refuses such a link from the web role, whatever the application does
+    rw_dsn = _role_dsn(_test_dsn(), "relphot_web", "RELPHOT_WEB_PASSWORD")
+    with psycopg.connect(rw_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            cur.execute(
+                "UPDATE relphot.detection SET superseded_by = %s WHERE det_id = %s",
+                (lookalikes[0], det_a),
+            )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "UPDATE relphot.detection SET obj_id = obj_id WHERE det_id = %s", (det_a,)
+            )

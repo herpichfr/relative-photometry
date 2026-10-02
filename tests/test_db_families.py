@@ -585,6 +585,36 @@ def test_update_families_stores_links_families_members_and_aliases(test_conn) ->
     ) == [(2,)]
 
 
+def test_a_superseded_event_is_not_eligible_and_makes_its_family_stale(test_conn) -> None:
+    obj_id, (n1, _n2), (d1, d2) = _pair_object(test_conn)
+    # a RERUN of the first transit supersedes the search event of that night
+    d3 = _event(test_conn, obj_id, n1, T0 + 0.2, origin="user")
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.detection SET superseded_by = %s WHERE det_id = %s", (d3, d1))
+    test_conn.commit()
+
+    update_families(test_conn, [obj_id])
+    test_conn.commit()
+    members = "SELECT det_id FROM relphot.repeat_family_member ORDER BY det_id"
+    assert _rows(test_conn, members) == [(d2,), (d3,)]  # the superseded event is out
+    (family,) = load_families(test_conn)
+    assert family["stale"] is False
+
+    # "keep this" on the search event: the family built on the RERUN event is stale ...
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.detection SET superseded_by = NULL WHERE det_id = %s", (d1,))
+        cur.execute("UPDATE relphot.detection SET superseded_by = %s WHERE det_id = %s", (d1, d3))
+    test_conn.commit()
+    (family,) = load_families(test_conn)
+    assert family["stale"] is True
+    # ... until the next recomputation, which sees the search event again
+    update_families(test_conn, [obj_id])
+    test_conn.commit()
+    assert _rows(test_conn, members) == [(d1,), (d2,)]
+    (family,) = load_families(test_conn)
+    assert family["stale"] is False
+
+
 def test_an_underflowing_joint_probability_is_stored_as_the_real_floor(test_conn) -> None:
     obj_id = _object(test_conn, "underflow")
     n1, n2 = _night(test_conn, "u1"), _night(test_conn, "u2")

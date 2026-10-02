@@ -482,7 +482,26 @@ function detectionStatusText(det) {
     + "bulk verdict of the similar-events window";
   wrap.appendChild(badge);
   appendAutoRejection(wrap, det, effective === "REJECTED (auto)");
+  const superseded = supersededNote(det);
+  if (superseded) wrap.appendChild(superseded);
   return wrap;
+}
+
+// "superseded by det N (RERUN)" under the status of an event that another event of its light
+// curve (the same object on the same night) replaced; null for an active event. The status shown
+// is the one the event kept: it no longer counts in the night's verdict or as an open candidate
+// until "Keep this" makes it active again.
+function supersededNote(det) {
+  if (det.superseded_by === null || det.superseded_by === undefined) return null;
+  const by = ((state.currentObject && state.currentObject.transit_events) || [])
+    .find((e) => e.det_id === det.superseded_by);
+  const what = by ? (by.origin === "user" ? " (RERUN)" : " (search)") : "";
+  const div = document.createElement("div");
+  div.className = "superseded-note";
+  div.textContent = `superseded by det ${det.superseded_by}${what}`;
+  div.title = "this event is out of the night's verdict and is no open candidate; "
+    + "'Keep this' on either event swaps them";
+  return div;
 }
 
 // The cross-candidate check's verdict on an event, under its status (`skipText`: the status
@@ -570,6 +589,7 @@ function renderTransitEvents(events) {
   tbody.innerHTML = "";
   for (const ev of events || []) {
     const tr = document.createElement("tr");
+    if (ev.superseded_by !== null && ev.superseded_by !== undefined) tr.className = "superseded";
     const tc = ev.tc !== null && ev.tc !== undefined ? ev.tc : ev.det_tc;
     const fit = ev.tc !== null && ev.tc !== undefined
       ? `${ev.converged ? "converged" : "not converged"} (${ev.input || ""}, chi2r ${fmtValue(ev.chi2_red, 3)})`
@@ -611,9 +631,57 @@ function renderTransitEvents(events) {
     btn.textContent = "Plot";
     btn.addEventListener("click", () => loadNightLc(ev.night_id));
     tdView.appendChild(btn);
+    const keep = keepEventControl(ev, events);
+    if (keep) tdView.appendChild(keep);
     tr.appendChild(tdView);
     tbody.appendChild(tr);
   }
+}
+
+// The "Keep this" control of a transit event that competes with another event of the SAME light
+// curve (this object, this night; never another star's event): a button when pressing it would
+// change something (the event is superseded, or another overlapping event is still active), else
+// a "kept" tag; null for an event that is the only one of its transit.
+function keepEventControl(ev, events) {
+  const competing = ev.competing_det_ids || [];
+  if (competing.length === 0) return null;
+  const isSuperseded = ev.superseded_by !== null && ev.superseded_by !== undefined;
+  const othersActive = competing.some((id) => {
+    const other = (events || []).find((e) => e.det_id === id);
+    return other && other.superseded_by !== ev.det_id;
+  });
+  if (!isSuperseded && !othersActive) {
+    const tag = document.createElement("span");
+    tag.className = "kept-tag";
+    tag.textContent = "kept";
+    tag.title = `the active event; it supersedes det ${competing.join(", ")}`;
+    return tag;
+  }
+  const btn = document.createElement("button");
+  btn.className = "keep-event";
+  btn.textContent = "Keep this";
+  btn.title = "make this the active event of this light curve; the overlapping event(s) "
+    + `(det ${competing.join(", ")}) are marked superseded by it. Reversible.`;
+  btn.addEventListener("click", () => keepEvent(ev, btn));
+  return btn;
+}
+
+async function keepEvent(ev, btn) {
+  btn.disabled = true;
+  const resp = await fetch(`/api/detection/${ev.det_id}/keep`, { method: "POST" });
+  const data = await resp.json();
+  if (!resp.ok) {
+    btn.disabled = false;
+    $("edit-status-msg").textContent = data.detail || "keep failed";
+    return;
+  }
+  // the active event changed the night's verdict and evidence: pull the re-derived state
+  await refreshObject(`event ${ev.det_id} kept`);
+  if (state.similar) loadSimilar(state.similar.detId, true);
+  const view = state.lcView;
+  if (view && view.kind === "night" && view.nightId === ev.night_id) loadNightLc(ev.night_id);
+  $("edit-status-msg").textContent = `event ${ev.det_id} kept`
+    + (data.changed.length ? `; ${data.changed.length} link(s) changed` : "; nothing to change");
 }
 
 async function patchDetection(detId, body, ev) {
@@ -1530,6 +1598,7 @@ function trapezoidShape(ev, t) {
 // The fitted trapezoid of a transit event (tc, T14, depth, ingress fraction) as a line trace of the
 // flux `baseline * (1 - depth * shape)`, mapped by `yOf`; for the night curve and the similar stack.
 function trapezoidTrace(ev, baseline, yOf) {
+  const superseded = ev.superseded_by !== null && ev.superseded_by !== undefined;
   const t14 = ev.t14_h / 24.0;
   const xs = [];
   const ys = [];
@@ -1539,8 +1608,10 @@ function trapezoidTrace(ev, baseline, yOf) {
     ys.push(yOf(baseline * (1 - ev.depth * trapezoidShape(ev, t))));
   }
   return {
-    x: xs, y: ys, type: "scatter", mode: "lines", line: { color: "rgb(200,30,30)" },
-    name: `trapezoid fit (${ev.converged ? "converged" : "not converged"})`,
+    x: xs, y: ys, type: "scatter", mode: "lines",
+    line: superseded ? { color: "rgb(150,150,150)", dash: "dash" } : { color: "rgb(200,30,30)" },
+    name: `${superseded ? "superseded " : ""}trapezoid fit (${ev.converged ? "converged" : "not converged"})`
+      + `${superseded ? ` (det ${ev.det_id})` : ""}`,
     text: xs.map(() => `T14 ${ev.duration_display || ""}${ev.incomplete_reason ? " (incomplete: " + ev.incomplete_reason + ")" : ""}`),
     hoverinfo: "x+y+text",
   };
@@ -1701,10 +1772,13 @@ function plotNightLc(nightId, lc) {
   const fitted = nightEvents.filter(
     (ev) => ev.depth !== null && ev.t14_h !== null && ev.ingress_frac !== null
   );
+  // an event another event of this light curve superseded is drawn grey and dashed and is not part
+  // of the model the residuals are taken from
+  const isSuperseded = (ev) => ev.superseded_by !== null && ev.superseded_by !== undefined;
   for (const ev of nightEvents.filter((e) => !fitted.includes(e))) {
     shapes.push({
       type: "line", x0: ev.tc - 2460000, x1: ev.tc - 2460000, y0: 0, y1: 1, yref: "paper",
-      line: { color: "rgb(200,30,30)", dash: "dot" },
+      line: { color: isSuperseded(ev) ? "rgb(150,150,150)" : "rgb(200,30,30)", dash: "dot" },
     });
     annotations.push({
       x: ev.tc - 2460000, y: 1, yref: "paper", showarrow: false, yanchor: "bottom",
@@ -1747,8 +1821,9 @@ function plotNightLc(nightId, lc) {
   };
   // with a trapezoid fit: a residual panel (obs - model of the drawn events) under the curve,
   // sharing its x axis; without one the plot is as it was
-  const res = fitted.length
-    ? lcResiduals(lc.bjd_tdb, lc.flux, yErr, fitted, baseline, yOf,
+  const activeFitted = fitted.filter((ev) => !isSuperseded(ev));
+  const res = activeFitted.length
+    ? lcResiduals(lc.bjd_tdb, lc.flux, yErr, activeFitted, baseline, yOf,
       lc.frame_index.map((fi) => `frame ${fi}`))
     : null;
   if (res && res.x.length) {
@@ -3065,7 +3140,10 @@ function reprocessResult(r, tdResult, tdAction) {
       + `${res.t14_lower_limit ? ">= " + fmtValue(res.t14_h, 3) : fmtPm(res.t14_h, res.t14_err, 3)} h`
       + `${res.incomplete_reason ? " (incomplete: " + res.incomplete_reason + ")" : ""}, chi2r `
       + `${fmtValue(res.chi2_red, 3)}, ${res.n_matches} matching-transit pair(s)`
-      + (res.search_det_id ? `; search event ${res.search_det_id} kept` : "");
+      + (res.search_det_id ? `; search event ${res.search_det_id} kept` : "")
+      + (res.superseded && res.superseded.length
+        ? `; supersedes event ${res.superseded.join(", ")} (Keep this in Transit events swaps back)`
+        : "");
     const btn = document.createElement("button");
     btn.textContent = "Plot night";
     btn.addEventListener("click", () => refreshAndPlotNight(res.night_id));
@@ -3085,6 +3163,7 @@ async function refreshAndPlotNight(nightId) {
     renderRepeatFamilies(data);
     renderDetections(data.detections);
     renderPeriodEstimates(data.period_estimates);
+    renderNightReviews(data.nights, data.object);
   }
   loadNightLc(nightId);
 }
@@ -3172,6 +3251,7 @@ async function loadReprocess() {
       renderRepeatFamilies(d);
       renderDetections(d.detections);
       renderPeriodEstimates(d.period_estimates);
+      renderNightReviews(d.nights, d.object);
       renderMeta(d.object);
       loadPhase(null);
     }

@@ -9,8 +9,9 @@ rejects (``relphot.repeat_decision``), and an event outside every family stays a
 additional signal (R1: several families, even overlapping ones, may share an object).
 
 Eligible event: a converged trapezoid fit (``relphot.transit_shape``) of a per-night transit
-detection that the person has not REJECTED and that the coincidence check has not auto-rejected
-(unless the person CONFIRMED it) -- the rule of :mod:`relphot.objflags` -- and, unless
+detection that the person has not REJECTED, that is not superseded by another event of its light
+curve (``detection.superseded_by``) and that the coincidence check has not auto-rejected (unless
+the person CONFIRMED it) -- the rule of :mod:`relphot.objflags` -- and, unless
 ``db.repeat_include_loose``, that is not on a loose night. The other events of the object, and its
 other nights, only enter the non-detection veto.
 
@@ -563,14 +564,15 @@ _EVENTS_SQL = """
     FROM relphot.transit_shape ts
     JOIN relphot.detection d ON d.det_id = ts.det_id
     JOIN relphot.night n ON n.night_id = d.night_id
-    WHERE ts.converged AND d.kind = 'transit'
+    WHERE ts.converged AND d.kind = 'transit' AND d.superseded_by IS NULL
       AND ts.tc IS NOT NULL AND ts.depth > 0 AND ts.t14_h > 0
       AND COALESCE(d.status, 'UNCONFIRMED') <> 'REJECTED'
       AND (d.auto_status IS DISTINCT FROM 'REJECTED' OR d.status = 'CONFIRMED')
       AND ts.obj_id IN (
           SELECT ts2.obj_id FROM relphot.transit_shape ts2
           JOIN relphot.detection d2 ON d2.det_id = ts2.det_id
-          WHERE ts2.converged AND COALESCE(d2.status, 'UNCONFIRMED') <> 'REJECTED'
+          WHERE ts2.converged AND d2.superseded_by IS NULL
+            AND COALESCE(d2.status, 'UNCONFIRMED') <> 'REJECTED'
             AND (d2.auto_status IS DISTINCT FROM 'REJECTED' OR d2.status = 'CONFIRMED')
             AND (%(obj_ids)s::bigint[] IS NULL OR ts2.obj_id = ANY(%(obj_ids)s))
           GROUP BY ts2.obj_id HAVING count(*) >= 2

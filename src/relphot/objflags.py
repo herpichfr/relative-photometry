@@ -11,6 +11,11 @@ never removes a literature match.
 exop_source, var_source, class, class_source, n_review_pending, n_nights_reviewed.
 This module imports only the standard library and psycopg (plus, lazily,
 :mod:`relphot.config`) so the web app can use it without importing ``relphot.db``.
+
+It also holds the rules for superseded transit events (``relphot.detection.superseded_by``):
+the light curve of ONE object on ONE night may carry several transit events -- the search's and a
+person's RERUNs -- that fit the same transit; one is the active event and the others are
+superseded by it (:func:`plan_keep`, :func:`keep_transit_event`).
 """
 
 from __future__ import annotations
@@ -20,10 +25,16 @@ import psycopg
 __all__ = [
     "NIGHT_EXOP_KINDS",
     "NIGHT_VAR_KINDS",
+    "OVERLAP_FRAC",
     "PLANET_CATALOGS",
+    "competing_events",
+    "events_overlap",
+    "keep_transit_event",
     "night_state",
+    "plan_keep",
     "plan_night_exop_to_events",
     "refresh_flags",
+    "sync_night_exop_from_events",
     "transit_night_verdict",
 ]
 
@@ -35,6 +46,12 @@ NIGHT_VAR_KINDS = ("variable", "internight", "ls_periodic", "recurrent")
 
 #: Catalog names that indicate a known exoplanet host.
 PLANET_CATALOGS = ("NASA Exoplanet Archive", "TOI")
+
+#: Two transit events of one light curve are the same event (one supersedes the other) when their
+#: centre times differ by at most this fraction of the longer of their durations: the convention
+#: of the night reload (a saved review goes to the event within half its duration) and of the
+#: RERUN worker (the search event within half the guessed width).
+OVERLAP_FRAC = 0.5
 
 _REFRESH_FLAGS_SQL = """
 WITH target AS (
@@ -49,7 +66,12 @@ night_auto AS (
            bool_or(d.kind = ANY(%(night_var_kinds)s)
                    AND COALESCE(d.status, 'UNCONFIRMED') = 'UNCONFIRMED') AS var_open
     FROM relphot.detection d JOIN target t ON t.obj_id = d.obj_id
-    WHERE d.night_id IS NOT NULL AND d.origin = 'search'
+    WHERE d.night_id IS NOT NULL AND d.superseded_by IS NULL
+          AND (d.origin = 'search' OR EXISTS (
+                   SELECT 1 FROM relphot.detection s
+                   WHERE s.superseded_by = d.det_id AND s.origin = 'search'
+                         AND (s.auto_status IS DISTINCT FROM 'REJECTED' OR s.status = 'CONFIRMED')
+          ))
           AND COALESCE(d.status, 'UNCONFIRMED') <> 'REJECTED'
           AND (d.auto_status IS DISTINCT FROM 'REJECTED' OR d.status = 'CONFIRMED')
     GROUP BY d.obj_id, d.night_id
@@ -169,6 +191,11 @@ def refresh_flags(
     are ignored (one event's evidence only), and so are those with ``auto_status =
     'REJECTED'`` (too many similar events on the night, :mod:`relphot.db.coincidence`)
     unless a person CONFIRMED them: neither evidence nor open for review.
+    A superseded event (``superseded_by`` set) is neither: the active event of its light curve
+    stands for it. A person's own (``origin = 'user'``) active event counts as the night's
+    automatic evidence only when it supersedes a search event that itself would count, so a
+    RERUN of an automatic candidate keeps the night's evidence and its place in the review queue,
+    and a RERUN of nothing the search found never sets a flag.
     ``exop_source`` / ``var_source`` are
     ``'manual'`` iff the object has a verdict of that kind on some night. Every
     target object is updated (an object with no evidence gets false / ``'UNC'``).
@@ -214,7 +241,9 @@ def night_state(
 
     ``detections`` is a list of dicts with keys: kind (str), status (str or None),
     origin (str), and optionally auto_status (str or None: ``'REJECTED'`` is the automatic
-    "too many similar events" verdict of :mod:`relphot.db.coincidence`).
+    "too many similar events" verdict of :mod:`relphot.db.coincidence`), det_id and
+    superseded_by (int or None: the event this one was superseded by; see
+    :func:`refresh_flags` for how superseded and RERUN events count).
 
     Returns a dict with keys:
     - auto_exop, auto_var: whether automatic evidence is present
@@ -222,16 +251,33 @@ def night_state(
     - exop_effective, var_effective: the effective flag value (verdict overrides auto)
     - pending: whether this night awaits review
     """
-    # Only the search's own events that are not rejected -- by a person, or automatically
-    # unless a person CONFIRMED them -- are automatic evidence.
-    search_dets = [
-        d for d in detections
-        if d.get("origin") == "search"
-        and (d.get("status") or "UNCONFIRMED") != "REJECTED"
-        and not (
+    def _auto_ok(d: dict) -> bool:
+        """Not rejected by a person, nor automatically unless a person CONFIRMED it."""
+        return (d.get("status") or "UNCONFIRMED") != "REJECTED" and not (
             d.get("auto_status") == "REJECTED"
             and (d.get("status") or "UNCONFIRMED") != "CONFIRMED"
         )
+
+    def _stands_for_search(d: dict) -> bool:
+        """A person's event that supersedes a search event whose own status would count."""
+        det_id = d.get("det_id")
+        return det_id is not None and any(
+            s.get("superseded_by") == det_id and s.get("origin") == "search"
+            and (
+                s.get("auto_status") != "REJECTED"
+                or (s.get("status") or "UNCONFIRMED") == "CONFIRMED"
+            )
+            for s in detections
+        )
+
+    # Only the active search events that are not rejected -- by a person, or automatically
+    # unless a person CONFIRMED them -- are automatic evidence; so is a person's active event
+    # that supersedes such a search event.
+    search_dets = [
+        d for d in detections
+        if d.get("superseded_by") is None
+        and (d.get("origin") == "search" or _stands_for_search(d))
+        and _auto_ok(d)
     ]
 
     exop_ev = any(d["kind"] in NIGHT_EXOP_KINDS for d in search_dets)
@@ -276,11 +322,12 @@ def night_state(
 def transit_night_verdict(statuses: list[str | None]) -> str | None:
     """The night EXOP verdict that goes with the person's verdicts on one night's transit events.
 
-    ``statuses`` are the ``detection.status`` values of all the transit events of one object on
-    one night (``None`` reads as UNCONFIRMED). One CONFIRMED event makes the night CONFIRMED;
-    otherwise the night is REJECTED when every event is REJECTED; anything else (no events, or
-    some still open) is no verdict, i.e. ``None`` = automatic. An event's automatic rejection
-    (``auto_status``) is not a person's verdict and is not looked at here.
+    ``statuses`` are the ``detection.status`` values of the active transit events (not superseded
+    by another) of one object on one night (``None`` reads as UNCONFIRMED). One CONFIRMED event
+    makes the night CONFIRMED; otherwise the night is REJECTED when every event is REJECTED;
+    anything else (no events, or some still open) is no verdict, i.e. ``None`` = automatic. An
+    event's automatic rejection (``auto_status``) is not a person's verdict and is not looked at
+    here.
     """
     states = [s or "UNCONFIRMED" for s in statuses]
     if "CONFIRMED" in states:
@@ -296,7 +343,8 @@ def plan_night_exop_to_events(
     """The ``det_id`` s of one night's transit events to set, and to what, when that night's
     EXOP verdict goes from ``previous`` to ``new`` (the inverse of :func:`transit_night_verdict`).
 
-    ``events`` are ``(det_id, status)`` of all the transit events of the object on the night.
+    ``events`` are ``(det_id, status)`` of the active transit events (not superseded by another)
+    of the object on the night.
 
     - ``new`` REJECTED: every event not yet REJECTED becomes REJECTED.
     - ``new`` CONFIRMED: every event not REJECTED becomes CONFIRMED; an event a person REJECTED
@@ -318,3 +366,169 @@ def plan_night_exop_to_events(
             if s != "CONFIRMED" and not (s == "REJECTED" and keep_rejected)
         ], "CONFIRMED"
     return [d for d, s in states.items() if s == previous], "UNCONFIRMED"
+
+
+def sync_night_exop_from_events(cur, pairs: set[tuple[int, int | None]]) -> list[dict]:
+    """Events -> night: bring the EXOP verdict of each ``(obj_id, night_id)`` to what its active
+    transit events (not superseded by another) say (:func:`transit_night_verdict`); a row left
+    with no verdict and no note is deleted. A superseded event's own status is kept but is not
+    looked at. ``cur`` is a cursor of an open transaction, which the caller commits.
+
+    Returns ``[{obj_id, night_id, exop}]`` for the pairs, ``exop`` being the verdict or ``None``.
+    """
+    pairs = {(o, n) for o, n in pairs if n is not None}
+    if not pairs:
+        return []
+    obj_ids, night_ids = zip(*sorted(pairs), strict=True)
+    cur.execute(
+        "SELECT d.obj_id, d.night_id, array_agg(COALESCE(d.status, 'UNCONFIRMED')) "
+        "FROM relphot.detection d "
+        "JOIN unnest(%s::bigint[], %s::integer[]) AS p(obj_id, night_id) "
+        "ON p.obj_id = d.obj_id AND p.night_id = d.night_id "
+        "WHERE d.kind = 'transit' AND d.superseded_by IS NULL GROUP BY d.obj_id, d.night_id",
+        (list(obj_ids), list(night_ids)),
+    )
+    states = {(o, n): statuses for o, n, statuses in cur.fetchall()}
+    result = []
+    for obj_id, night_id in sorted(pairs):
+        verdict = transit_night_verdict(states.get((obj_id, night_id), []))
+        params = {"obj_id": obj_id, "night_id": night_id, "verdict": verdict}
+        if verdict is not None:
+            cur.execute(
+                "INSERT INTO relphot.user_night_review (obj_id, night_id, exop_verdict) "
+                "VALUES (%(obj_id)s, %(night_id)s, %(verdict)s) "
+                "ON CONFLICT (obj_id, night_id) DO UPDATE SET "
+                "exop_verdict = EXCLUDED.exop_verdict, updated_at = now() "
+                "WHERE relphot.user_night_review.exop_verdict IS DISTINCT FROM "
+                "EXCLUDED.exop_verdict",
+                params,
+            )
+        else:
+            cur.execute(
+                "UPDATE relphot.user_night_review SET exop_verdict = NULL, updated_at = now() "
+                "WHERE obj_id = %(obj_id)s AND night_id = %(night_id)s "
+                "AND exop_verdict IS NOT NULL",
+                params,
+            )
+            cur.execute(
+                "DELETE FROM relphot.user_night_review WHERE obj_id = %(obj_id)s "
+                "AND night_id = %(night_id)s AND exop_verdict IS NULL AND var_verdict IS NULL "
+                "AND note IS NULL",
+                params,
+            )
+        result.append({"obj_id": obj_id, "night_id": night_id, "exop": verdict})
+    return result
+
+
+# --------------------------------------------------------------------------
+# superseded transit events: one active event per transit of one light curve
+#
+# The events of ONE object on ONE night (one light curve; never two stars of a night) that fit
+# the same transit are a group: the search's event and the person's RERUNs. The group has one
+# active event (``superseded_by`` NULL); the others point at it. ``events`` below are dicts with
+# ``det_id``, ``tc`` (``detection.tc_bjd_tdb``, BJD), ``duration_h`` and ``superseded_by`` of the
+# transit events of that one object and night.
+# --------------------------------------------------------------------------
+
+
+def events_overlap(
+    tc_a: float | None, duration_a_h: float | None, tc_b: float | None, duration_b_h: float | None
+) -> bool:
+    """Whether two transit events of one light curve are the same transit: their centre times
+    (BJD) differ by at most :data:`OVERLAP_FRAC` of the longer duration (hours). An event with no
+    centre time overlaps nothing; a missing duration counts as zero."""
+    if tc_a is None or tc_b is None:
+        return False
+    longest = max(d for d in (duration_a_h, duration_b_h, 0.0) if d is not None)
+    return abs(tc_a - tc_b) <= OVERLAP_FRAC * longest / 24.0
+
+
+def _group_of(keep_id: int, events: list[dict]) -> set[int]:
+    """The events ``keep_id`` competes with (and itself): those that overlap it in time, and
+    everything already linked to them or to it (the active event they were superseded by, and the
+    events superseded by that one)."""
+    by_id = {e["det_id"]: e for e in events}
+    keep = by_id[keep_id]
+    base = {keep_id} | {
+        e["det_id"] for e in events
+        if e["det_id"] != keep_id
+        and events_overlap(keep["tc"], keep["duration_h"], e["tc"], e["duration_h"])
+    }
+
+    def root(det_id: int) -> int:
+        parent = by_id[det_id].get("superseded_by")
+        return parent if parent in by_id else det_id
+
+    roots = {root(i) for i in base}
+    return base | roots | {i for i in by_id if root(i) in roots}
+
+
+def plan_keep(keep_id: int, events: list[dict]) -> dict[int, int | None]:
+    """The ``superseded_by`` changes that make ``keep_id`` the active event of its group.
+
+    ``{det_id: new superseded_by}`` for each event whose link must change: ``keep_id`` itself
+    becomes active (``None``) and every other event of its group (:func:`_group_of`) is
+    superseded by it, whatever it was superseded by before, so links stay flat. An event of the
+    night outside the group (another transit) is left alone. ``{}`` when ``keep_id`` is not among
+    ``events`` or already stands alone as the active event.
+    """
+    by_id = {e["det_id"]: e for e in events}
+    if keep_id not in by_id:
+        return {}
+    changes: dict[int, int | None] = {}
+    for det_id in _group_of(keep_id, events):
+        wanted = None if det_id == keep_id else keep_id
+        if by_id[det_id].get("superseded_by") != wanted:
+            changes[det_id] = wanted
+    return changes
+
+
+def competing_events(events: list[dict]) -> dict[int, list[int]]:
+    """For each event, the ``det_id`` s of the other events of the light curve it competes with
+    (its group without itself, sorted): the events a "keep this" on it would supersede, or that
+    superseded it. Empty for an event that is the only one of its transit."""
+    return {
+        e["det_id"]: sorted(_group_of(e["det_id"], events) - {e["det_id"]}) for e in events
+    }
+
+
+_NIGHT_TRANSITS_SQL = (
+    "SELECT det_id, tc_bjd_tdb, duration_h, superseded_by FROM relphot.detection "
+    "WHERE obj_id = %s AND night_id = %s AND kind = 'transit' ORDER BY det_id"
+)
+
+
+def keep_transit_event(cur, det_id: int) -> tuple[int, int, dict[int, int | None]]:
+    """Make the per-night transit event ``det_id`` the active event of its group
+    (:func:`plan_keep`) and write the changed ``superseded_by`` links. Used by the RERUN worker
+    for the event it just stored (the older events it overlaps are superseded) and by the web's
+    "keep this" button (which swaps the links back and forth). Only the events of that one
+    object and night are read or written; the database refuses a link across objects or nights
+    anyway.
+
+    ``cur`` is a cursor of an open transaction, which the caller commits. Returns
+    ``(obj_id, night_id, changes)``, ``changes`` as in :func:`plan_keep` (``{}``: nothing to do).
+    Raises :class:`LookupError` when ``det_id`` is not a per-night transit event.
+    """
+    cur.execute(
+        "SELECT obj_id, night_id FROM relphot.detection "
+        "WHERE det_id = %s AND kind = 'transit' AND night_id IS NOT NULL",
+        (det_id,),
+    )
+    found = cur.fetchone()
+    if found is None:
+        msg = f"per-night transit event {det_id} not found"
+        raise LookupError(msg)
+    obj_id, night_id = found
+    cur.execute(_NIGHT_TRANSITS_SQL, (obj_id, night_id))
+    events = [
+        {"det_id": i, "tc": tc, "duration_h": dur, "superseded_by": sup}
+        for i, tc, dur, sup in cur.fetchall()
+    ]
+    changes = plan_keep(det_id, events)
+    for changed_id, superseded_by in changes.items():
+        cur.execute(
+            "UPDATE relphot.detection SET superseded_by = %s WHERE det_id = %s",
+            (superseded_by, changed_id),
+        )
+    return obj_id, night_id, changes
