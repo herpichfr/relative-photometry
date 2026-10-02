@@ -19,6 +19,12 @@ worker, which runs on the host with the owner role like the loader, carries it o
   ``tc_guess`` is never overwritten (its id is kept in the new detection's ``extra``). User
   detections take part in ``transit_match`` (events are never merged), survive a night reload
   (which deletes ``origin = 'search'`` only) and never set ``is_exop`` by themselves.
+  The new event SUPERSEDES the older events of that object and night that fit the same transit
+  (:func:`relphot.objflags.keep_transit_event`: centre times within half the longer duration;
+  ``detection.superseded_by``), converged or not; then the night's EXOP verdict is re-derived
+  from the active events, so the new event awaits its own review (the superseded events keep
+  their statuses, for the web's "keep this" button to swap back). A request whose fit does not
+  converge stores no event and supersedes nothing.
 
 Both kinds then rebuild the object's transit matches and repeated-event families
 (:mod:`relphot.db.families`) and refresh its summary fields.
@@ -58,6 +64,7 @@ from relphot.db.analyze import (
 from relphot.db.families import update_families
 from relphot.db.refresh import refresh_objects
 from relphot.exceptions import ReprocessError
+from relphot.objflags import keep_transit_event, sync_night_exop_from_events
 
 logger = logging.getLogger(__name__)
 
@@ -178,9 +185,15 @@ def _process_transit(conn: psycopg.Connection, req: dict, settings: Settings) ->
         (det_id,) = cur.fetchone()
         shape["det_id"] = det_id
         cur.execute(_SHAPE_INSERT_SQL, _shape_values(obj_id, shape))
+        # the older events of this light curve that fit the same transit are superseded, and the
+        # night's EXOP verdict follows the events that are left active
+        _, _, changes = keep_transit_event(cur, det_id)
+        sync_night_exop_from_events(cur, {(obj_id, nd.night_id)})
+        superseded = sorted(i for i, by in changes.items() if by == det_id)
 
     return {
         "det_id": det_id, "search_det_id": search_det_id, "night_id": nd.night_id,
+        "superseded": superseded,
         **{
             key: shape[key] for key in (
                 "tc", "tc_err", "depth", "depth_err", "t14_h", "t14_err", "t14_lower_limit",

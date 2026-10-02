@@ -150,8 +150,8 @@ def test_migration_004_from_v3_maps_class_to_flags(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12]
-    assert current_version(test_conn) == 12
+    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    assert current_version(test_conn) == 13
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -285,7 +285,7 @@ def test_migration_005_verify_status_backfill_and_check(test_conn) -> None:
             )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [5, 6, 7, 8, 9, 10, 11, 12]
+    assert init_schema(test_conn) == [5, 6, 7, 8, 9, 10, 11, 12, 13]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -308,7 +308,7 @@ def test_migration_007_night_zero_point_defaults_existing_nights_to_assumed(test
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [7, 8, 9, 10, 11, 12]
+    assert init_schema(test_conn) == [7, 8, 9, 10, 11, 12, 13]
 
     with test_conn.cursor() as cur:
         cur.execute("SELECT zp, zp_source FROM relphot.night")
@@ -335,7 +335,7 @@ def test_migration_008_night_zero_point_source_accepts_measured(test_conn) -> No
         cur.execute("UPDATE relphot.night SET zp_source = 'measured'")
     test_conn.rollback()
 
-    assert init_schema(test_conn) == [8, 9, 10, 11, 12]
+    assert init_schema(test_conn) == [8, 9, 10, 11, 12, 13]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -376,7 +376,7 @@ def test_migration_009_coincidence_columns_and_table_from_v8(test_conn) -> None:
         (det_id,) = cur.fetchone()
     test_conn.commit()
 
-    assert init_schema(test_conn) == [9, 10, 11, 12]
+    assert init_schema(test_conn) == [9, 10, 11, 12, 13]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -475,8 +475,8 @@ def test_migration_006_guided_reprocessing_schema_from_v5(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12]
-    assert current_version(test_conn) == 12
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12, 13]
+    assert current_version(test_conn) == 13
 
     with test_conn.cursor() as cur:
         # existing rows: searches' detections, no inflation information, no new estimate info
@@ -570,7 +570,7 @@ def test_migration_006_user_night_review_from_v5_backfills_object_level_flags(te
                 )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12]
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12, 13]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -799,7 +799,7 @@ def test_migration_010_loose_night_ids_from_v9(test_conn) -> None:
             (["a", "b"],),
         )
     test_conn.commit()
-    assert init_schema(test_conn) == [10, 11, 12]
+    assert init_schema(test_conn) == [10, 11, 12, 13]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -841,7 +841,7 @@ def test_migration_011_members_from_v10(test_conn) -> None:
         (obj_id,) = cur.fetchone()
     test_conn.commit()
 
-    assert init_schema(test_conn) == [11, 12]
+    assert init_schema(test_conn) == [11, 12, 13]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -994,8 +994,8 @@ def test_migration_011_members_from_v10(test_conn) -> None:
 def test_migration_012_repeat_events_from_v11(test_conn) -> None:
     _apply_up_to(test_conn, 11)
     test_conn.commit()
-    assert init_schema(test_conn) == [12]
-    assert current_version(test_conn) == 12
+    assert init_schema(test_conn) == [12, 13]
+    assert current_version(test_conn) == 13
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -1110,5 +1110,53 @@ def test_migration_012_repeat_events_from_v11(test_conn) -> None:
         cur.execute("SELECT count(*), count(fam_id) FROM relphot.repeat_ephemeris")
         assert cur.fetchone() == (1, 0)
         cur.execute("SELECT count(*) FROM relphot.repeat_decision")
+        assert cur.fetchone() == (1,)
+    test_conn.commit()
+
+
+def test_migration_013_supersede_from_v12(test_conn) -> None:
+    _apply_up_to(test_conn, 12)
+    test_conn.commit()
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.object (name, ra, dec) VALUES ('o', 0, 0) RETURNING obj_id"
+        )
+        (obj_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+            "VALUES ('T80S', '2025-01-01', 'a', '/tmp/a') RETURNING night_id"
+        )
+        (night_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind, origin) "
+            "VALUES (%s, %s, 'transit', 'search'), (%s, %s, 'transit', 'user') RETURNING det_id",
+            (obj_id, night_id, obj_id, night_id),
+        )
+        det_ids = [row[0] for row in cur.fetchall()]
+    test_conn.commit()
+
+    assert init_schema(test_conn) == [13]
+    assert current_version(test_conn) == 13
+
+    with test_conn.cursor() as cur:
+        # no row is linked by the migration
+        cur.execute("SELECT count(*) FROM relphot.detection WHERE superseded_by IS NOT NULL")
+        assert cur.fetchone() == (0,)
+        # the web role may set the link and nothing else new
+        cur.execute(
+            "SELECT has_column_privilege('relphot_web', 'relphot.detection', 'superseded_by', "
+            "'UPDATE'), has_column_privilege('relphot_web', 'relphot.detection', 'obj_id', "
+            "'UPDATE'), has_column_privilege('relphot_ro', 'relphot.detection', 'superseded_by', "
+            "'UPDATE'), has_column_privilege('relphot_ro', 'relphot.detection', 'superseded_by', "
+            "'SELECT')"
+        )
+        assert cur.fetchone() == (True, False, False, True)
+        cur.execute(
+            "UPDATE relphot.detection SET superseded_by = %s WHERE det_id = %s",
+            (det_ids[1], det_ids[0]),
+        )
+        cur.execute(
+            "SELECT count(*) FROM relphot.detection WHERE superseded_by = %s", (det_ids[1],)
+        )
         assert cur.fetchone() == (1,)
     test_conn.commit()

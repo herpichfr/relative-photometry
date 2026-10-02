@@ -98,8 +98,9 @@ def load_families(
     """The stored families with their aliases (SELECT only), as :func:`predict_windows` takes them.
 
     ``telescope``: only objects with a night of that telescope. Each family dict has the
-    ``repeat_family`` columns, ``obj_name``, ``stale`` (a member was rejected, or the person
-    decided on a pair, since the family was computed) and ``aliases`` (``repeat_ephemeris`` rows).
+    ``repeat_family`` columns, ``obj_name``, ``stale`` (a member was rejected or superseded, or the
+    person decided on a pair, since the family was computed) and ``aliases`` (``repeat_ephemeris``
+    rows).
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -110,7 +111,7 @@ def load_families(
                        SELECT 1 FROM relphot.repeat_family_member m
                        JOIN relphot.detection d ON d.det_id = m.det_id
                        WHERE m.fam_id = f.fam_id
-                         AND (d.status = 'REJECTED'
+                         AND (d.status = 'REJECTED' OR d.superseded_by IS NOT NULL
                               OR (d.auto_status = 'REJECTED'
                                   AND d.status IS DISTINCT FROM 'CONFIRMED'))
                    ) OR EXISTS (

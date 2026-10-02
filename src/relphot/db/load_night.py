@@ -263,6 +263,66 @@ def _restore_detection_reviews(
     return n_restored, n_orphaned
 
 
+def _restore_supersede_links(
+    cur: psycopg.Cursor, night_id: int, saved: list[tuple]
+) -> tuple[int, int]:
+    """Re-attach the saved ``detection.superseded_by`` links of the reloaded night.
+
+    ``saved`` holds ``(det_id, obj_id, origin, tc, duration_h, superseded_by)`` of every transit
+    event that was linked (either end) before the reload. A person's (``origin = 'user'``) event
+    keeps its id; a search event was re-created, so it goes to the new search transit event of
+    the same object whose ``tc`` differs by at most half the saved duration (the nearest one),
+    like a saved review. A link whose either end cannot be found is dropped with a warning: both
+    events are then active again. Returns ``(n_restored, n_lost)``.
+    """
+    cur.execute(
+        "SELECT det_id, obj_id, tc_bjd_tdb, duration_h FROM relphot.detection "
+        "WHERE night_id = %s AND kind = 'transit' AND origin = 'search' ORDER BY det_id",
+        (night_id,),
+    )
+    pool: dict[int, list[tuple[int, float | None, float | None]]] = {}
+    for det_id, obj_id, tc, dur in cur.fetchall():
+        pool.setdefault(obj_id, []).append((det_id, tc, dur))
+
+    now_id: dict[int, int] = {}
+    used: set[int] = set()
+    for old_id, obj_id, origin, tc, duration_h, _ in saved:
+        if origin != "search":
+            now_id[old_id] = old_id
+            continue
+        if tc is None:
+            continue
+        near = [
+            c for c in pool.get(obj_id, [])
+            if c[0] not in used and c[1] is not None
+            and abs(c[1] - tc)
+            <= 0.5 * (duration_h if duration_h is not None else (c[2] or 0.0)) / 24.0
+        ]
+        if near:
+            best = min(near, key=lambda c: abs(c[1] - tc))
+            used.add(best[0])
+            now_id[old_id] = best[0]
+
+    n_restored = n_lost = 0
+    for old_id, obj_id, _origin, tc, _dur, old_parent in saved:
+        if old_parent is None:
+            continue
+        child, parent = now_id.get(old_id), now_id.get(old_parent)
+        if child is None or parent is None:
+            logger.warning(
+                "night %d reload: a transit event of obj_id=%d (tc=%s) superseded by an event "
+                "that no longer matches; both are active again",
+                night_id, obj_id, tc,
+            )
+            n_lost += 1
+            continue
+        cur.execute(
+            "UPDATE relphot.detection SET superseded_by = %s WHERE det_id = %s", (parent, child)
+        )
+        n_restored += 1
+    return n_restored, n_lost
+
+
 def _optional_col(row: object, name: str) -> float | None:
     """``row.<name>`` as a finite float, or ``None`` when the column is absent or NaN.
 
@@ -545,6 +605,18 @@ def load_night(
                 (night_id,),
             )
             saved_reviews = cur.fetchall()
+            # the supersede links (a RERUN's event replacing another of the same light curve) of
+            # this night: the search events are re-created below with new ids, and the person's
+            # events lose a link to one of them, so both ends are saved and re-attached
+            cur.execute(
+                "SELECT det_id, obj_id, origin, tc_bjd_tdb, duration_h, superseded_by "
+                "FROM relphot.detection WHERE night_id = %(night_id)s AND kind = 'transit' "
+                "AND (superseded_by IS NOT NULL OR det_id IN ("
+                "SELECT superseded_by FROM relphot.detection "
+                "WHERE night_id = %(night_id)s AND superseded_by IS NOT NULL))",
+                {"night_id": night_id},
+            )
+            saved_links = cur.fetchall()
             # the repeated-event families with an event of this night go too (their ephemeris
             # rows stay as history); `db analyze` recomputes them
             cur.execute(
@@ -883,6 +955,8 @@ def load_night(
 
             if saved_reviews:
                 _restore_detection_reviews(cur, night_id, saved_reviews)
+            if saved_links:
+                _restore_supersede_links(cur, night_id, saved_links)
 
             # --- drop objects this reload (or a prior one) left with no star_night, except
             # those a person has touched: any manual flag or period, a status, notes, a

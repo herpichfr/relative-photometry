@@ -316,6 +316,103 @@ def test_worker_transit_request_adds_a_user_detection_and_never_touches_the_sear
     assert is_exop is True  # from the search event; see the next test for user events alone
 
 
+def _links(conn) -> dict[int, int | None]:
+    conn.rollback()
+    with conn.cursor() as cur:
+        cur.execute("SELECT det_id, superseded_by FROM relphot.detection ORDER BY det_id")
+        return dict(cur.fetchall())
+
+
+def _night_verdict(conn, obj_id: int, night_id: int) -> str | None:
+    conn.rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT exop_verdict FROM relphot.user_night_review "
+            "WHERE obj_id = %s AND night_id = %s",
+            (obj_id, night_id),
+        )
+        row = cur.fetchone()
+    return None if row is None else row[0]
+
+
+def test_worker_rerun_supersedes_the_search_event_it_refits_not_another_transit(test_conn) -> None:
+    obj_id, night_id, search_det = _insert_two_dip_night(test_conn, "supersede")
+    # the person had REJECTED the night, and with it the search event, before this RERUN
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.detection SET status = 'REJECTED' WHERE det_id = %s", (search_det,)
+        )
+        cur.execute(
+            "INSERT INTO relphot.user_night_review (obj_id, night_id, exop_verdict) "
+            "VALUES (%s, %s, 'REJECTED')",
+            (obj_id, night_id),
+        )
+    test_conn.commit()
+    on_search = _queue(
+        test_conn, obj_id, "transit", tc_guess=2460000.125, width_guess_h=2.4, night_id=night_id
+    )
+    elsewhere = _queue(test_conn, obj_id, "transit", tc_guess=2460000.31, width_guess_h=1.5)
+
+    assert reprocess(test_conn, settings=_SETTINGS).n_done == 2
+    a, b = _request(test_conn, on_search)["result"], _request(test_conn, elsewhere)["result"]
+
+    # the refit of the search event supersedes it; the other dip of the night is its own event
+    assert a["superseded"] == [search_det] and b["superseded"] == []
+    assert _links(test_conn) == {search_det: a["det_id"], a["det_id"]: None, b["det_id"]: None}
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, origin FROM relphot.detection WHERE det_id = %s", (search_det,)
+        )
+        assert cur.fetchone() == ("REJECTED", "search")  # the person's verdict is kept on it
+        cur.execute(
+            "SELECT is_exop, n_review_pending FROM relphot.object WHERE obj_id = %s", (obj_id,)
+        )
+        # the RERUN event stands for the search event: the flag stays, the night awaits review
+        assert cur.fetchone() == (True, 1)
+        cur.execute("SELECT count(*) FROM relphot.transit_match WHERE obj_id = %s", (obj_id,))
+        assert cur.fetchone() == (3,)  # the pairs are still stored; the web hides superseded ones
+    # the night's EXOP verdict follows the active events (the new ones are open): cleared
+    assert _night_verdict(test_conn, obj_id, night_id) is None
+
+
+def test_failed_rerun_supersedes_nothing_and_leaves_the_verdicts_alone(test_conn) -> None:
+    obj_id, night_id, search_det = _insert_two_dip_night(test_conn, "fail_supersede")
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.detection SET status = 'REJECTED' WHERE det_id = %s", (search_det,)
+        )
+        cur.execute(
+            "INSERT INTO relphot.user_night_review (obj_id, night_id, exop_verdict) "
+            "VALUES (%s, %s, 'REJECTED')",
+            (obj_id, night_id),
+        )
+    test_conn.commit()
+    bad_fit = _queue(test_conn, obj_id, "transit", tc_guess=2460000.0005, width_guess_h=0.1)
+
+    assert reprocess(test_conn, settings=_SETTINGS).n_failed == 1
+    assert _request(test_conn, bad_fit)["status"] == "failed"
+    assert _links(test_conn) == {search_det: None}
+    assert _night_verdict(test_conn, obj_id, night_id) == "REJECTED"
+
+
+def test_a_second_rerun_of_the_same_transit_supersedes_the_first_and_the_search_event(
+    test_conn,
+) -> None:
+    obj_id, _night, search_det = _insert_two_dip_night(test_conn, "twice")
+    first = _queue(test_conn, obj_id, "transit", tc_guess=2460000.125, width_guess_h=2.4)
+    assert reprocess(test_conn, settings=_SETTINGS).n_done == 1
+    second = _queue(test_conn, obj_id, "transit", tc_guess=2460000.119, width_guess_h=2.0)
+    assert reprocess(test_conn, settings=_SETTINGS).n_done == 1
+
+    one, two = _request(test_conn, first)["result"], _request(test_conn, second)["result"]
+    assert one["superseded"] == [search_det]
+    assert two["superseded"] == sorted([search_det, one["det_id"]])
+    # flat: both older events point at the newest
+    assert _links(test_conn) == {
+        search_det: two["det_id"], one["det_id"]: two["det_id"], two["det_id"]: None,
+    }
+
+
 def test_user_detections_never_set_is_exop_and_analyze_refits_them(test_conn) -> None:
     obj_id = _insert_object(test_conn, "user_only")
     night_id = _insert_night(test_conn, "user_only_n")

@@ -57,6 +57,51 @@ Version 009 adds the automatic cross-candidate check of the per-night transit ev
 
 Version 011 adds traceability of reference and comparison star sets used to build each tile's light curves (`relphot.night_tile`, `relphot.tile_lc`, `relphot.reference_member`, `relphot.comparison_member` tables). **After `relphot db init` applies version 011, backfill members** with `relphot members <night>/night.npz <night>/ref.npz <night>/lc/<stem>.npz` (recovers reference stars from the npz products) and then `relphot db load-members <night>/relphot [--lc-stem STEM]` per night (or use the `--no-members` flag to skip the automatic backfill in `relphot lightcurves` after that).
 
+Version 013 adds `detection.superseded_by` (a RERUN's transit event superseding an older event of the same light curve, see "User-guided reprocessing"): a composite foreign key `(superseded_by, obj_id, night_id)` that makes the database refuse a link to an event of another object or another night, a CHECK that only per-night transit events are linked, and the single grant `UPDATE (superseded_by)` to `relphot_web`. It needs PostgreSQL >= 15 (`ON DELETE SET NULL (column)`). No row changes: the RERUN events stored before 013 stay unlinked (both events active) until the one-off backfill below is run, or until a new RERUN / a "Keep this" press links them. Run `relphot db init` right after pulling this version, **before** any other `relphot db` command or the worker: the flag derivation (`refresh_flags`) reads the new column.
+
+**One-off supersede backfill** (owner role, once, after `relphot db init` applied 013): the newest RERUN event of each object and night supersedes the other transit events of that light curve that overlap it (the rule under "User-guided reprocessing"); the night's EXOP verdict then follows the active events:
+
+```sql
+BEGIN;
+WITH ev AS (
+    SELECT det_id, obj_id, night_id, origin, tc_bjd_tdb AS tc, duration_h AS dur
+    FROM relphot.detection
+    WHERE kind = 'transit' AND night_id IS NOT NULL AND tc_bjd_tdb IS NOT NULL
+), newest AS (
+    SELECT DISTINCT ON (obj_id, night_id) det_id, obj_id, night_id, tc, dur
+    FROM ev WHERE origin = 'user' ORDER BY obj_id, night_id, det_id DESC
+)
+UPDATE relphot.detection d SET superseded_by = n.det_id
+FROM newest n, ev
+WHERE ev.det_id = d.det_id AND ev.obj_id = n.obj_id AND ev.night_id = n.night_id
+  AND ev.det_id <> n.det_id
+  AND abs(ev.tc - n.tc) <= 0.5 * greatest(ev.dur, n.dur, 0) / 24.0;
+
+WITH verdicts AS (
+    SELECT p.obj_id, p.night_id,
+           CASE WHEN bool_or(COALESCE(d.status, 'UNCONFIRMED') = 'CONFIRMED') THEN 'CONFIRMED'
+                WHEN bool_and(COALESCE(d.status, 'UNCONFIRMED') = 'REJECTED') THEN 'REJECTED'
+           END AS verdict
+    FROM (SELECT DISTINCT obj_id, night_id FROM relphot.detection
+          WHERE superseded_by IS NOT NULL) p
+    JOIN relphot.detection d ON d.obj_id = p.obj_id AND d.night_id = p.night_id
+         AND d.kind = 'transit' AND d.superseded_by IS NULL
+    GROUP BY p.obj_id, p.night_id
+)
+UPDATE relphot.user_night_review r SET exop_verdict = v.verdict, updated_at = now()
+FROM verdicts v
+WHERE r.obj_id = v.obj_id AND r.night_id = v.night_id
+  AND r.exop_verdict IS DISTINCT FROM v.verdict;
+DELETE FROM relphot.user_night_review r
+USING (SELECT DISTINCT obj_id, night_id FROM relphot.detection
+       WHERE superseded_by IS NOT NULL) p
+WHERE r.obj_id = p.obj_id AND r.night_id = p.night_id
+  AND r.exop_verdict IS NULL AND r.var_verdict IS NULL AND r.note IS NULL;
+COMMIT;
+```
+
+Then `relphot db analyze --obj-id <id>` for each object it touched (flags, matching transits, families).
+
 ## Nightly workflow
 
 Per night, per telescope, after the usual relphot photometry stages:
@@ -151,6 +196,8 @@ On an object's detail view, RERUN queues a re-run with your own guess (`relphot.
 
 - **variable** (period guess in days > 0): Lomb-Scargle in the windows `guess x h x (1 +/- db.guided_period_window_frac)` (default 0.2) for h in 0.5, 1, 2, refined by the Fourier fit (long periods as above), stored as a `period_estimate` with `method = 'LS-guided'` and the guess in `guess`, verified against the literature period as usual. A later guided request on the same nights replaces the earlier guided row (the request history keeps every result). It never changes PERIOD: the result offers **Adopt as period** (`POST /api/object/{id}/adopt_period`), which sets a manual PERIOD with the estimate's error (`period_source = 'manual'`; "reset period to auto" hands it back). Estimates flagged `long_period_needs_tie` cannot be adopted. 'All nights rerun' unticked restricts the search to the chosen night (no multi-night tie; only periods shorter than the night's span can be found).
 - **transit** (centre in BJD_TDB inside an observed night of the object -- or click the light curve to fill it -- and a width of 0.1-12 hours): the trapezoid fit of "Transit events" (window `tc +/- max(1.5 w, w + 1 h)`, incomplete events are lower limits) started there. The result is a new `transit_shape` on a NEW detection with `origin = 'user'`; a search detection of that night within half the width is linked in the new detection's `extra` and never overwritten. User detections appear in the Transit events and Matching transits tables (events are never merged), are **not** deleted when the night is reloaded (a reload replaces the `origin = 'search'` detections only, and never drops an object that holds a user detection or a request), and never set `is_exop` or the best-transit summary; set the flag by hand if you want it.
+
+**A RERUN's event supersedes the older event of the same transit.** The new event is compared with the other per-night transit events of the SAME object on the SAME night (one light curve; two stars of one night, e.g. the look-alikes of the Similar events window, are never linked -- the database enforces it): those whose centre time differs from the new one by at most half the longer of the two durations (`detection.tc_bjd_tdb` / `duration_h`; the convention of the night reload) are marked `detection.superseded_by = <new event>`, converged or not, together with everything already linked to them. A superseded event keeps its status and notes, is shown greyed in the Transit events table as "superseded by det N (RERUN)", is no open candidate, is out of the night's EXOP verdict (the verdict is re-derived from the active events when the worker stores the event, so the night is open for review again), out of the repeated-event families (marked stale until the next `relphot db analyze`) and out of the Matching transits table, and its trapezoid is drawn grey and dashed on the light curve and left out of the residuals. A RERUN whose fit does not converge stores no event and supersedes nothing. Another transit of the same night (no overlap) stays an independent active event. The night's automatic evidence is unchanged: a person's active event counts for the automatic flag only when it supersedes a search event that counts. **Keep this** (`POST /api/detection/{det_id}/keep`, `relphot_web` role) in the Transit events table appears on an event that has such a competitor: it makes that event the active one and marks the overlapping ones superseded by it; pressing it on the other swaps them back. A night reload (`relphot db load-night`) saves the links with the search events' reviews and re-attaches them to the re-created events (by object and centre time, like a saved review); a link whose event no longer matches is dropped with a warning and both events are active again.
 
 Both kinds then rebuild the object's transit matches and refresh its summary fields. The request history (status, result) is polled by the page, which also shows the queue depth.
 

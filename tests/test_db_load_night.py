@@ -806,6 +806,69 @@ def test_reload_spares_an_orphan_object_that_only_has_a_review_row(test_conn, tm
         assert [r[0] for r in cur.fetchall()] == ["reviewed_only"]
 
 
+def test_reload_reattaches_supersede_links_in_both_directions(
+    test_conn, tmp_path, caplog
+) -> None:
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    report = load_night(test_conn, root, settings=_SETTINGS)
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT obj_id, det_id FROM relphot.detection WHERE kind = 'transit'")
+        obj_id, search_det = cur.fetchone()
+        # a RERUN of the same transit (the search event is at tc 2460000.55, 1.5 h long)
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind, depth, tc_bjd_tdb, "
+            "duration_h, flags, origin) VALUES (%s, %s, 'transit', 0.02, 2460000.555, 1.0, "
+            "'USER', 'user') RETURNING det_id",
+            (obj_id, report.night_id),
+        )
+        (user_det,) = cur.fetchone()
+        cur.execute(
+            "UPDATE relphot.detection SET superseded_by = %s WHERE det_id = %s",
+            (user_det, search_det),
+        )
+    test_conn.commit()
+
+    def links() -> dict[str, tuple[int, int | None]]:
+        test_conn.rollback()
+        with test_conn.cursor() as cur:
+            cur.execute(
+                "SELECT origin, det_id, superseded_by FROM relphot.detection "
+                "WHERE kind = 'transit'"
+            )
+            return {origin: (det_id, by) for origin, det_id, by in cur.fetchall()}
+
+    # the search event is superseded by the person's: re-created with a new id, still superseded
+    load_night(test_conn, root, settings=_SETTINGS)
+    found = links()
+    assert found["search"][0] != search_det
+    assert found == {"search": (found["search"][0], user_det), "user": (user_det, None)}
+
+    # "keep this" on the search event: the person's is superseded by it, and stays so
+    with test_conn.cursor() as cur:
+        cur.execute("UPDATE relphot.detection SET superseded_by = NULL WHERE origin = 'search'")
+        cur.execute(
+            "UPDATE relphot.detection SET superseded_by = %s WHERE origin = 'user'",
+            (found["search"][0],),
+        )
+    test_conn.commit()
+    load_night(test_conn, root, settings=_SETTINGS)
+    again = links()
+    assert again["search"][0] != found["search"][0]
+    assert again == {"search": (again["search"][0], None), "user": (user_det, again["search"][0])}
+
+    # the event moved by far more than half its duration: it is another event, the link is
+    # dropped with a warning and both are active
+    _edit_metrics(root, lambda sm: sm.__setitem__(
+        "transit_tc_bjd_tdb", sm["transit_tc_bjd_tdb"] + 0.2
+    ))
+    with caplog.at_level("WARNING", logger="relphot.db.load_night"):
+        load_night(test_conn, root, settings=_SETTINGS)
+    moved = links()
+    assert moved == {"search": (moved["search"][0], None), "user": (user_det, None)}
+    assert "both are active again" in caplog.text
+
+
 def test_reload_keeps_user_detections_and_the_objects_they_touch(test_conn, tmp_path) -> None:
     root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
     _write_night1(root)
