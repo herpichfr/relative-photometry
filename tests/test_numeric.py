@@ -26,6 +26,29 @@ def test_nanmedian_quiet_all_nan_no_warning() -> None:
         assert len(w) == 0, "nanmedian_quiet should suppress RuntimeWarning for all-NaN input"
 
 
+def test_nanmedian_quiet_long_axis_matches_numpy_exactly() -> None:
+    """Axes past numpy's slow-path threshold use the sorted implementation: same values."""
+    rng = np.random.default_rng(1)
+    for dtype in (np.float32, np.float64):
+        for shape, axis in (((700, 9), 0), ((9, 650), 1), ((3, 700, 4), 1), ((600, 5), 0)):
+            arr = rng.normal(size=shape).astype(dtype)
+            arr[rng.random(shape) < 0.3] = np.nan
+            lines = np.moveaxis(arr, axis, -1)  # a view: edits land in ``arr``
+            lines[(0,) * (lines.ndim - 1)] = np.nan  # an all-NaN slice
+            single = lines[(1,) * (lines.ndim - 1)]
+            single[:] = np.nan
+            single[3] = 3.5  # a slice with one valid value
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                expected = np.nanmedian(arr, axis=axis)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", category=RuntimeWarning)
+                got = nanmedian_quiet(arr, axis=axis)
+            assert not caught
+            assert got.dtype == expected.dtype
+            np.testing.assert_array_equal(got, expected)
+
+
 def test_mad_sigma_standard_normal() -> None:
     """MAD sigma of N(0,1) sample within 0.03 of 1.0."""
     rng = np.random.default_rng(seed=42)
