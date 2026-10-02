@@ -1,4 +1,4 @@
-> Report dated 2026-10-02. relphot main 2f3b709 (forced ingest + frame-quality cut + R90 + NEIGHBOUR_SHARED_EVENT) for the per-night runs; tie fix on branch `tie-fix` e629dd5 (not merged at the time of writing). Scratch: `/ssdsto1/data/mnt/rejected_survival/`, `/ssdsto1/data/mnt/tie_fix/`, `/ssdsto1/data/mnt/neighbour_flag/` (may no longer exist).
+> Report dated 2026-10-02. relphot main 2f3b709 (forced ingest + frame-quality cut + R90 + NEIGHBOUR_SHARED_EVENT) for the per-night runs; tie fix e629dd5, merged as 003d450 and used for the final multinight run. Scratch: `/ssdsto1/data/mnt/rejected_survival/`, `/ssdsto1/data/mnt/tie_fix/`, `/ssdsto1/data/mnt/neighbour_flag/` (may no longer exist).
 
 # T80S re-analysis with forced photometry, neighbour shared-event flag, and survival of user-REJECTED events
 
@@ -114,8 +114,17 @@ old epoch.
 - Forced per-night tie floors (aperture 0, mean of bins) are 1.1-1.9x the catalogue-mode values on the core nights (1104 7.6 vs 3.4,
   1105 5.8 vs 4.0, 1106 27.3 vs 18.3, 1107 20.8 vs 15.4 mmag).
 
-## 5. Pending
+## 5. Completion (tie fix merged 003d450)
 
-- Merge `tie-fix`, re-run `relphot multinight` + `multisearch` + `db load-multinight`, drop mn_run 12, `relphot db analyze --all`.
+- `run_forced_step3.sh`: mn_run 12 dropped (diverged products kept in `multinight/mn_1104_1207_loose_forced_diverged/`), `relphot multinight`
+  re-run with the fix (97 s; 17 aperture-4 stars excluded as runaway), `multisearch`, `db load-multinight` -> mn_run 13,
+  `relphot db analyze --all` (196 s): 911280 tie rows, 0 non-finite or |mag| > 30; 1559 transit shapes; coincidence veto 472 auto-rejected.
+- With the coincidence veto (DB, after analyze), the 328 REJECTED events re-attached in the DB split into 214 not auto-rejected
+  (119 of them without any R90 or NEIGHBOUR_SHARED_EVENT flag) and 114 auto-rejected. **Strictest survival: 119 of 1171 = 10.2 %**
+  (DB-based, so it excludes the 23 survivors orphaned by the tc re-attach rule). UNCONFIRMED in the DB after reload: 1225 transit events,
+  358 auto-rejected; 399 not auto-rejected and without R90/NEIGHBOUR_SHARED_EVENT flags.
+
+## 6. Pending
+
 - Re-attach rule: 23 REJECTED reviews orphaned by tc shifts of 0.4-1 h; consider a wider tc window for forced reloads.
 - Visual review of the NEIGHBOUR_SHARED_EVENT flags and of the 1110 new unreviewed candidates (mostly 20251107, 20251207).
