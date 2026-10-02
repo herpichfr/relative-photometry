@@ -81,6 +81,7 @@ __all__ = [
     "FLAG_HIGH_BETA",
     "FLAG_NAMES",
     "FLAG_NEIGHBOUR_BLEND",
+    "FLAG_NEIGHBOUR_SHARED_EVENT",
     "FLAG_ON_VARIABLE",
     "FLAG_PARTIAL",
     "FLAG_R90_CLIP",
@@ -140,6 +141,13 @@ FLAG_R90_CLIP = 1 << 12
 FLAG_R90_FLAT = 1 << 13
 #: No trapezoid refit could be made, or the optimiser did not converge.
 FLAG_R90_FIT_FAIL = 1 << 14
+#: A neighbouring star within ``neighbour_event_radius_arcsec`` also dims at this event's
+#: ``(tc, duration)`` window (>= ``neighbour_event_dip_sigma``): the event may be one star's
+#: eclipse leaking into the other's aperture (:mod:`relphot.transit_neighbour`, which also
+#: says which star is the probable source). Set on both members of the pair when both are
+#: candidates. Informational exactly like ``FLAG_ON_VARIABLE``: not in ``HARD_REJECT_FLAGS``,
+#: ignored by :func:`tier_for_flags`.
+FLAG_NEIGHBOUR_SHARED_EVENT = 1 << 15
 
 FLAG_NAMES: tuple[tuple[int, str], ...] = (
     (FLAG_SHARED_EPOCH, "SHARED_EPOCH"),
@@ -157,6 +165,7 @@ FLAG_NAMES: tuple[tuple[int, str], ...] = (
     (FLAG_R90_CLIP, "R90_CLIP"),
     (FLAG_R90_FLAT, "R90_FLAT"),
     (FLAG_R90_FIT_FAIL, "R90_FIT_FAIL"),
+    (FLAG_NEIGHBOUR_SHARED_EVENT, "NEIGHBOUR_SHARED_EVENT"),
 )
 
 #: All R90 bits; a screened candidate passes R90 iff none of them is set.

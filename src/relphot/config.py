@@ -759,6 +759,18 @@ class SearchSettings:
     r90_clip3_dchi2_min: float = 16.0
     #: R90_FLAT: trapezoid vs nuisance-only, dchi2 / max(1, chi2_red) - 4 ln N.
     r90_dbic_flat_min: float = 6.0
+    #: NEIGHBOUR_SHARED_EVENT (relphot.transit_neighbour): informational flag on a transit
+    #: candidate when another star within the radius also dims in the candidate's own
+    #: (tc, duration) window -- one star's eclipse leaking into its neighbour's aperture.
+    #: Never a reject, never the tier; only candidates are screened (a few ms per neighbour).
+    neighbour_event_enabled: bool = True
+    #: 12 arcsec = the largest aperture radius of the standard sets (8 arcsec) plus ~2 FWHM
+    #: of a 2 arcsec seeing disc: a source further away than that cannot put measurable
+    #: light into the neighbour's aperture. The motivating pair (WASP-145 A and its Gaia
+    #: neighbour) is 5.2 arcsec apart.
+    neighbour_event_radius_arcsec: float = 12.0
+    #: The best neighbour's depth/error at the candidate's window must reach this many sigma.
+    neighbour_event_dip_sigma: float = 3.0
     #: Per-frame error-inflation factor bounds (relphot.cotrend.compute_frame_error_scale).
     #: Below 1 is allowed (a quieter-than-typical frame is not penalised);
     #: the ceiling keeps one catastrophic frame from zeroing out a trial

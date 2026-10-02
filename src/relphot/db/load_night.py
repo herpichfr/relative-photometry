@@ -352,6 +352,10 @@ _TRANSIT_EXTRA_BASE = [
     "transit_r90_evaluated", "transit_r90_pass", "transit_top1_share", "transit_top3_share",
     "transit_reg_dchi2_ratio", "transit_reg_depth_ratio", "transit_clip3_dchi2",
     "transit_dbic_flat",
+    # NEIGHBOUR_SHARED_EVENT partner (relphot.transit_neighbour): same, absent before it.
+    "transit_shared_partner", "transit_shared_sep_arcsec", "transit_shared_depth",
+    "transit_shared_dip_sigma", "transit_shared_dtc_hours", "transit_shared_deficit_ratio",
+    "transit_shared_is_source", "transit_shared_gaia_id",
 ]
 _VARIABLE_EXTRA_COLS = [
     "variability_searched", "variability_rms_robust", "variability_rms_std",

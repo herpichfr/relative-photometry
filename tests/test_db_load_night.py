@@ -427,6 +427,40 @@ def test_load_night_keeps_r90_flags_and_raw_features(test_conn, tmp_path) -> Non
     assert rows == [(1, flags, "false", "0.55", None)]
 
 
+def test_load_night_keeps_neighbour_shared_event_flag_and_partner(test_conn, tmp_path) -> None:
+    """``NEIGHBOUR_SHARED_EVENT`` lands in ``detection.flags`` (text, no migration) and the
+    partner's numbers in ``extra``; a file written before the flag still loads (above)."""
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    path = root / "lc" / "night_lc_search_metrics.parquet"
+    sm = pd.read_parquet(path)
+    n = len(sm)
+    sm["transit_shared_partner"] = np.full(n, -1, dtype=np.int64)
+    sm["transit_shared_is_source"] = np.zeros(n, dtype=bool)
+    sm["transit_shared_gaia_id"] = np.full(n, "", dtype=object)
+    for name in ("sep_arcsec", "depth", "dip_sigma", "dtc_hours", "deficit_ratio"):
+        sm[f"transit_shared_{name}"] = np.nan
+    sm.loc[4, "transit_shared_partner"] = 5
+    sm.loc[4, "transit_shared_is_source"] = True
+    sm.loc[4, "transit_shared_gaia_id"] = "6458529931463278976"
+    for name, value in (("sep_arcsec", 5.2), ("depth", 0.052), ("dip_sigma", 6.7),
+                        ("dtc_hours", np.nan), ("deficit_ratio", 0.78)):
+        sm.loc[4, f"transit_shared_{name}"] = value
+    sm.loc[4, "transit_flags_str"] = "NEIGHBOUR_SHARED_EVENT"
+    sm.to_parquet(path)
+    load_night(test_conn, root, settings=_SETTINGS)
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT tier, flags, extra->>'transit_shared_partner', "
+            "extra->>'transit_shared_is_source', extra->>'transit_shared_gaia_id', "
+            "extra->>'transit_shared_sep_arcsec', extra->>'transit_shared_dtc_hours' "
+            "FROM relphot.detection"
+        )
+        rows = cur.fetchall()
+    assert rows == [(1, "NEIGHBOUR_SHARED_EVENT", "5", "true", "6458529931463278976", "5.2", None)]
+
+
 def test_load_night_classes_and_detections(test_conn, tmp_path) -> None:
     root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
     _write_night1(root)

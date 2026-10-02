@@ -89,6 +89,7 @@ from relphot.stats import (
     select_best_aperture,
 )
 from relphot.tiles import build_tilemap
+from relphot.transit_neighbour import flag_neighbour_shared_events
 from relphot.transit_search import (
     FLAG_NEIGHBOUR_BLEND,
     FLAG_TOO_DEEP,
@@ -773,9 +774,17 @@ def _frame_error_scale_at_tc(tilemap, transit_result, night) -> np.ndarray:
     return out
 
 
+def _partner_gaia_ids(shared_event, neighbour) -> np.ndarray:
+    """Gaia DR3 id of each star's neighbour-shared-event partner ('' without a partner)."""
+    return np.array(
+        [str(neighbour.gaia_id[p]) if p >= 0 else "" for p in shared_event.partner], dtype=object
+    )
+
+
 def _search_table_columns(
     night, tilemap, comparison_result, star_stats, star_best_aper,
     transit_result, variability_result, variable_match, planet_match, neighbour,
+    shared_event,
 ):
     """One row per star: every Stage-6 metric, for ``search_metrics.parquet``."""
     n_stars = night.n_stars
@@ -827,6 +836,14 @@ def _search_table_columns(
         "transit_reg_depth_ratio": transit_result.reg_depth_ratio,
         "transit_clip3_dchi2": transit_result.clip3_dchi2,
         "transit_dbic_flat": transit_result.dbic_flat,
+        "transit_shared_partner": shared_event.partner,
+        "transit_shared_sep_arcsec": shared_event.sep_arcsec,
+        "transit_shared_depth": shared_event.depth,
+        "transit_shared_dip_sigma": shared_event.dip_sigma,
+        "transit_shared_dtc_hours": shared_event.dtc_hours,
+        "transit_shared_deficit_ratio": shared_event.deficit_ratio,
+        "transit_shared_is_source": shared_event.is_source,
+        "transit_shared_gaia_id": _partner_gaia_ids(shared_event, neighbour),
         "variability_searched": variability_result.searched,
         "variability_rms_robust": variability_result.rms_robust,
         "variability_rms_std": variability_result.rms_std,
@@ -989,6 +1006,16 @@ def _run_search(args: argparse.Namespace) -> int:
     )
     transit_result.flags[blend] |= FLAG_NEIGHBOUR_BLEND
 
+    # Informational NEIGHBOUR_SHARED_EVENT: a neighbouring star also dims in the candidate's
+    # window (one star's eclipse leaking into the other's aperture). Candidates only.
+    t_shared0 = time.monotonic()
+    shared_event = flag_neighbour_shared_events(
+        night, tilemap, cotrend_result, lc, lc_err, epoch_ok, frame_kept, star_best_aper,
+        transit_result, settings,
+    )
+    shared_gaia_id = _partner_gaia_ids(shared_event, neighbour)
+    logger.info("neighbour shared events: %.2f s", time.monotonic() - t_shared0)
+
     # Route TOO_DEEP transit events to variables (as eclipsing). A star the
     # variability search independently calls variable -- or that a catalogue
     # already lists as a known variable of a disqualifying type -- is also
@@ -1067,6 +1094,14 @@ def _run_search(args: argparse.Namespace) -> int:
             "reg_depth_ratio": float(transit_result.reg_depth_ratio[i]),
             "clip3_dchi2": float(transit_result.clip3_dchi2[i]),
             "dbic_flat": float(transit_result.dbic_flat[i]),
+            "shared_partner": int(shared_event.partner[i]),
+            "shared_sep_arcsec": float(shared_event.sep_arcsec[i]),
+            "shared_depth": float(shared_event.depth[i]),
+            "shared_dip_sigma": float(shared_event.dip_sigma[i]),
+            "shared_dtc_hours": float(shared_event.dtc_hours[i]),
+            "shared_deficit_ratio": float(shared_event.deficit_ratio[i]),
+            "shared_is_source": bool(shared_event.is_source[i]),
+            "shared_gaia_id": str(shared_gaia_id[i]),
             "known_planet_name": str(planet_match.name[i]),
             "known_planet_period_days": float(planet_match.period_days[i]),
             "known_planet_is_toi": bool(planet_match.is_toi[i]),
@@ -1228,6 +1263,7 @@ def _run_search(args: argparse.Namespace) -> int:
     columns = _search_table_columns(
         night, tilemap, comparison_result, star_stats, star_best_aper,
         transit_result, variability_result, variable_match, planet_match, neighbour,
+        shared_event,
     )
     metrics_path = Path(args.lc).with_suffix("")
     metrics_out = metrics_path.with_name(f"{metrics_path.name}_search_metrics")
