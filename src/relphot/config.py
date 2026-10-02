@@ -76,6 +76,14 @@ class CatalogSettings:
 
     #: Name of the BinTableHDU holding the source catalogue in a FITS file.
     hdu_name: str = "CATALOG"
+    #: Which photometry the catalogues hold: ``"standard"`` (robo43 ``photometry``: sources
+    #: detected and centroided on every frame) or ``"forced"`` (robo43 ``forced``: fixed sky
+    #: positions, same columns). In ``"forced"`` mode each input path is mapped to its frame's
+    #: forced catalogue (``*_proc_forced_catalog.csv``, else the ``forced_hdu_name`` extension of
+    #: ``*_proc.fits``). Saved with the night, so a ``night.npz`` records which one it holds.
+    photometry: str = "standard"
+    #: BinTableHDU of the forced catalogue in a FITS file (robo43 ``forced --fits-ext``).
+    forced_hdu_name: str = "CATALOG_FORCED"
     #: Cross-match radius, in arcsec, used by relphot.match.
     match_radius_arcsec: float = 1.0
     #: Minimum fraction of frames a star must appear in to be kept.
@@ -320,6 +328,44 @@ class ReferenceSettings:
     #: Maximum iterations for per-star outlier rejection loop.
     star_reject_iter: int = 5
     method: str = "weighted_fixed_mean"
+    #: Per-frame quality cut (:func:`relphot.reference.assess_frame_quality`): ``"auto"`` applies
+    #: it to forced photometry only (a forced catalogue has the same sources in every frame, so
+    #: the fixed-star-set rule above never drops a frame there), ``"on"`` to every night,
+    #: ``"off"`` never. The metrics are always computed and written to ``<stem>_frames.csv``.
+    frame_quality: str = "auto"
+    #: A frame is cut when a one-sided robust z (median/MAD over the night's frames) of its
+    #: ensemble scatter, FWHM or sky level (high), or transparency (low, against a quadratic
+    #: trend in time), exceeds this ...
+    frame_quality_sigma: float = 3.0
+    #: ... and the metric is also off by at least this fraction (scatter and FWHM above, flux
+    #: below the median / trend): a very uniform night has a tiny MAD and must not cut frames
+    #: over a few percent.
+    frame_quality_min_excess: float = 0.05
+    #: At most this fraction of the frames is cut by the quality rule (worst first), and never
+    #: more than ``max_dropped_frame_fraction`` in total.
+    frame_quality_max_fraction: float = 0.15
+    #: Nights shorter than this many frames are not cut (a median/MAD needs a sample).
+    frame_quality_min_frames: int = 10
+    #: Ensemble for the metrics: at most this many of the brightest reference candidates that
+    #: are valid in at least 90 % of the frames.
+    frame_quality_max_stars: int = 4000
+
+    def __post_init__(self) -> None:
+        if self.frame_quality not in ("auto", "on", "off"):
+            msg = (
+                "reference.frame_quality must be 'auto', 'on' or 'off', "
+                f"got {self.frame_quality!r}"
+            )
+            raise ConfigError(msg)
+        if not 0.0 <= self.frame_quality_max_fraction <= 1.0:
+            msg = (
+                "reference.frame_quality_max_fraction must be in [0, 1], "
+                f"got {self.frame_quality_max_fraction!r}"
+            )
+            raise ConfigError(msg)
+        if not self.frame_quality_sigma > 0.0:
+            msg = f"reference.frame_quality_sigma must be > 0, got {self.frame_quality_sigma!r}"
+            raise ConfigError(msg)
 
 
 @dataclass(frozen=True, slots=True)

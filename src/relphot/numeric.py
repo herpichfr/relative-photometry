@@ -22,8 +22,42 @@ __all__ = [
 ]
 
 
+#: ``np.nanmedian`` along an axis this long (or longer) of an array that has NaN falls back to a
+#: Python-level ``apply_along_axis`` loop, which is ~50x slower than the vectorised path it uses
+#: for shorter axes (a 600-star tile median over 67 frames, for example).
+_NUMPY_NANMEDIAN_SLOW_AXIS = 600
+
+
+def _nanmedian_sorted(arr: np.ndarray, axis: int) -> np.ndarray:
+    """``np.nanmedian(arr, axis)`` for a floating array, vectorised by sorting.
+
+    NaN sorts last, so the valid values of every slice come first; the median is the mean of the
+    two middle ones (equal when the count is odd). NaN where a slice has no valid value. Gives the
+    same values as numpy's, only without its per-slice Python loop.
+    """
+    arr = np.moveaxis(arr, axis, -1)
+    n_valid = np.count_nonzero(~np.isnan(arr), axis=-1)
+    srt = np.sort(arr, axis=-1)
+    lo = np.take_along_axis(srt, np.maximum((n_valid - 1) // 2, 0)[..., None], axis=-1)[..., 0]
+    hi = np.take_along_axis(srt, np.maximum(n_valid // 2, 0)[..., None], axis=-1)[..., 0]
+    out = (lo + hi) / 2
+    return np.where(n_valid > 0, out, np.nan).astype(arr.dtype, copy=False)
+
+
 def nanmedian_quiet(arr: np.ndarray, axis: int | None = None) -> np.ndarray:
-    """``np.nanmedian``, without the "All-NaN slice" warning an expected NaN result raises."""
+    """``np.nanmedian``, without the "All-NaN slice" warning an expected NaN result raises.
+
+    Long axes of floating arrays are reduced by :func:`_nanmedian_sorted` (same values, much
+    faster than numpy's per-slice fallback).
+    """
+    arr = np.asarray(arr)
+    if (
+        axis is not None
+        and arr.ndim > 1
+        and arr.dtype.kind == "f"
+        and arr.shape[axis] >= _NUMPY_NANMEDIAN_SLOW_AXIS
+    ):
+        return _nanmedian_sorted(arr, axis)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         return np.nanmedian(arr, axis=axis)

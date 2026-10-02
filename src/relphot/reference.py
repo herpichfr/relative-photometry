@@ -13,6 +13,11 @@ stars a tile's reference may be built from (PLAN.md Stage 3). :func:`build_refer
 combines each tile's fixed star set into per-frame, per-aperture reference flux
 ``R`` using ``"weighted_fixed_mean"`` (inverse-variance weighted mean, default)
 or ``"median_fixed"`` (plain median of normalised fluxes).
+
+:func:`assess_frame_quality` adds a per-frame quality cut ahead of the star-set rule (which
+only drops frames when a tile runs short of reference stars, i.e. never for forced photometry,
+where every frame has the same sources): robust outliers in the reference ensemble's
+scatter, transparency, FWHM and sky level are dropped.
 """
 
 from __future__ import annotations
@@ -35,8 +40,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "QUALITY_METRICS",
+    "FrameQuality",
     "FrameSelection",
     "ReferenceResult",
+    "assess_frame_quality",
     "build_references",
     "reference_member_weights",
     "select_candidates",
@@ -44,6 +52,11 @@ __all__ = [
 ]
 
 _METHODS = ("weighted_fixed_mean", "median_fixed")
+
+#: The ensemble of the frame-quality metrics: stars valid in at least this fraction of the frames.
+_QUALITY_MIN_COVERAGE = 0.9
+#: Names of the four frame-quality metrics, in the column order of ``FrameQuality.z``.
+QUALITY_METRICS = ("scatter", "transparency", "fwhm", "sky")
 
 
 @dataclass(slots=True)
@@ -86,12 +99,41 @@ class FrameSelection:
     and aperture. ``tile_stars[t]`` is tile t's fixed star set S_t (master-star indices,
     subset of candidates), with every member having FLAGS == 0 and finite positive flux at
     every aperture in every kept frame, after star-level outlier rejection.
-    ``dropped_frames`` is an ascending tuple of False indices.
+    ``dropped_frames`` is an ascending tuple of False indices (quality cuts included).
+    ``quality`` holds the per-frame quality metrics (``None`` if they could not be computed).
     """
 
     frame_kept: np.ndarray
     tile_stars: list[np.ndarray]
     dropped_frames: tuple[int, ...]
+    quality: FrameQuality | None = None
+
+
+@dataclass(slots=True)
+class FrameQuality:
+    """Per-frame quality metrics of the reference ensemble and the cut derived from them.
+
+    All arrays are ``(n_frames,)`` except ``z``, ``(n_frames, 4)`` in the order of
+    :data:`QUALITY_METRICS`. ``scatter`` is the MAD sigma, over the ensemble stars, of the
+    flux relative to each star's own median and the frame's transparency; ``transparency`` is
+    the ensemble's median relative flux divided by its quadratic trend in time (1 = on trend);
+    ``fwhm`` and ``sky`` are ensemble medians of the catalogues' FWHM and background columns.
+    ``z`` is the one-sided robust z-score (positive = worse); ``flagged`` marks frames that
+    pass both the ``frame_quality_sigma`` and the ``frame_quality_min_excess`` tests,
+    ``dropped`` those actually cut (``flagged``, worst first, up to the cap, when the cut is
+    applied) and ``reason`` the text logged for every flagged frame.
+    """
+
+    scatter: np.ndarray
+    transparency: np.ndarray
+    fwhm: np.ndarray
+    sky: np.ndarray
+    z: np.ndarray
+    flagged: np.ndarray
+    dropped: np.ndarray
+    reason: list[str]
+    n_ensemble: int
+    applied: bool
 
 
 def select_candidates(
@@ -185,13 +227,155 @@ def select_candidates(
     return candidate_mask
 
 
+def _one_sided_z(values: np.ndarray, sign: float) -> np.ndarray:
+    """Robust z-score of ``sign * values`` about the median over frames (0 where undefined)."""
+    v = sign * np.asarray(values, dtype=np.float64)
+    good = np.isfinite(v)
+    if np.count_nonzero(good) < 3:
+        return np.zeros(v.shape)
+    med = nanmedian_quiet(v[good])
+    sigma = 1.4826 * nanmedian_quiet(np.abs(v[good] - med))
+    if not np.isfinite(sigma) or sigma <= 0:
+        return np.zeros(v.shape)
+    return np.where(good, (v - med) / sigma, 0.0)
+
+
+def _time_trend_residual(log_t: np.ndarray, bjd_tdb: np.ndarray) -> np.ndarray:
+    """``log_t`` minus a robust (3-sigma clipped, twice) quadratic fit in time."""
+    good = np.isfinite(log_t) & np.isfinite(bjd_tdb)
+    if np.count_nonzero(good) < 6:
+        med = nanmedian_quiet(log_t)
+        return log_t - (med if np.isfinite(med) else 0.0)
+    t0 = np.mean(bjd_tdb[good])
+    use = good.copy()
+    for _ in range(3):
+        coeffs = np.polyfit(bjd_tdb[use] - t0, log_t[use], 2)
+        resid = log_t - np.polyval(coeffs, bjd_tdb - t0)
+        sigma = 1.4826 * nanmedian_quiet(np.abs(resid[use] - nanmedian_quiet(resid[use])))
+        if not np.isfinite(sigma) or sigma <= 0:
+            break
+        use = good & (np.abs(resid) <= 3.0 * sigma)
+        if np.count_nonzero(use) < 6:
+            break
+    return log_t - np.polyval(coeffs, bjd_tdb - t0)
+
+
+def assess_frame_quality(
+    night: MatchedNight,
+    candidates: np.ndarray,
+    settings: Settings,
+    aper: int,
+    *,
+    photometry: str | None = None,
+) -> FrameQuality | None:
+    """Per-frame quality metrics from the reference ensemble, and the frames to cut.
+
+    The ensemble is the (at most ``frame_quality_max_stars``) brightest ``candidates`` that
+    have FLAGS == 0 and a finite positive flux at ``aper`` in at least 90 % of the frames.
+    Four metrics per frame (see :class:`FrameQuality`): ensemble scatter, transparency
+    against a quadratic trend, FWHM and sky level. A frame is *flagged* when the one-sided
+    robust z of one of them exceeds ``frame_quality_sigma`` and the metric also deviates by
+    ``frame_quality_min_excess`` (a fraction, relative to the median or the trend; none for
+    sky). Flagged frames are *dropped* -- worst z first, at most ``frame_quality_max_fraction``
+    of the night and ``max_dropped_frame_fraction`` -- only when the cut applies:
+    ``frame_quality`` is ``"on"``, or ``"auto"`` with forced photometry (``photometry``,
+    default ``settings.catalog.photometry``). Returns ``None`` when no ensemble exists.
+    """
+    ref = settings.reference
+    n_frames = night.n_frames
+    if photometry is None:
+        photometry = settings.catalog.photometry
+    applied = ref.frame_quality == "on" or (ref.frame_quality == "auto" and photometry == "forced")
+
+    flux_a = night.flux[:, :, aper]
+    present = night.flags != -1
+    valid = (night.flags == 0) & np.isfinite(flux_a) & (flux_a > 0)
+    coverage = valid.sum(axis=1) >= _QUALITY_MIN_COVERAGE * n_frames
+    pool = np.nonzero(np.asarray(candidates, dtype=bool) & coverage)[0]
+    if pool.size < 20 or n_frames < 3:
+        return None
+    if pool.size > ref.frame_quality_max_stars:
+        snr = np.where(present[pool], night.snr[pool], np.nan)
+        order = np.argsort(-np.nan_to_num(nanmedian_quiet(snr, axis=1), nan=-np.inf))
+        pool = pool[order[: ref.frame_quality_max_stars]]
+
+    f = np.where(valid[pool], flux_a[pool].astype(np.float64), np.nan)
+    baseline = nanmedian_quiet(f, axis=1)
+    rel = f / baseline[:, np.newaxis]
+    transp = nanmedian_quiet(rel, axis=0)
+    resid = rel / transp[np.newaxis, :]
+    scatter = 1.4826 * nanmedian_quiet(
+        np.abs(resid - nanmedian_quiet(resid, axis=0)[np.newaxis, :]), axis=0
+    )
+    bjd = np.array([m.bjd_tdb for m in night.frame_meta], dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        log_t = np.where(transp > 0, np.log10(transp), np.nan)
+    transparency = 10.0 ** _time_trend_residual(log_t, bjd)
+    fwhm = nanmedian_quiet(np.where(present[pool], night.fwhm[pool], np.nan), axis=0)
+    sky = nanmedian_quiet(np.where(present[pool], night.background[pool], np.nan), axis=0)
+
+    z = np.column_stack(
+        [
+            _one_sided_z(scatter, 1.0),
+            _one_sided_z(np.log10(transparency), -1.0),
+            _one_sided_z(fwhm, 1.0),
+            _one_sided_z(sky, 1.0),
+        ]
+    )
+    med = [nanmedian_quiet(scatter), 1.0, nanmedian_quiet(fwhm), nanmedian_quiet(sky)]
+    excess_ok = np.column_stack(
+        [
+            scatter >= med[0] * (1.0 + ref.frame_quality_min_excess),
+            transparency <= 1.0 - ref.frame_quality_min_excess,
+            fwhm >= med[2] * (1.0 + ref.frame_quality_min_excess),
+            np.ones(n_frames, dtype=bool),
+        ]
+    )
+    hit = (z > ref.frame_quality_sigma) & excess_ok
+    flagged = hit.any(axis=1)
+    values = (scatter, transparency, fwhm, sky)
+    reason = [""] * n_frames
+    for j in np.nonzero(flagged)[0]:
+        parts = [
+            f"{QUALITY_METRICS[k]} z={z[j, k]:.1f} ({values[k][j]:.4g} vs median {med[k]:.4g})"
+            for k in np.nonzero(hit[j])[0]
+        ]
+        reason[j] = "; ".join(parts)
+
+    dropped = np.zeros(n_frames, dtype=bool)
+    if applied and n_frames >= ref.frame_quality_min_frames:
+        cap = min(
+            int(np.floor(ref.frame_quality_max_fraction * n_frames)),
+            int(np.floor(ref.max_dropped_frame_fraction * n_frames)),
+        )
+        worst_first = np.argsort(-np.where(flagged, np.where(hit, z, -np.inf).max(axis=1), -np.inf))
+        dropped[[j for j in worst_first[:cap] if flagged[j]]] = True
+        if int(flagged.sum()) > cap:
+            logger.warning(
+                "frame quality: %d frames flagged, only the worst %d are cut (cap %.0f%%)",
+                int(flagged.sum()), cap, 100 * ref.frame_quality_max_fraction,
+            )
+    return FrameQuality(
+        scatter=scatter, transparency=transparency, fwhm=fwhm, sky=sky, z=z, flagged=flagged,
+        dropped=dropped, reason=reason, n_ensemble=int(pool.size), applied=applied,
+    )
+
+
 def select_reference_frames_and_stars(
-    night: MatchedNight, tilemap: TileMap, candidates: np.ndarray, settings: Settings, aper: int
+    night: MatchedNight,
+    tilemap: TileMap,
+    candidates: np.ndarray,
+    settings: Settings,
+    aper: int,
+    *,
+    photometry: str | None = None,
 ) -> FrameSelection:
     """Select frames to keep and build each tile's fixed star set S_t.
 
-    Drops frames globally when min_ref_stars cannot be met in every tile within
-    max_dropped_frame_fraction of the night. Performs per-star outlier rejection
+    First applies the per-frame quality cut (:func:`assess_frame_quality`; ``photometry``
+    defaults to ``settings.catalog.photometry`` and decides whether ``frame_quality="auto"``
+    applies it). Then drops frames globally when min_ref_stars cannot be met in every tile,
+    all within max_dropped_frame_fraction of the night. Performs per-star outlier rejection
     on each tile's reference star set. Returns a FrameSelection with the kept-frame
     mask and per-tile star indices.
     """
@@ -206,7 +390,10 @@ def select_reference_frames_and_stars(
 
     # Frame-dropping loop
     max_drop = int(np.floor(ref.max_dropped_frame_fraction * n_frames))
-    dropped_set = set()  # type: set[int]
+    quality = assess_frame_quality(night, candidates, settings, aper, photometry=photometry)
+    dropped_set = (
+        {int(i) for i in np.nonzero(quality.dropped)[0]} if quality is not None else set()
+    )  # type: set[int]
     warned_empty_tile = False
 
     for drop_iter in range(max_drop + 1):
@@ -340,7 +527,10 @@ def select_reference_frames_and_stars(
     dropped_frames = tuple(sorted(dropped_set))
 
     return FrameSelection(
-        frame_kept=frame_kept, tile_stars=tile_stars_list, dropped_frames=dropped_frames
+        frame_kept=frame_kept,
+        tile_stars=tile_stars_list,
+        dropped_frames=dropped_frames,
+        quality=quality,
     )
 
 

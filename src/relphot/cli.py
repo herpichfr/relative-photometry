@@ -175,6 +175,29 @@ def _write_reference_csv(night, tilemap, result, aper: int, frame_selection, pat
                 ])
 
 
+def _write_frames_csv(night, frame_selection, path: Path) -> None:
+    """Write one row per frame: kept/dropped and the frame-quality metrics, z-scores and reason."""
+    quality = frame_selection.quality
+    metric_names = ("scatter", "transparency", "fwhm", "sky")
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "frame", "file", "bjd_tdb", "airmass", "kept", *metric_names,
+            *(f"z_{name}" for name in metric_names), "flagged", "quality_dropped", "reason",
+        ])
+        for j, meta in enumerate(night.frame_meta):
+            row = [
+                j, meta.file.name, meta.bjd_tdb, meta.airmass, int(frame_selection.frame_kept[j]),
+            ]
+            if quality is None:
+                row += [""] * (2 * len(metric_names) + 3)
+            else:
+                row += [getattr(quality, name)[j] for name in metric_names]
+                row += [quality.z[j, k] for k in range(len(metric_names))]
+                row += [int(quality.flagged[j]), int(quality.dropped[j]), quality.reason[j]]
+            writer.writerow(row)
+
+
 def _run_ingest(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -185,6 +208,10 @@ def _run_ingest(args: argparse.Namespace) -> int:
     except RelphotError:
         logger.exception("failed to load config %s", args.config)
         return 1
+
+    if args.photometry is not None:
+        settings = replace(settings, catalog=replace(settings.catalog, photometry=args.photometry))
+    logger.info("ingest: %s photometry", settings.catalog.photometry)
 
     paths = _expand_inputs(args.files)
     if not paths:
@@ -218,6 +245,7 @@ def _run_ingest(args: argparse.Namespace) -> int:
     report_path = out_path.with_suffix(".report.csv")
     _write_report_csv(night, report_path)
 
+    print(f"photometry: {settings.catalog.photometry}")
     print(f"stars before presence cut: {night.n_stars_before_cut}")
     print(f"stars after presence cut:  {night.n_stars_after_cut}")
     print(f"master frame: {night.frame_meta[night.master_frame_index].file}")
@@ -240,7 +268,7 @@ def _run_reference(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        night, _ingest_settings = load_night(args.night)
+        night, ingest_settings = load_night(args.night)
     except (OSError, RelphotError):
         logger.exception("failed to load %s", args.night)
         return 1
@@ -279,13 +307,27 @@ def _run_reference(args: argparse.Namespace) -> int:
 
     try:
         frame_selection = select_reference_frames_and_stars(
-            night, tilemap, candidates, settings, aper
+            night, tilemap, candidates, settings, aper,
+            photometry=ingest_settings.catalog.photometry,
         )
     except RelphotError:
         logger.exception("frame/star selection failed")
         return 1
     t3 = time.monotonic()
     logger.info("frame/star selection: %.2f s", t3 - t2)
+    quality = frame_selection.quality
+    if quality is not None:
+        logger.info(
+            "frame quality (%d ensemble stars, cut %s): %d flagged, %d cut",
+            quality.n_ensemble, "applied" if quality.applied else "not applied",
+            int(quality.flagged.sum()), int(quality.dropped.sum()),
+        )
+        for j in np.nonzero(quality.flagged)[0]:
+            logger.info(
+                "frame quality: %s %s: %s",
+                night.frame_meta[j].file.name, "CUT" if quality.dropped[j] else "flagged only",
+                quality.reason[j],
+            )
     n_kept = int(np.sum(frame_selection.frame_kept))
     n_total = night.n_frames
     logger.info("frames kept: %d/%d", n_kept, n_total)
@@ -307,6 +349,8 @@ def _run_reference(args: argparse.Namespace) -> int:
     tilemap.to_csv(tiles_csv)
     reference_csv = out_path.with_name(f"{out_path.stem}_reference.csv")
     _write_reference_csv(night, tilemap, result, aper, frame_selection, reference_csv)
+    frames_csv = out_path.with_name(f"{out_path.stem}_frames.csv")
+    _write_frames_csv(night, frame_selection, frames_csv)
 
     print(f"stars: {night.n_stars}, tiles: {tilemap.n_tiles}, aperture: {aper}")
     print(f"candidates: {int(candidates.sum())}")
@@ -318,6 +362,7 @@ def _run_reference(args: argparse.Namespace) -> int:
     print(f"wrote {out_path}")
     print(f"wrote {tiles_csv}")
     print(f"wrote {reference_csv}")
+    print(f"wrote {frames_csv}")
     return 0
 
 
@@ -1852,6 +1897,15 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument(
         "--np", type=int, default=4, dest="np",
         help="parallel readers (default: 4; measured optimum for this workload)",
+    )
+    ingest.add_argument(
+        "--photometry", choices=["standard", "forced"], default=None,
+        help=(
+            "which photometry to ingest (default: catalog.photometry of the config, 'standard'): "
+            "'forced' reads each frame's robo43 `forced` catalogue (*_proc_forced_catalog.csv, "
+            "else the CATALOG_FORCED extension) instead of its per-frame detections; recorded "
+            "in the night.npz settings"
+        ),
     )
     ingest.add_argument("files", nargs="+", help="catalogue files, or @list.txt")
     ingest.set_defaults(func=_run_ingest)

@@ -18,6 +18,7 @@ CATFLAGS); the image planes are never touched.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "PHOTOMETRY_MODES",
     "FrameCatalog",
     "FrameMeta",
     "read_catalog",
@@ -46,6 +48,12 @@ __all__ = [
     "read_csv_catalog",
     "read_fits_catalog",
 ]
+
+#: Values of ``settings.catalog.photometry``.
+PHOTOMETRY_MODES = ("standard", "forced")
+
+_PROC_CATALOG_CSV = "_proc_catalog.csv"
+_PROC_FORCED_CSV = "_proc_forced_catalog.csv"
 
 #: (RA, Dec) sentinel for "no usable frame centre"; propagates to a NaN BJD_TDB.
 _NO_CENTRE = (float("nan"), float("nan"))
@@ -392,11 +400,13 @@ def read_fits_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
 
 
 def _companion_fits(csv_path: Path) -> Path | None:
-    """The ``*_proc.fits`` a ``*_proc_catalog.csv`` was derived from, if present."""
-    if csv_path.name.endswith("_proc_catalog.csv"):
-        candidate = csv_path.with_name(csv_path.name[: -len("_catalog.csv")] + ".fits")
-        if candidate.is_file():
-            return candidate
+    """The ``*_proc.fits`` a ``*_proc_catalog.csv`` (or ``*_proc_forced_catalog.csv``) came from."""
+    for suffix in (_PROC_CATALOG_CSV, _PROC_FORCED_CSV):
+        if csv_path.name.endswith(suffix):
+            stem = csv_path.name[: -len(suffix)]
+            candidate = csv_path.with_name(stem + "_proc.fits")
+            if candidate.is_file():
+                return candidate
     return None
 
 
@@ -486,8 +496,47 @@ def read_csv_catalog(path: Path | str, settings: Settings) -> FrameCatalog:
     )
 
 
+def _resolve_forced_source(path: Path, settings: Settings, fmt: str | None) -> tuple[Path, str]:
+    """The forced catalogue of the frame ``path`` belongs to, and its format.
+
+    ``path`` may be the frame's ``*_proc.fits``, its ``*_proc_catalog.csv`` or the
+    ``*_proc_forced_catalog.csv`` itself. The forced CSV wins over the forced FITS extension
+    when both exist (``fmt`` restricts the choice).
+    """
+    name = path.name
+    for suffix in (_PROC_FORCED_CSV, _PROC_CATALOG_CSV, "_proc.fits"):
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            break
+    else:
+        msg = f"{path}: cannot map to a forced catalogue (expected *_proc.fits or *_catalog.csv)"
+        raise IngestError(msg)
+
+    csv_path = path.with_name(stem + _PROC_FORCED_CSV)
+    fits_path = path.with_name(stem + "_proc.fits")
+    if fmt in (None, "csv") and csv_path.is_file():
+        return csv_path, "csv"
+    if fmt in (None, "fits") and fits_path.is_file():
+        try:
+            with fits.open(fits_path, memmap=True) as hdul:
+                if settings.catalog.forced_hdu_name in hdul:
+                    return fits_path, "fits"
+        except OSError as exc:
+            msg = f"cannot open {fits_path}: {exc}"
+            raise IngestError(msg) from exc
+    msg = (
+        f"{path}: no forced catalogue ({csv_path.name}, or a "
+        f"'{settings.catalog.forced_hdu_name}' extension in {fits_path.name}); run `robo43 forced`"
+    )
+    raise IngestError(msg)
+
+
 def resolve_catalog_source(path: Path, settings: Settings, fmt: str | None) -> tuple[Path, str]:
     """Resolve the file and format actually read for ``path``.
+
+    With ``settings.catalog.photometry == "forced"`` the path is first mapped to the frame's
+    forced catalogue (see :func:`_resolve_forced_source`); a forced CSV is never redirected to
+    the companion FITS, whose ``CATALOG`` extension holds the per-frame photometry.
 
     An explicit ``fmt`` (``"fits"`` or ``"csv"``, or anything else a caller
     passes) is returned unchanged. In auto mode (``fmt is None``), a ``.csv``
@@ -499,10 +548,20 @@ def resolve_catalog_source(path: Path, settings: Settings, fmt: str | None) -> t
     HDU falls back to reading the CSV itself. A non-``.csv`` path in auto
     mode is always read as FITS.
     """
+    if settings.catalog.photometry not in PHOTOMETRY_MODES:
+        msg = (
+            f"unknown catalog.photometry {settings.catalog.photometry!r}; "
+            f"expected one of {PHOTOMETRY_MODES}"
+        )
+        raise IngestError(msg)
+    if settings.catalog.photometry == "forced":
+        return _resolve_forced_source(path, settings, fmt)
     if fmt is not None:
         return path, fmt
     if path.suffix.lower() != ".csv":
         return path, "fits"
+    if path.name.endswith(_PROC_FORCED_CSV):
+        return path, "csv"
     companion = _companion_fits(path)
     if companion is not None:
         try:
@@ -523,10 +582,20 @@ def read_catalog(path: Path | str, settings: Settings, fmt: str | None = None) -
     """
     path = Path(path)
     path, fmt = resolve_catalog_source(path, settings, fmt)
+    forced = settings.catalog.photometry == "forced"
     if fmt == "fits":
+        if forced:
+            catalog = dataclasses.replace(
+                settings.catalog, hdu_name=settings.catalog.forced_hdu_name
+            )
+            settings = dataclasses.replace(settings, catalog=catalog)
         return read_fits_catalog(path, settings)
     if fmt == "csv":
-        return read_csv_catalog(path, settings)
+        cat = read_csv_catalog(path, settings)
+        companion = _companion_fits(path) if forced else None
+        if companion is not None:
+            cat.meta.file = companion  # downstream sees the same file names as standard photometry
+        return cat
     msg = f"unknown catalogue format {fmt!r}"
     raise IngestError(msg)
 
