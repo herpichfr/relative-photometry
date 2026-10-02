@@ -348,6 +348,10 @@ _TRANSIT_EXTRA_BASE = [
     "transit_searched", "transit_n_in", "transit_beta", "transit_coverage",
     "transit_partial", "transit_frame_error_scale_at_tc", "transit_dchi2_box_vs_flat",
     "transit_dchi2_box_vs_step", "transit_coincidence_count", "transit_flags",
+    # R90 screen (relphot.transit_r90): absent from search-metrics files written before it.
+    "transit_r90_evaluated", "transit_r90_pass", "transit_top1_share", "transit_top3_share",
+    "transit_reg_dchi2_ratio", "transit_reg_depth_ratio", "transit_clip3_dchi2",
+    "transit_dbic_flat",
 ]
 _VARIABLE_EXTRA_COLS = [
     "variability_searched", "variability_rms_robust", "variability_rms_std",

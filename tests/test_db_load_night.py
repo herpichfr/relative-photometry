@@ -397,6 +397,36 @@ def test_load_night_lightcurve_matches_input(test_conn, tmp_path) -> None:
         assert flux == pytest.approx(expected_flux, abs=1e-2)
 
 
+def test_load_night_keeps_r90_flags_and_raw_features(test_conn, tmp_path) -> None:
+    """R90 flag names land in ``detection.flags`` (text, no migration) and the raw
+    features in ``extra``; a search-metrics file written before R90 still loads (above)."""
+    root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
+    _write_night1(root)
+    path = root / "lc" / "night_lc_search_metrics.parquet"
+    sm = pd.read_parquet(path)
+    n = len(sm)
+    sm["transit_r90_evaluated"] = np.array([False] * 4 + [True] + [False])
+    sm["transit_r90_pass"] = np.zeros(n, dtype=bool)
+    for name, value in (
+        ("top1_share", 0.55), ("top3_share", 0.7), ("reg_dchi2_ratio", 0.1),
+        ("reg_depth_ratio", 0.9), ("clip3_dchi2", 4.0), ("dbic_flat", np.nan),
+    ):
+        sm[f"transit_{name}"] = np.nan
+        sm.loc[4, f"transit_{name}"] = value
+    sm.loc[4, "transit_flags_str"] = "R90_SINGLE_POINT|R90_SYSTEMATICS|R90_CLIP|R90_FLAT"
+    sm.to_parquet(path)
+    load_night(test_conn, root, settings=_SETTINGS)
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT tier, flags, extra->>'transit_r90_pass', extra->>'transit_top1_share', "
+            "extra->>'transit_dbic_flat' FROM relphot.detection"
+        )
+        rows = cur.fetchall()
+    flags = "R90_SINGLE_POINT|R90_SYSTEMATICS|R90_CLIP|R90_FLAT"
+    assert rows == [(1, flags, "false", "0.55", None)]
+
+
 def test_load_night_classes_and_detections(test_conn, tmp_path) -> None:
     root = tmp_path / "T80S_reduced" / "20250101" / "relphot"
     _write_night1(root)

@@ -74,6 +74,12 @@ def test_search_smoke(fits_files, tmp_path) -> None:
     assert "transit_snr" in table.colnames
     assert "variability_excess" in table.colnames
     assert len(table) > 0
+    for column in (
+        "transit_r90_evaluated", "transit_r90_pass", "transit_top1_share",
+        "transit_top3_share", "transit_reg_dchi2_ratio", "transit_reg_depth_ratio",
+        "transit_clip3_dchi2", "transit_dbic_flat",
+    ):
+        assert column in table.colnames, column
 
 
 def test_search_known_variable_with_transit_stays_a_candidate(
@@ -164,6 +170,9 @@ def test_search_known_variable_with_transit_stays_a_candidate(
         rows = {int(r["star_id"]): r for r in csv.DictReader(handle)}
     assert target in rows
     assert "ON_VARIABLE" in rows[target]["flags"].split("|")
+    assert rows[target]["r90_pass"] == ""  # forced in, never screened: not evaluated
+    assert {"top1_share", "top3_share", "reg_dchi2_ratio", "reg_depth_ratio", "clip3_dchi2",
+            "dbic_flat"} <= set(rows[target])
     with (variables_dir / "candidates.csv").open() as handle:
         variable_ids = {int(r["star_id"]) for r in csv.DictReader(handle)}
     assert target in variable_ids  # still listed as a (known) variable as well

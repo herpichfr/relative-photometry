@@ -24,6 +24,7 @@ from relphot.transit_search import (
 class _FrameMeta:
     def __init__(self, bjd: float) -> None:
         self.bjd_tdb = bjd
+        self.median_fwhm = 3.0
 
 
 class _FakeNight:
@@ -32,6 +33,15 @@ class _FakeNight:
         self.n_frames = n_frames
         self.n_aper = n_aper
         self.frame_meta = [_FrameMeta(float(b)) for b in bjd]
+        # Per-star per-frame seeing, background and centroid: independent of the
+        # synthetic light curves (the R90 regressors), so a real injected event
+        # does not correlate with them.
+        rng = np.random.default_rng(12345)
+        shape = (n_stars, n_frames)
+        self.fwhm = 3.0 + 0.1 * rng.standard_normal(shape)
+        self.background = 100.0 + 2.0 * rng.standard_normal(shape)
+        self.frame_x = 500.0 + 0.05 * rng.standard_normal(shape)
+        self.frame_y = 700.0 + 0.05 * rng.standard_normal(shape)
 
 
 class _FakeTileMap:
@@ -450,3 +460,270 @@ def test_flag_on_variable_marks_transit_candidates_that_are_variable() -> None:
     assert flags.tolist() == [FLAG_ON_VARIABLE, 0, FLAG_SHARED_EPOCH | FLAG_ON_VARIABLE, 0]
     # candidacy is the caller's mask; the helper never changes it
     assert candidate.tolist() == [True, True, True, False]
+
+
+# --- R90 false-positive screen (informational flags) -----------------------------------------
+
+
+def _r90_series(seed: int = 0, n: int = 350, cadence_s: float = 31.7, sigma: float = 0.004):
+    """One synthetic star for the R90 features: time, flux, errors, empty CBVs, regressors.
+
+    The regressors are ``(4, n)`` FWHM ratio, background and centroid x/y, white noise
+    independent of the flux (a star whose light curve does not follow its seeing).
+    """
+    rng = np.random.default_rng(seed)
+    t = 2460930.5 + np.arange(n) * cadence_s / 86400.0
+    y = 1.0 + sigma * rng.standard_normal(n)
+    err = np.full(n, sigma)
+    cbv = np.zeros((0, n))
+    regs = np.vstack([
+        1.0 + 0.03 * rng.standard_normal(n),
+        100.0 + 2.0 * rng.standard_normal(n),
+        500.0 + 0.05 * rng.standard_normal(n),
+        700.0 + 0.05 * rng.standard_normal(n),
+    ])
+    return t, y, err, cbv, regs
+
+
+def _r90_bits(t, y, err, cbv, regs, tc, duration_h, settings=None) -> int:
+    from relphot.config import SearchSettings
+    from relphot.transit_r90 import compute_r90_features
+    from relphot.transit_search import r90_flag_bits
+
+    settings = settings or SearchSettings()
+    features = compute_r90_features(
+        t, y, err, cbv, tc, duration_h / 24.0, regs, settings.poly_degree
+    )
+    return r90_flag_bits(features, settings)
+
+
+def test_r90_flags_are_informational_and_round_trip() -> None:
+    from relphot.transit_search import (
+        FLAG_NAMES,
+        FLAG_R90_CLIP,
+        FLAG_R90_FIT_FAIL,
+        FLAG_R90_FLAT,
+        FLAG_R90_SINGLE_POINT,
+        FLAG_R90_SYSTEMATICS,
+        R90_FLAGS,
+    )
+
+    bits = [
+        FLAG_R90_SINGLE_POINT, FLAG_R90_SYSTEMATICS, FLAG_R90_CLIP, FLAG_R90_FLAT,
+        FLAG_R90_FIT_FAIL,
+    ]
+    assert all(b > FLAG_ON_VARIABLE for b in bits)  # after the existing bits
+    assert len(set(bits)) == 5
+    assert sum(bits) == R90_FLAGS
+    assert R90_FLAGS & HARD_REJECT_FLAGS == 0
+    names = dict(FLAG_NAMES)
+    assert [names[b] for b in bits] == [
+        "R90_SINGLE_POINT", "R90_SYSTEMATICS", "R90_CLIP", "R90_FLAT", "R90_FIT_FAIL"
+    ]
+    assert len({name for _bit, name in FLAG_NAMES}) == len(FLAG_NAMES)
+    for bit, name in FLAG_NAMES:
+        assert flags_to_string(bit) == name
+        assert name in flags_to_string(bit | FLAG_PARTIAL).split("|")
+    assert flags_to_string(R90_FLAGS | FLAG_ON_VARIABLE).split("|") == [
+        "ON_VARIABLE", "R90_SINGLE_POINT", "R90_SYSTEMATICS", "R90_CLIP", "R90_FLAT",
+        "R90_FIT_FAIL",
+    ]
+    # the tier is blind to them, whatever else is set
+    assert tier_for_flags(R90_FLAGS) == 1
+    assert tier_for_flags(FLAG_SHARED_EPOCH | R90_FLAGS) == 2
+    assert tier_for_flags(FLAG_PARTIAL | R90_FLAGS) == 3
+    # the integer must survive the int64 flags column and the DB text round trip
+    assert int(np.int64(R90_FLAGS | FLAG_ON_VARIABLE)) == R90_FLAGS | FLAG_ON_VARIABLE
+
+
+def test_r90_flag_bits_thresholds_and_nan() -> None:
+    from dataclasses import replace
+
+    from relphot.config import SearchSettings
+    from relphot.transit_r90 import R90Features
+    from relphot.transit_search import (
+        FLAG_R90_CLIP,
+        FLAG_R90_FIT_FAIL,
+        FLAG_R90_FLAT,
+        FLAG_R90_SINGLE_POINT,
+        FLAG_R90_SYSTEMATICS,
+        r90_flag_bits,
+    )
+
+    s = SearchSettings()
+    assert (s.r90_enabled, s.r90_top1_share_max, s.r90_top3_share_max) == (True, 0.4, 0.6)
+    assert (s.r90_reg_dchi2_ratio_min, s.r90_reg_depth_ratio_min) == (0.3, 0.7)
+    assert (s.r90_clip3_dchi2_min, s.r90_dbic_flat_min) == (16.0, 6.0)
+
+    ok = R90Features(
+        fit_ok=True, success=True, top1_share=0.4, top3_share=0.6, reg_dchi2_ratio=0.3,
+        reg_depth_ratio=0.7, clip3_dchi2=16.0, dbic_flat=6.0,
+    )
+    assert r90_flag_bits(ok, s) == 0  # every threshold is inclusive
+    cases = {
+        FLAG_R90_SINGLE_POINT: [{"top1_share": 0.41}, {"top3_share": 0.61}],
+        FLAG_R90_SYSTEMATICS: [{"reg_dchi2_ratio": 0.29}, {"reg_depth_ratio": 0.69}],
+        FLAG_R90_CLIP: [{"clip3_dchi2": 15.9}],
+        FLAG_R90_FLAT: [{"dbic_flat": 5.9}],
+        FLAG_R90_FIT_FAIL: [{"success": False}],
+    }
+    for bit, variants in cases.items():
+        for change in variants:
+            assert r90_flag_bits(replace(ok, **change), s) == bit, change
+    # a number that could not be computed fails its own group, and only that group
+    assert r90_flag_bits(replace(ok, top1_share=np.nan), s) == FLAG_R90_SINGLE_POINT
+    assert r90_flag_bits(replace(ok, reg_depth_ratio=np.nan), s) == FLAG_R90_SYSTEMATICS
+    assert r90_flag_bits(replace(ok, clip3_dchi2=np.nan), s) == FLAG_R90_CLIP
+    assert r90_flag_bits(replace(ok, dbic_flat=np.nan), s) == FLAG_R90_FLAT
+    # no fit at all: FIT_FAIL alone
+    assert r90_flag_bits(R90Features(), s) == FLAG_R90_FIT_FAIL
+    # thresholds come from the settings
+    loose = replace(s, r90_top1_share_max=0.5, r90_dbic_flat_min=0.0)
+    assert r90_flag_bits(replace(ok, top1_share=0.5, dbic_flat=1.0), loose) == 0
+
+
+def test_r90_settings_load_from_toml(tmp_path) -> None:
+    from relphot.config import load_settings, settings_from_dict, settings_to_dict
+
+    path = tmp_path / "r90.toml"
+    path.write_text(
+        "[search]\nr90_enabled = false\nr90_top1_share_max = 0.3\nr90_clip3_dchi2_min = 25.0\n"
+    )
+    search = load_settings(path).search
+    assert search.r90_enabled is False
+    assert (search.r90_top1_share_max, search.r90_clip3_dchi2_min) == (0.3, 25.0)
+    assert search.r90_dbic_flat_min == 6.0  # untouched keys keep the default
+    assert settings_from_dict(settings_to_dict(load_settings(path))).search == search
+
+
+def test_r90_clean_transit_passes_every_criterion() -> None:
+    t, y, err, cbv, regs = _r90_series(seed=1)
+    tc = t[0] + 0.5 * (t[-1] - t[0])
+    y = y * _limb_darkened_transit(t, tc, 0.02, 1.0 / 24.0)
+    assert _r90_bits(t, y, err, cbv, regs, tc, 1.0) == 0
+
+
+def test_r90_single_point_spike_fails_single_point() -> None:
+    from relphot.transit_search import FLAG_R90_CLIP, FLAG_R90_SINGLE_POINT
+
+    t, y, err, cbv, regs = _r90_series(seed=2)
+    tc = t[0] + 0.5 * (t[-1] - t[0])
+    y = y.copy()
+    y[np.argmin(np.abs(t - tc))] -= 0.04  # one 10-sigma epoch, no event around it
+    bits = _r90_bits(t, y, err, cbv, regs, tc, 0.5)
+    assert bits & FLAG_R90_SINGLE_POINT
+    # once that epoch is clipped nothing is left of the event
+    assert bits & FLAG_R90_CLIP
+    # the same star without the spike is not single-point dominated
+    t, y, err, cbv, regs = _r90_series(seed=2)
+    assert not _r90_bits(t, y, err, cbv, regs, tc, 0.5) & FLAG_R90_SINGLE_POINT
+
+
+def test_r90_event_collinear_with_seeing_fails_systematics() -> None:
+    from relphot.transit_search import FLAG_R90_SYSTEMATICS
+
+    t, y, err, cbv, regs = _r90_series(seed=3)
+    tc = t[0] + 0.5 * (t[-1] - t[0])
+    bump = np.exp(-0.5 * ((t - tc) / (0.25 / 24.0)) ** 2)  # a seeing excursion of ~0.6 h
+    y = y * (1.0 - 0.02 * bump)  # the flux dip follows it exactly
+    clean = _r90_bits(t, y, err, cbv, regs, tc, 0.6)
+    assert not clean & FLAG_R90_SYSTEMATICS  # the same dip with quiet seeing is an event
+    regs = regs.copy()
+    regs[0] = regs[0] + 0.5 * bump  # the FWHM of this star swells with the dip
+    assert _r90_bits(t, y, err, cbv, regs, tc, 0.6) & FLAG_R90_SYSTEMATICS
+
+
+def test_r90_flat_noise_fails_flat() -> None:
+    from relphot.transit_search import FLAG_R90_FIT_FAIL, FLAG_R90_FLAT
+
+    t, y, err, cbv, regs = _r90_series(seed=4)
+    tc = t[0] + 0.5 * (t[-1] - t[0])
+    bits = _r90_bits(t, y, err, cbv, regs, tc, 1.0)
+    assert bits & FLAG_R90_FLAT
+    assert not bits & FLAG_R90_FIT_FAIL  # the fit itself worked; there is just nothing to fit
+
+
+def test_r90_unfittable_light_curve_is_fit_fail_not_an_exception() -> None:
+    from relphot.transit_search import FLAG_R90_FIT_FAIL
+
+    t, y, err, cbv, regs = _r90_series(seed=5, n=60)
+    y = np.full_like(y, np.nan)
+    assert _r90_bits(t, y, err, cbv, regs, t[30], 1.0) == FLAG_R90_FIT_FAIL
+
+
+def test_r90_screen_in_search_transits_candidates_only_and_informational() -> None:
+    from dataclasses import replace
+
+    from relphot.transit_search import R90_FLAGS
+
+    n_stars, n_comp, target = 100, 80, 99
+    night, tilemap, lc, lc_err, epoch_ok, frame_kept, star_best_aper, bjd = _scenario(
+        n_stars=n_stars, seed=3
+    )
+    tc_true = bjd[0] + (bjd[-1] - bjd[0]) * 0.5
+    lc[target, :, 0] *= _limb_darkened_transit(bjd, tc_true, 0.03, 1.2 / 24.0)
+    comparison_mask = np.zeros((n_stars, 1), dtype=bool)
+    comparison_mask[:n_comp, 0] = True
+
+    def run(**search_kw):
+        settings = Settings()
+        settings = replace(settings, search=replace(settings.search, **search_kw))
+        return _run_search(
+            night, tilemap, lc, lc_err, epoch_ok, frame_kept, star_best_aper, comparison_mask,
+            settings,
+        )
+
+    on = run()
+    off = run(r90_enabled=False)
+
+    # screened exactly the candidates; a clean injected transit passes
+    assert on.candidate[target]
+    assert np.array_equal(on.r90_evaluated, on.candidate)
+    assert on.r90_pass[target]
+    assert on.flags[target] & R90_FLAGS == 0
+    feats = ("top1_share", "top3_share", "reg_dchi2_ratio", "reg_depth_ratio", "clip3_dchi2",
+             "dbic_flat")
+    for name in feats:
+        column = getattr(on, name)
+        assert np.isfinite(column[target]), name
+        assert np.all(np.isnan(column[~on.r90_evaluated])), name  # non-candidates untouched
+    assert on.top1_share[target] <= 0.4 and on.reg_depth_ratio[target] >= 0.7
+
+    # switched off: nothing computed, no bit, and the search itself is untouched
+    assert not off.r90_evaluated.any() and not off.r90_pass.any()
+    assert all(np.all(np.isnan(getattr(off, name))) for name in feats)
+    assert (off.flags & R90_FLAGS == 0).all()
+    assert np.array_equal(on.flags & ~R90_FLAGS, off.flags)
+    assert np.array_equal(on.candidate, off.candidate)
+    assert np.array_equal(on.snr, off.snr, equal_nan=True)
+    assert np.array_equal(on.tc, off.tc, equal_nan=True)
+    assert [tier_for_flags(int(b)) for b in on.flags] == [
+        tier_for_flags(int(b)) for b in off.flags
+    ]
+
+
+def test_r90_systematics_flag_from_the_night_regressors_leaves_tier_and_candidacy() -> None:
+    from relphot.transit_search import FLAG_R90_SYSTEMATICS, R90_FLAGS
+
+    n_stars, n_comp, target = 100, 80, 99
+    night, tilemap, lc, lc_err, epoch_ok, frame_kept, star_best_aper, bjd = _scenario(
+        n_stars=n_stars, seed=5
+    )
+    tc_true = bjd[0] + (bjd[-1] - bjd[0]) * 0.5
+    bump = np.exp(-0.5 * ((bjd - tc_true) / (0.25 / 24.0)) ** 2)
+    lc[target, :, 0] *= 1.0 - 0.02 * bump
+    night.fwhm[target] += 1.0 * bump  # this star's seeing swells with its dip
+    comparison_mask = np.zeros((n_stars, 1), dtype=bool)
+    comparison_mask[:n_comp, 0] = True
+
+    result = _run_search(
+        night, tilemap, lc, lc_err, epoch_ok, frame_kept, star_best_aper, comparison_mask
+    )
+    assert result.candidate[target]  # candidacy is not touched
+    assert result.r90_evaluated[target] and not result.r90_pass[target]
+    assert result.flags[target] & FLAG_R90_SYSTEMATICS
+    # the regressor explains the dip, so little chi2 improvement is left for the event
+    assert result.reg_dchi2_ratio[target] < 0.3
+    assert tier_for_flags(int(result.flags[target])) == tier_for_flags(
+        int(result.flags[target]) & ~R90_FLAGS
+    )
