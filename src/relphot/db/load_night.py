@@ -133,9 +133,13 @@ def _unique_name(base: str, existing: set[str]) -> str:
 
 
 def _infer_telescope(night_dir: Path) -> str | None:
-    for part in night_dir.parts:
+    """Telescope from a ``<TEL>_reduced`` (SSD staging) or ``<TEL>/reduced`` (permanent storage)."""
+    parts = night_dir.parts
+    for i, part in enumerate(parts):
         if part.endswith("_reduced") and len(part) > len("_reduced"):
             return part[: -len("_reduced")]
+        if part == "reduced" and i > 1:
+            return parts[i - 1]
     return None
 
 
@@ -392,7 +396,7 @@ def load_night(
     if not resolved_telescope:
         msg = (
             f"cannot infer telescope from {night_dir} "
-            "(no '<TEL>_reduced' path component); pass --telescope"
+            "(no '<TEL>_reduced' or '<TEL>/reduced' path component); pass --telescope"
         )
         raise NightLoadError(msg)
     resolved_label = label or night_dir.parent.name
