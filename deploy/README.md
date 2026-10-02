@@ -248,3 +248,18 @@ After schema v6 the live data needs, in this order: `relphot lightcurves` per ni
 ## No sudo required
 
 Every command above runs as the invoking user: rootless podman, user-scoped systemd units (`systemctl --user`, `~/.config/systemd/user/`, `~/.config/containers/systemd/`), and a user-writable data directory. Nothing in this guide needs `sudo`.
+
+## Data storage: SSD staging and permanent NFS storage
+
+Since 2026-10-02 telescope data lives permanently on the NFS share `/mnt/sto01/<TEL>/raw/` and `/mnt/sto01/<TEL>/reduced/<NIGHT>/`
+(slow random IO). `/ssdsto1/data/<TEL>_reduced/<NIGHT>/` is only a staging area for the IO-heavy steps (robo43 reduction and
+`forced`, `relphot ingest/reference/lightcurves/search`). The results DB (`/ssdsto1/data/relphotDB`) stays on the SSD.
+
+Rule: the DB holds the PERMANENT path. `relphot db load-night` and `load-multinight` key a night on `night.source_dir`, so
+1. process the night in staging;
+2. `deploy/relocate_reduced.sh --sync /ssdsto1/data/<TEL>_reduced/<NIGHT> /mnt/sto01/<TEL>/reduced/<NIGHT>`;
+3. `relphot db load-night /mnt/sto01/<TEL>/reduced/<NIGHT>/relphot` (the telescope is inferred from `<TEL>/reduced`);
+4. run `relphot multinight` on the permanent night directories (its npz records them) and load it from there;
+5. remove the staging copy.
+A night already in the DB under its staging path is moved with `--db` (rewrites `night.source_dir`, `frame.file_path`,
+`mn_run.stem` after a backup). The script never deletes the source.
