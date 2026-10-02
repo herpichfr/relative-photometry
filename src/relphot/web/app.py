@@ -34,7 +34,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from relphot.config import DbSettings
-from relphot.objflags import PLANET_CATALOGS, night_state, refresh_flags
+from relphot.objflags import (
+    PLANET_CATALOGS,
+    night_state,
+    plan_night_exop_to_events,
+    refresh_flags,
+    transit_night_verdict,
+)
 from relphot.repeat import (
     decision_tol_days,
     load_families,
@@ -2013,6 +2019,98 @@ class ObjectPatchBody(BaseModel):
     period_source: str | None = None
 
 
+# --------------------------------------------------------------------------
+# One verdict, two views: a night's EXOP verdict and the person's status on its transit events
+#
+# ``relphot.user_night_review.exop_verdict`` (Night reviews) and ``relphot.detection.status`` of
+# the ``kind = 'transit'`` events of that object and night (Transit events, Similar events) are
+# kept equal by every web write, in the transaction of that write:
+#   events -> night: CONFIRMED if any event is CONFIRMED, else REJECTED if all are REJECTED,
+#                    else no verdict (``transit_night_verdict``);
+#   night -> events: REJECTED rejects all, CONFIRMED confirms the open ones, clearing resets the
+#                    events that carried the cleared verdict (``plan_night_exop_to_events``).
+# The VAR verdict and the night's note are not mirrored. A night with no transit event keeps its
+# EXOP verdict on its own.
+# --------------------------------------------------------------------------
+
+
+def _transit_events_of_night(cur, obj_id: int, night_id: int) -> list[tuple[int, str | None]]:
+    """``(det_id, status)`` of the transit events of one object on one night."""
+    cur.execute(
+        "SELECT det_id, status FROM relphot.detection "
+        "WHERE obj_id = %s AND night_id = %s AND kind = 'transit' ORDER BY det_id",
+        (obj_id, night_id),
+    )
+    return cur.fetchall()
+
+
+def _apply_night_exop_to_events(
+    cur, obj_id: int, changes: list[tuple[int, str | None, str | None]]
+) -> list[int]:
+    """Night -> events: set the transit events of each ``(night_id, previous, new)`` EXOP verdict
+    change as ``plan_night_exop_to_events`` says. Returns the ``det_id`` s whose status changed."""
+    changed: list[int] = []
+    for night_id, previous, new in changes:
+        det_ids, status = plan_night_exop_to_events(
+            _transit_events_of_night(cur, obj_id, night_id), previous, new
+        )
+        if det_ids:
+            cur.execute(
+                "UPDATE relphot.detection SET status = %s WHERE det_id = ANY(%s)",
+                (status, det_ids),
+            )
+            changed.extend(det_ids)
+    return sorted(changed)
+
+
+def _sync_night_exop_from_events(cur, pairs: set[tuple[int, int | None]]) -> list[dict]:
+    """Events -> night: bring the EXOP verdict of each ``(obj_id, night_id)`` to what its transit
+    events say (``transit_night_verdict``); a row left with no verdict and no note is deleted.
+    Returns ``[{obj_id, night_id, exop}]`` for the pairs, ``exop`` being the verdict or ``None``."""
+    pairs = {(o, n) for o, n in pairs if n is not None}
+    if not pairs:
+        return []
+    obj_ids, night_ids = zip(*sorted(pairs), strict=True)
+    cur.execute(
+        "SELECT d.obj_id, d.night_id, array_agg(COALESCE(d.status, 'UNCONFIRMED')) "
+        "FROM relphot.detection d "
+        "JOIN unnest(%s::bigint[], %s::integer[]) AS p(obj_id, night_id) "
+        "ON p.obj_id = d.obj_id AND p.night_id = d.night_id "
+        "WHERE d.kind = 'transit' GROUP BY d.obj_id, d.night_id",
+        (list(obj_ids), list(night_ids)),
+    )
+    states = {(o, n): statuses for o, n, statuses in cur.fetchall()}
+    result = []
+    for obj_id, night_id in sorted(pairs):
+        verdict = transit_night_verdict(states.get((obj_id, night_id), []))
+        params = {"obj_id": obj_id, "night_id": night_id, "verdict": verdict}
+        if verdict is not None:
+            cur.execute(
+                "INSERT INTO relphot.user_night_review (obj_id, night_id, exop_verdict) "
+                "VALUES (%(obj_id)s, %(night_id)s, %(verdict)s) "
+                "ON CONFLICT (obj_id, night_id) DO UPDATE SET "
+                "exop_verdict = EXCLUDED.exop_verdict, updated_at = now() "
+                "WHERE relphot.user_night_review.exop_verdict IS DISTINCT FROM "
+                "EXCLUDED.exop_verdict",
+                params,
+            )
+        else:
+            cur.execute(
+                "UPDATE relphot.user_night_review SET exop_verdict = NULL, updated_at = now() "
+                "WHERE obj_id = %(obj_id)s AND night_id = %(night_id)s "
+                "AND exop_verdict IS NOT NULL",
+                params,
+            )
+            cur.execute(
+                "DELETE FROM relphot.user_night_review WHERE obj_id = %(obj_id)s "
+                "AND night_id = %(night_id)s AND exop_verdict IS NULL AND var_verdict IS NULL "
+                "AND note IS NULL",
+                params,
+            )
+        result.append({"obj_id": obj_id, "night_id": night_id, "exop": verdict})
+    return result
+
+
 def _flag_edits(provided: dict) -> tuple[dict[str, bool | None], dict[str, str | None]]:
     """Resolve the flag/source fields of a PATCH into ``({flag: new value}, {flag: new source})``.
 
@@ -2072,6 +2170,22 @@ def patch_object(obj_id: int, body: ObjectPatchBody):
     flags, sources = _flag_edits(provided)
     with get_rw_conn() as conn, conn.cursor() as cur:
         if flags or sources:
+            exop_changes: list[tuple[int, str | None, str | None]] = []
+            if "exop" in flags or sources.get("exop") == "auto":
+                cur.execute(
+                    "SELECT exop_verdict, night_id FROM relphot.user_night_review "
+                    "WHERE obj_id = %s",
+                    (obj_id,),
+                )
+                previous = {night: verdict for verdict, night in cur.fetchall()}
+                if "exop" in flags:
+                    cur.execute(
+                        "SELECT night_id FROM relphot.star_night WHERE obj_id = %s", (obj_id,)
+                    )
+                    new = "CONFIRMED" if flags["exop"] else "REJECTED"
+                    exop_changes = [(n, previous.get(n), new) for (n,) in cur.fetchall()]
+                else:
+                    exop_changes = [(n, v, None) for n, v in previous.items()]
             for key in ("exop", "var"):
                 if key in flags:
                     verdict = "CONFIRMED" if flags[key] else "REJECTED"
@@ -2094,6 +2208,7 @@ def patch_object(obj_id: int, body: ObjectPatchBody):
                 "AND exop_verdict IS NULL AND var_verdict IS NULL AND note IS NULL",
                 {"obj_id": obj_id},
             )
+            _apply_night_exop_to_events(cur, obj_id, exop_changes)
             refresh_flags(
                 conn, [obj_id], class_multinight_kinds=DbSettings().class_multinight_kinds
             )
@@ -2184,6 +2299,11 @@ def patch_detection(det_id: int, body: DetectionPatchBody):
             conn.rollback()
             raise HTTPException(status_code=404, detail="detection not found")
         columns = [d.name for d in cur.description]
+        # a transit event's verdict is its night's EXOP verdict too (Night reviews)
+        if "status" in provided and row[columns.index("kind")] == "transit":
+            _sync_night_exop_from_events(
+                cur, {(row[columns.index("obj_id")], row[columns.index("night_id")])}
+            )
         # a verdict on an event changes the night's automatic evidence: re-derive the flags
         if "status" in provided:
             refresh_flags(
@@ -2219,7 +2339,9 @@ def put_night_review(obj_id: int, night_id: int, body: NightReviewBody):
     """Upsert or delete a per-night review verdict.
 
     All null (and note null/empty) -> DELETE row, else INSERT ... ON CONFLICT DO UPDATE.
-    Returns {review, night: night_state dict, object: object row with updated flags/counts}.
+    Returns {review, night: night_state dict, object: object row with updated flags/counts,
+    events_updated: det_ids of the night's transit events whose status followed a changed EXOP
+    verdict}.
     """
     provided = body.model_dump(exclude_unset=True)
 
@@ -2249,6 +2371,14 @@ def put_night_review(obj_id: int, night_id: int, body: NightReviewBody):
         if cur.fetchone() is None:
             conn.rollback()
             raise HTTPException(status_code=404, detail="object has no data on this night")
+
+        cur.execute(
+            "SELECT exop_verdict FROM relphot.user_night_review "
+            "WHERE obj_id = %s AND night_id = %s",
+            (obj_id, night_id),
+        )
+        found = cur.fetchone()
+        previous_exop = found[0] if found else None
 
         # Determine action: all null (and note null/empty) -> delete, else upsert
         exop_v = provided.get("exop")
@@ -2288,6 +2418,11 @@ def put_night_review(obj_id: int, night_id: int, body: NightReviewBody):
                 }
             else:
                 review = None
+
+        # the night's EXOP verdict is the person's status on its transit events too
+        events_updated = _apply_night_exop_to_events(
+            cur, obj_id, [(night_id, previous_exop, exop_v)]
+        )
 
         # Compute night_state for this night
         cur.execute(
@@ -2330,6 +2465,7 @@ def put_night_review(obj_id: int, night_id: int, body: NightReviewBody):
         "review": review,
         "night": ns,
         "object": obj_data,
+        "events_updated": events_updated,
     })
 
 
@@ -2353,7 +2489,9 @@ class DetectionsReviewBody(BaseModel):
     ``det_ids`` (1..100) get ``status`` and, when ``note`` is not empty, the note: appended on a
     new line of their ``notes`` (``note_mode = 'append'``) or replacing them (``'replace'``). The
     viewed event ``anchor_det_id`` may be among them. Either way a summary line of the action is
-    appended to the anchor's notes (after the user note, if the anchor got one).
+    appended to the anchor's notes (after the user note, if the anchor got one). The new
+    statuses are written through to the EXOP verdict of each affected (object, night) in the same
+    transaction (``night_reviews`` in the response).
     """
 
     anchor_det_id: int
@@ -2452,6 +2590,10 @@ def post_detections_review(body: DetectionsReviewBody):
         anchor_status, anchor_notes = cur.fetchone()
         if anchor_id in updated:
             updated[anchor_id]["notes"] = anchor_notes
+        # the events' verdicts are their nights' EXOP verdicts too (Night reviews)
+        night_reviews = _sync_night_exop_from_events(
+            cur, {(row["obj_id"], row["night_id"]) for row in updated.values()}
+        )
         # a verdict on an event changes the night's automatic evidence: re-derive the flags
         refresh_flags(
             conn, sorted({row["obj_id"] for row in updated.values()} | {anchor_obj}),
@@ -2468,6 +2610,7 @@ def post_detections_review(body: DetectionsReviewBody):
                 "det_id": anchor_id, "obj_id": anchor_obj, "status": anchor_status,
                 "notes": anchor_notes,
             },
+            "night_reviews": night_reviews,
         }
     )
 

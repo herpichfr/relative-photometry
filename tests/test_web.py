@@ -1405,9 +1405,12 @@ def test_put_review_rejecting_a_night_never_removes_the_literature(client) -> No
 
     data = test_client.put(url, json={"exop": "REJECTED"}).json()
 
-    assert data["night"]["auto_exop"] is True
+    # the night's EXOP verdict is also the status of its transit event: that event is rejected
+    # with it, so it is no automatic evidence any more
+    assert data["night"]["auto_exop"] is False
     assert data["night"]["exop_effective"] is False
     assert data["night"]["pending"] is False  # the person has decided this night
+    assert data["events_updated"] != []
     assert (data["object"]["is_exop"], data["object"]["class"]) == (True, "EXOP")  # known planet
     assert data["object"]["exop_source"] == "manual"
     assert data["object"]["n_nights_reviewed"] == 1
@@ -1496,7 +1499,8 @@ def test_object_detail_nights_carry_the_review_and_night_state(client) -> None:
     assert (first["review_exop"], first["review_var"]) == ("REJECTED", None)
     assert first["review_note"] == "systematic"
     assert first["review_updated_at"]
-    assert (first["auto_exop"], first["exop_effective"], first["pending"]) == (True, False, False)
+    # the REJECTED verdict rejects the night's transit event too: no automatic evidence left
+    assert (first["auto_exop"], first["exop_effective"], first["pending"]) == (False, False, False)
 
 
 def test_search_needs_review_and_user_reviewed_filters(client, test_conn) -> None:
@@ -3645,3 +3649,225 @@ def test_the_web_app_does_not_import_relphot_db_or_pandas() -> None:
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
+
+
+# --------------------------------------------------------------------------
+# one verdict, two views: Night reviews (EXOP) <-> the status of the night's transit events
+# --------------------------------------------------------------------------
+
+
+def _exop_rows(test_conn, obj_id: int) -> list[tuple]:
+    test_conn.rollback()
+    return _review_rows(test_conn, obj_id)
+
+
+def _night_review(test_client, obj_id: int, night_id: int) -> dict | None:
+    """The review the Night reviews table shows for one night (``None``: no row)."""
+    night = next(
+        n for n in test_client.get(f"/api/object/{obj_id}").json()["nights"]
+        if n["night_id"] == night_id
+    )
+    if night["review_exop"] is None and night["review_var"] is None and not night["review_note"]:
+        return None
+    return {"exop": night["review_exop"], "var": night["review_var"], "note": night["review_note"]}
+
+
+def _event_statuses(test_client, obj_id: int) -> dict[int, str]:
+    events = test_client.get(f"/api/object/{obj_id}").json()["transit_events"]
+    return {e["det_id"]: e["status"] for e in events}
+
+
+def test_bulk_reject_all_shows_in_night_reviews_and_unconfirm_clears_it(client, test_conn) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids, n=3)
+    night1, night2 = ids["night1"], ids["night2"]
+
+    resp = _review(test_client, ids["det_a"], [ids["det_a"], ids["det_b"], *similar], "REJECTED")
+    assert resp.status_code == 200
+    reviewed = {(r["obj_id"], r["night_id"]): r["exop"] for r in resp.json()["night_reviews"]}
+    assert len(reviewed) == 5  # obj_both on two nights, three look-alike objects on night 1
+    assert set(reviewed.values()) == {"REJECTED"}
+    # Night reviews of the viewed object ...
+    assert _exop_rows(test_conn, ids["obj_both"]) == [
+        (night1, "REJECTED", None, None), (night2, "REJECTED", None, None),
+    ]
+    assert _night_review(test_client, ids["obj_both"], night1)["exop"] == "REJECTED"
+    # ... and of each look-alike's object
+    with test_conn.cursor() as cur:
+        cur.execute("SELECT obj_id FROM relphot.detection WHERE det_id = ANY(%s)", (similar,))
+        sim_objs = [o for (o,) in cur.fetchall()]
+    for obj_id in sim_objs:
+        assert _exop_rows(test_conn, obj_id) == [(night1, "REJECTED", None, None)]
+
+    # one event of the object back to UNCONFIRMED: that night has no verdict any more
+    resp = _review(test_client, ids["det_b"], [ids["det_b"]], "UNCONFIRMED")
+    assert resp.status_code == 200
+    assert resp.json()["night_reviews"] == [
+        {"obj_id": ids["obj_both"], "night_id": night2, "exop": None}
+    ]
+    assert _exop_rows(test_conn, ids["obj_both"]) == [(night1, "REJECTED", None, None)]
+    assert _night_review(test_client, ids["obj_both"], night2) is None
+    # the effective state follows: night 2 awaits review again
+    night = next(
+        n for n in test_client.get(f"/api/object/{ids['obj_both']}").json()["nights"]
+        if n["night_id"] == night2
+    )
+    assert night["pending"] is True
+
+
+def test_bulk_confirm_all_is_a_confirmed_exop_verdict_and_keeps_var_and_note(
+    client, test_conn
+) -> None:
+    test_client, ids = client
+    obj, night1 = ids["obj_both"], ids["night1"]
+    put = test_client.put(
+        f"/api/object/{obj}/night/{night1}/review", json={"var": "CONFIRMED", "note": "keep"}
+    )
+    assert put.status_code == 200
+
+    assert _review(test_client, ids["det_a"], [ids["det_a"]], "CONFIRMED").status_code == 200
+    assert _exop_rows(test_conn, obj) == [(night1, "CONFIRMED", "CONFIRMED", "keep")]
+    assert _review(test_client, ids["det_a"], [ids["det_a"]], "UNCONFIRMED").status_code == 200
+    # the verdict goes, the VAR verdict and the note (their own row content) stay
+    assert _exop_rows(test_conn, obj) == [(night1, None, "CONFIRMED", "keep")]
+
+
+def test_bulk_review_failure_leaves_the_night_reviews_alone(client, test_conn) -> None:
+    test_client, ids = client
+    similar = _add_lookalikes(test_conn, ids, n=2)
+    resp = _review(test_client, ids["det_a"], [*similar, 999999], "REJECTED")
+    assert resp.status_code == 404
+    with test_conn.cursor() as cur:
+        test_conn.rollback()
+        cur.execute("SELECT count(*) FROM relphot.user_night_review")
+        assert cur.fetchone()[0] == 0
+
+
+def test_night_exop_verdict_sets_the_transit_events_of_that_night(client, test_conn) -> None:
+    test_client, ids = client
+    obj, night1, night2 = ids["obj_both"], ids["night1"], ids["night2"]
+    url = f"/api/object/{obj}/night/{night1}/review"
+
+    data = test_client.put(url, json={"exop": "REJECTED", "note": "systematics"}).json()
+    assert data["events_updated"] == [ids["det_a"]]
+    assert _event_statuses(test_client, obj) == {
+        ids["det_a"]: "REJECTED", ids["det_b"]: "UNCONFIRMED"  # the other night is untouched
+    }
+    assert data["night"]["exop_effective"] is False and data["night"]["pending"] is False
+    assert (data["object"]["n_nights_reviewed"], data["object"]["n_review_pending"]) == (1, 1)
+
+    # saving the same EXOP verdict again (e.g. only the note changed) touches no event
+    test_client.patch(f"/api/detection/{ids['det_a']}", json={"notes": "by hand"})
+    data = test_client.put(url, json={"exop": "REJECTED", "note": "systematics 2"}).json()
+    assert data["events_updated"] == []
+    assert _event_statuses(test_client, obj)[ids["det_a"]] == "REJECTED"
+
+    # all of the night's events were REJECTED: CONFIRMED confirms them
+    data = test_client.put(url, json={"exop": "CONFIRMED"}).json()
+    assert data["events_updated"] == [ids["det_a"]]
+    assert _event_statuses(test_client, obj)[ids["det_a"]] == "CONFIRMED"
+
+    # back to automatic: the events that carried the verdict are open again
+    data = test_client.put(url, json={"exop": None, "note": "x"}).json()
+    assert data["events_updated"] == [ids["det_a"]]
+    assert _event_statuses(test_client, obj) == {
+        ids["det_a"]: "UNCONFIRMED", ids["det_b"]: "UNCONFIRMED"
+    }
+    assert _exop_rows(test_conn, obj) == [(night1, None, None, "x")]
+    # deleting the review (all null, no note) is the same as clearing it
+    test_client.put(url, json={"exop": "REJECTED"})
+    resp = test_client.delete(url)
+    assert resp.json()["events_updated"] == [ids["det_a"]]
+    assert _event_statuses(test_client, obj)[ids["det_a"]] == "UNCONFIRMED"
+    assert _exop_rows(test_conn, obj) == []
+    assert night2  # the second night never had a verdict
+
+
+def test_night_with_several_transit_events_and_mixed_verdicts(client, test_conn) -> None:
+    test_client, ids = client
+    obj, night1 = ids["obj_both"], ids["night1"]
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind, snr, depth, tc_bjd_tdb, "
+            "duration_h, tier) VALUES (%s, %s, 'transit', 8.0, 0.02, 2460310.60, 1.5, 2) "
+            "RETURNING det_id",
+            (obj, night1),
+        )
+        (det_c,) = cur.fetchone()
+    test_conn.commit()
+    det_a = ids["det_a"]
+    url = f"/api/object/{obj}/night/{night1}/review"
+
+    # night REJECTED rejects both events of the night
+    data = test_client.put(url, json={"exop": "REJECTED"}).json()
+    assert data["events_updated"] == [det_a, det_c]
+    # one event reopened: the night has no verdict while some event is open
+    test_client.patch(f"/api/detection/{det_c}", json={"status": "UNCONFIRMED"})
+    assert _exop_rows(test_conn, obj) == []
+    assert _event_statuses(test_client, obj)[det_a] == "REJECTED"
+    # night CONFIRMED confirms the open event and leaves the person's rejection of the other
+    data = test_client.put(url, json={"exop": "CONFIRMED"}).json()
+    assert data["events_updated"] == [det_c]
+    assert _event_statuses(test_client, obj) == {
+        det_a: "REJECTED", det_c: "CONFIRMED", ids["det_b"]: "UNCONFIRMED"
+    }
+    # a CONFIRMED event keeps the night CONFIRMED however the others stand ...
+    test_client.patch(f"/api/detection/{det_a}", json={"status": "UNCONFIRMED"})
+    assert _exop_rows(test_conn, obj) == [(night1, "CONFIRMED", None, None)]
+    # ... and clearing the night resets only the CONFIRMED one
+    test_client.patch(f"/api/detection/{det_a}", json={"status": "REJECTED"})
+    assert test_client.put(url, json={"exop": None}).json()["events_updated"] == [det_c]
+    assert _event_statuses(test_client, obj)[det_a] == "REJECTED"
+    assert _event_statuses(test_client, obj)[det_c] == "UNCONFIRMED"
+
+
+def test_patch_detection_on_a_transit_event_writes_the_night_verdict_other_kinds_do_not(
+    client, test_conn
+) -> None:
+    test_client, ids = client
+    obj, night1 = ids["obj_both"], ids["night1"]
+    resp = test_client.patch(f"/api/detection/{ids['det_a']}", json={"status": "REJECTED"})
+    assert resp.status_code == 200
+    assert _exop_rows(test_conn, obj) == [(night1, "REJECTED", None, None)]
+    # a notes-only edit changes no verdict
+    test_client.patch(f"/api/detection/{ids['det_a']}", json={"notes": "n"})
+    assert _exop_rows(test_conn, obj) == [(night1, "REJECTED", None, None)]
+    test_client.patch(f"/api/detection/{ids['det_a']}", json={"status": "UNCONFIRMED"})
+    assert _exop_rows(test_conn, obj) == []
+
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT det_id, obj_id, night_id FROM relphot.detection WHERE kind = 'variable'"
+        )
+        var_det, var_obj, var_night = cur.fetchone()
+    resp = test_client.patch(f"/api/detection/{var_det}", json={"status": "REJECTED"})
+    assert resp.status_code == 200
+    assert _exop_rows(test_conn, var_obj) == []  # a VAR event is not an EXOP verdict
+    assert var_night
+
+
+def test_object_flag_shorthand_follows_to_the_transit_events(client, test_conn) -> None:
+    test_client, ids = client
+    obj, night1 = ids["obj_exop"], ids["night1"]  # one transit event, on night 1
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "SELECT det_id FROM relphot.detection WHERE obj_id = %s AND kind = 'transit'", (obj,)
+        )
+        (det,) = cur.fetchone()
+
+    assert test_client.patch(f"/api/object/{obj}", json={"is_exop": False}).status_code == 200
+    assert _event_statuses(test_client, obj) == {det: "REJECTED"}
+    assert [r[1] for r in _exop_rows(test_conn, obj)] == ["REJECTED", "REJECTED"]
+    assert test_client.patch(f"/api/object/{obj}", json={"exop_source": "auto"}).status_code == 200
+    assert _event_statuses(test_client, obj) == {det: "UNCONFIRMED"}
+    assert _exop_rows(test_conn, obj) == []
+    assert night1
+
+
+def test_front_end_shows_the_transit_event_status_read_only() -> None:
+    js = (resources.files("relphot.web") / "static" / "app.js").read_text()
+    assert "function detectionStatusText" in js
+    # the Transit events table has no selector; the Detections table keeps one for other kinds
+    events = js[js.index("function renderTransitEvents"):js.index("async function patchDetection")]
+    assert "detectionStatusText(ev)" in events and "detectionStatusSelect" not in events
+    assert 'r.kind === "transit" ? detectionStatusText(r) : detectionStatusSelect(r)' in js

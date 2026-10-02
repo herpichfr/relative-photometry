@@ -22,7 +22,9 @@ __all__ = [
     "NIGHT_VAR_KINDS",
     "PLANET_CATALOGS",
     "night_state",
+    "plan_night_exop_to_events",
     "refresh_flags",
+    "transit_night_verdict",
 ]
 
 #: Per-night detection kinds that set exoplanet flag automatically.
@@ -269,3 +271,50 @@ def night_state(
         "var_effective": var_effective,
         "pending": pending,
     }
+
+
+def transit_night_verdict(statuses: list[str | None]) -> str | None:
+    """The night EXOP verdict that goes with the person's verdicts on one night's transit events.
+
+    ``statuses`` are the ``detection.status`` values of all the transit events of one object on
+    one night (``None`` reads as UNCONFIRMED). One CONFIRMED event makes the night CONFIRMED;
+    otherwise the night is REJECTED when every event is REJECTED; anything else (no events, or
+    some still open) is no verdict, i.e. ``None`` = automatic. An event's automatic rejection
+    (``auto_status``) is not a person's verdict and is not looked at here.
+    """
+    states = [s or "UNCONFIRMED" for s in statuses]
+    if "CONFIRMED" in states:
+        return "CONFIRMED"
+    if states and all(s == "REJECTED" for s in states):
+        return "REJECTED"
+    return None
+
+
+def plan_night_exop_to_events(
+    events: list[tuple[int, str | None]], previous: str | None, new: str | None
+) -> tuple[list[int], str]:
+    """The ``det_id`` s of one night's transit events to set, and to what, when that night's
+    EXOP verdict goes from ``previous`` to ``new`` (the inverse of :func:`transit_night_verdict`).
+
+    ``events`` are ``(det_id, status)`` of all the transit events of the object on the night.
+
+    - ``new`` REJECTED: every event not yet REJECTED becomes REJECTED.
+    - ``new`` CONFIRMED: every event not REJECTED becomes CONFIRMED; an event a person REJECTED
+      stays so, unless all of them are REJECTED, then all become CONFIRMED.
+    - ``new`` ``None`` (back to automatic): the events that carry the verdict being cleared
+      become UNCONFIRMED; the others are left alone.
+
+    Nothing to do (``([], "")``) when the verdict does not change.
+    """
+    if new == previous:
+        return [], ""
+    states = {det_id: status or "UNCONFIRMED" for det_id, status in events}
+    if new == "REJECTED":
+        return [d for d, s in states.items() if s != "REJECTED"], "REJECTED"
+    if new == "CONFIRMED":
+        keep_rejected = any(s != "REJECTED" for s in states.values())
+        return [
+            d for d, s in states.items()
+            if s != "CONFIRMED" and not (s == "REJECTED" and keep_rejected)
+        ], "CONFIRMED"
+    return [d for d, s in states.items() if s == previous], "UNCONFIRMED"
