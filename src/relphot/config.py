@@ -694,6 +694,25 @@ class SearchSettings:
     #: close to either data edge is statistically indistinguishable from
     #: the box itself and would otherwise report a spurious perfect match.
     step_min_side_points: int = 10
+    #: R90 false-positive screen of the transit candidates (relphot.transit_r90): sets the
+    #: informational ``R90_*`` flags (never a reject, never the tier) and stores the raw
+    #: features. ~25 ms per candidate; ``False`` skips the computation altogether.
+    #: Defaults are the "R90" cut set of the detection-improvement study (1622 reviewed
+    #: events, 12 nights): 67 % of the events a person rejected flagged at 91 % recall
+    #: of injected transits.
+    r90_enabled: bool = True
+    #: R90_SINGLE_POINT: the largest epoch / the three largest epochs may carry at most
+    #: this share of the event's chi2 improvement.
+    r90_top1_share_max: float = 0.4
+    r90_top3_share_max: float = 0.6
+    #: R90_SYSTEMATICS: refit with per-star FWHM, background and centroid x/y added to the
+    #: nuisance model must keep at least this fraction of the chi2 improvement / depth.
+    r90_reg_dchi2_ratio_min: float = 0.3
+    r90_reg_depth_ratio_min: float = 0.7
+    #: R90_CLIP: scaled chi2 improvement after a 3-sigma residual clip and refit.
+    r90_clip3_dchi2_min: float = 16.0
+    #: R90_FLAT: trapezoid vs nuisance-only, dchi2 / max(1, chi2_red) - 4 ln N.
+    r90_dbic_flat_min: float = 6.0
     #: Per-frame error-inflation factor bounds (relphot.cotrend.compute_frame_error_scale).
     #: Below 1 is allowed (a quieter-than-typical frame is not penalised);
     #: the ceiling keeps one catastrophic frame from zeroing out a trial

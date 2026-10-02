@@ -45,6 +45,12 @@ run, a shared frame-level glitch) is handled separately again, upstream in
 :func:`search_transits`, by rescaling every star's per-frame error using the
 comparison ensemble's own per-frame scatter (:func:`relphot.cotrend.compute_frame_error_scale`)
 -- never a per-star fit, so it stays transit-safe.
+
+Every candidate is finally screened by the informational "R90" false-positive flags
+(:mod:`relphot.transit_r90`): a trapezoid refit that asks whether one epoch carries the
+event, whether the star's own seeing/background/centroid explain it, whether it survives
+a residual clip and whether it beats a flat light curve. They are reported as ``R90_*``
+bits and raw features next to the other vetting flags and never change candidacy or tier.
 """
 
 from __future__ import annotations
@@ -57,6 +63,7 @@ import numpy as np
 
 from relphot.cotrend import compute_frame_error_scale
 from relphot.numeric import mad_sigma, nanmedian_quiet, robust_clip_series
+from relphot.transit_r90 import R90Features, compute_r90_features
 
 if TYPE_CHECKING:
     from relphot.comparison import ComparisonResult
@@ -76,10 +83,16 @@ __all__ = [
     "FLAG_NEIGHBOUR_BLEND",
     "FLAG_ON_VARIABLE",
     "FLAG_PARTIAL",
+    "FLAG_R90_CLIP",
+    "FLAG_R90_FIT_FAIL",
+    "FLAG_R90_FLAT",
+    "FLAG_R90_SINGLE_POINT",
+    "FLAG_R90_SYSTEMATICS",
     "FLAG_SHARED_EPOCH",
     "FLAG_STEP_LIKE",
     "FLAG_TOO_DEEP",
     "HARD_REJECT_FLAGS",
+    "R90_FLAGS",
     "StarSearchResult",
     "TransitSearchResult",
     "depth_at_other_aperture",
@@ -87,6 +100,7 @@ __all__ = [
     "flag_on_variable",
     "flags_to_string",
     "plot_transit_candidate",
+    "r90_flag_bits",
     "search_one_star",
     "search_transits",
     "tier_for_flags",
@@ -108,6 +122,24 @@ FLAG_PARTIAL = 1 << 8
 #: never rejects or demotes an event (not in ``HARD_REJECT_FLAGS``, ignored by
 #: :func:`tier_for_flags`); it is set by :func:`flag_on_variable`.
 FLAG_ON_VARIABLE = 1 << 9
+# "R90" false-positive screen (:mod:`relphot.transit_r90`, thresholds in
+# :class:`~relphot.config.SearchSettings`), one bit per failed criterion group. On 1622
+# reviewed events of 12 nights the full set removed 67 % of the events a person rejected
+# at 91 % recall of injected transits, and passed WASP-145 A b. Informational exactly like
+# ``FLAG_ON_VARIABLE``: not in ``HARD_REJECT_FLAGS`` and ignored by :func:`tier_for_flags`,
+# because the cuts are statistical (a real transit that coincides with a seeing change
+# fails the regressor test) and a person decides. Only candidates are screened.
+#: One epoch carries the event: top1 > 0.4 or top3 > 0.6 of its chi2 improvement.
+FLAG_R90_SINGLE_POINT = 1 << 10
+#: Seeing/background/centroid regressors absorb the event (retained chi2 improvement or
+#: depth below threshold).
+FLAG_R90_SYSTEMATICS = 1 << 11
+#: The event does not survive a 3-sigma residual clip (clip3 chi2 improvement too small).
+FLAG_R90_CLIP = 1 << 12
+#: The trapezoid does not beat the flat/nuisance-only model by the BIC margin.
+FLAG_R90_FLAT = 1 << 13
+#: No trapezoid refit could be made, or the optimiser did not converge.
+FLAG_R90_FIT_FAIL = 1 << 14
 
 FLAG_NAMES: tuple[tuple[int, str], ...] = (
     (FLAG_SHARED_EPOCH, "SHARED_EPOCH"),
@@ -120,6 +152,20 @@ FLAG_NAMES: tuple[tuple[int, str], ...] = (
     (FLAG_NEIGHBOUR_BLEND, "NEIGHBOUR_BLEND"),
     (FLAG_PARTIAL, "PARTIAL"),
     (FLAG_ON_VARIABLE, "ON_VARIABLE"),
+    (FLAG_R90_SINGLE_POINT, "R90_SINGLE_POINT"),
+    (FLAG_R90_SYSTEMATICS, "R90_SYSTEMATICS"),
+    (FLAG_R90_CLIP, "R90_CLIP"),
+    (FLAG_R90_FLAT, "R90_FLAT"),
+    (FLAG_R90_FIT_FAIL, "R90_FIT_FAIL"),
+)
+
+#: All R90 bits; a screened candidate passes R90 iff none of them is set.
+R90_FLAGS = (
+    FLAG_R90_SINGLE_POINT
+    | FLAG_R90_SYSTEMATICS
+    | FLAG_R90_CLIP
+    | FLAG_R90_FLAT
+    | FLAG_R90_FIT_FAIL
 )
 
 #: Flags that disqualify a star from candidate status outright, regardless of
@@ -163,6 +209,36 @@ def flag_on_variable(
     flags[np.asarray(candidate, dtype=bool) & np.asarray(variable_candidate, dtype=bool)] |= (
         FLAG_ON_VARIABLE
     )
+
+
+def r90_flag_bits(features: R90Features, settings: SearchSettings) -> int:
+    """The ``R90_*`` bits of one screened event, from its raw :class:`R90Features`.
+
+    One bit per failed criterion group, thresholds from ``settings``. A NaN feature
+    fails its criterion (a number that could not be computed vouches for nothing). When
+    no trapezoid fit exists at all only ``R90_FIT_FAIL`` is set: every other feature is
+    then NaN for that one reason, and flagging four groups would say less, not more.
+    """
+    if not features.fit_ok:
+        return FLAG_R90_FIT_FAIL
+    bits = 0
+    if not features.success:
+        bits |= FLAG_R90_FIT_FAIL
+    if not (
+        features.top1_share <= settings.r90_top1_share_max
+        and features.top3_share <= settings.r90_top3_share_max
+    ):
+        bits |= FLAG_R90_SINGLE_POINT
+    if not (
+        features.reg_dchi2_ratio >= settings.r90_reg_dchi2_ratio_min
+        and features.reg_depth_ratio >= settings.r90_reg_depth_ratio_min
+    ):
+        bits |= FLAG_R90_SYSTEMATICS
+    if not features.clip3_dchi2 >= settings.r90_clip3_dchi2_min:
+        bits |= FLAG_R90_CLIP
+    if not features.dbic_flat >= settings.r90_dbic_flat_min:
+        bits |= FLAG_R90_FLAT
+    return bits
 
 
 def tier_for_flags(flags: int) -> int:
@@ -214,6 +290,7 @@ class StarSearchResult:
     high_beta: bool = False
     aperture_inconsistent: bool = False
     few_points: bool = False
+    r90: R90Features | None = None
     t_good: np.ndarray | None = None
     y_good: np.ndarray | None = None
     err_good: np.ndarray | None = None
@@ -233,6 +310,11 @@ class TransitSearchResult:
     int, one histogram per tile of stars' best event epoch (only stars with
     ``snr >= settings.search.coincidence_snr_threshold`` contribute).
     ``coverage``/``partial`` mirror :class:`StarSearchResult`.
+    ``r90_evaluated`` marks the stars the R90 screen was run on (exactly the stars
+    that are candidates before the population-level flags); for them ``r90_pass`` is
+    True iff no ``R90_*`` bit is set, and the six raw feature arrays hold the numbers
+    the bits were derived from (NaN where not evaluated or not computable), so the
+    thresholds can be re-tuned from the stored table.
     ``frame_error_scale`` is ``(n_tiles, n_aper, n_frames)``, the per-frame
     error-inflation factor from :func:`relphot.cotrend.compute_frame_error_scale`
     applied to every star's errors before searching.
@@ -258,6 +340,14 @@ class TransitSearchResult:
     candidate: np.ndarray
     event_time_hist: np.ndarray
     frame_error_scale: np.ndarray
+    r90_evaluated: np.ndarray
+    r90_pass: np.ndarray
+    top1_share: np.ndarray
+    top3_share: np.ndarray
+    reg_dchi2_ratio: np.ndarray
+    reg_depth_ratio: np.ndarray
+    clip3_dchi2: np.ndarray
+    dbic_flat: np.ndarray
 
 
 def fit_nuisance_model(
@@ -355,6 +445,7 @@ def search_one_star(
     aper: int = -1,
     n_aper: int = 1,
     keep_grid: bool = False,
+    regressors: np.ndarray | None = None,
 ) -> StarSearchResult:
     """Search one star's light curve (one aperture) for the best single dimming event.
 
@@ -366,6 +457,14 @@ def search_one_star(
     aperture (already NaN-free at kept frames, or shape ``(0, n_frames)``
     when no CBVs are available). Returns ``ok=False`` when there are too
     few good epochs to fit even the nuisance model.
+
+    ``regressors`` is ``(4, n_frames)`` -- FWHM relative to the frame median, local
+    background, centroid x and y of this star at every frame -- and switches on the R90
+    screen (:mod:`relphot.transit_r90`, when ``settings.r90_enabled``): a best event
+    that is a candidate (SNR at or above ``settings.snr_threshold`` and none of
+    STEP_LIKE/TOO_DEEP/FEW_POINTS) gets its :class:`~relphot.transit_r90.R90Features`
+    in ``result.r90``; every other event leaves it ``None``. The screen only reads the
+    event the search found and never changes it.
     """
     idx_good = np.nonzero(good)[0]
     n_good = idx_good.size
@@ -384,6 +483,7 @@ def search_one_star(
     # outlier rejection, not a systematics model, and safe for transit-safety.
     keep = robust_clip_series(y_good, settings.lc_clip_sigma, settings.lc_clip_window)
     if not np.all(keep):
+        idx_good = idx_good[keep]
         t_good, y_good, err_good = t_good[keep], y_good[keep], err_good[keep]
         cbv_good = cbv_good[:, keep]
         n_good = t_good.shape[0]
@@ -615,6 +715,21 @@ def search_one_star(
     is_few_points = best_n_in < settings.few_points_threshold
     is_high_beta = best_beta > settings.high_beta_threshold
 
+    # R90 screen, candidates only (~25 ms per event, far too slow for every star):
+    # decided here, where the epochs the search actually fit and the hard flags are at
+    # hand, with the same condition search_transits uses for ``candidate``.
+    r90 = None
+    if (
+        settings.r90_enabled
+        and regressors is not None
+        and best_snr >= settings.snr_threshold
+        and not (is_step_like or is_too_deep or is_few_points)
+    ):
+        r90 = compute_r90_features(
+            t_good, y_good, err_good, cbv_good, best_tc, best_dur,
+            regressors[:, idx_good], settings.poly_degree,
+        )
+
     # Cross-aperture depth check, at the same (tc, duration): recompute the
     # joint fit directly (only n_aper evaluations, not a grid) for whichever
     # apertures the caller supplies via depth_per_aper/sigma_depth_per_aper.
@@ -646,6 +761,7 @@ def search_one_star(
         step_like=bool(is_step_like),
         high_beta=bool(is_high_beta),
         few_points=bool(is_few_points),
+        r90=r90,
     )
     if keep_grid:
         in_best = (t_good >= best_tc - best_dur / 2.0) & (t_good <= best_tc + best_dur / 2.0)
@@ -746,6 +862,11 @@ def search_transits(
     ``comparison_result``) before searching, so a genuinely noisier stretch
     of the night or a shared instrumental glitch is down-weighted for every
     star without any per-star fit.
+
+    With ``settings.search.r90_enabled`` the per-frame FWHM (relative to the frame's
+    median FWHM), local background and centroid x/y of ``night`` are handed to
+    :func:`search_one_star` as extra regressors for the R90 screen
+    (:mod:`relphot.transit_r90`), whose ``R90_*`` bits are set on every candidate.
     """
     search = settings.search
     n_kept = int(np.count_nonzero(frame_kept))
@@ -777,6 +898,17 @@ def search_transits(
     depth_per_aper = np.full((n_stars, n_aper), np.nan)
     sigma_depth_per_aper = np.full((n_stars, n_aper), np.nan)
     flags = np.zeros(n_stars, dtype=np.int64)
+    r90_evaluated = np.zeros(n_stars, dtype=bool)
+    r90_pass = np.zeros(n_stars, dtype=bool)
+    r90_columns = {
+        name: np.full(n_stars, np.nan)
+        for name in (
+            "top1_share", "top3_share", "reg_dchi2_ratio", "reg_depth_ratio",
+            "clip3_dchi2", "dbic_flat",
+        )
+    }
+    if search.r90_enabled:
+        med_fwhm = np.array([m.median_fwhm for m in night.frame_meta], dtype=np.float64)
 
     warned_no_cbv: set[tuple[int, int]] = set()
 
@@ -807,8 +939,14 @@ def search_transits(
 
         searched[i] = True
         aper_arr[i] = a
+        regressors = None
+        if search.r90_enabled:
+            regressors = np.stack(
+                [night.fwhm[i] / med_fwhm, night.background[i], night.frame_x[i], night.frame_y[i]]
+            ).astype(np.float64, copy=False)
         result = search_one_star(
-            bjd, y_norm, err_norm, good, cbv_rows, search, aper=a, n_aper=n_aper
+            bjd, y_norm, err_norm, good, cbv_rows, search, aper=a, n_aper=n_aper,
+            regressors=regressors,
         )
         if not result.ok:
             continue
@@ -866,6 +1004,13 @@ def search_transits(
             flag_bits |= FLAG_FEW_POINTS
         if result.partial:
             flag_bits |= FLAG_PARTIAL
+        if result.r90 is not None:
+            r90_bits = r90_flag_bits(result.r90, search)
+            flag_bits |= r90_bits
+            r90_evaluated[i] = True
+            r90_pass[i] = r90_bits == 0
+            for name, column in r90_columns.items():
+                column[i] = getattr(result.r90, name)
 
         finite_d = np.isfinite(depth_per_aper[i]) & np.isfinite(sigma_depth_per_aper[i])
         finite_d &= sigma_depth_per_aper[i] > 0
@@ -935,6 +1080,9 @@ def search_transits(
         candidate=candidate,
         event_time_hist=event_time_hist,
         frame_error_scale=frame_error_scale,
+        r90_evaluated=r90_evaluated,
+        r90_pass=r90_pass,
+        **r90_columns,
     )
 
 
