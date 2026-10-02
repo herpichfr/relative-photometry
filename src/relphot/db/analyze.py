@@ -92,6 +92,13 @@ __all__ = ["AnalyzeReport", "analyze"]
 
 _DEFAULT_CHUNK_SIZE = 200
 _MIN_NIGHT_POINTS = 10
+#: A tie magnitude is an instrumental magnitude (about -20 to 0); one beyond this is the
+#: output of a degenerate tie (the multi-night tie once wrote ~1e20), not a measurement,
+#: and the night counts as untied for that object.
+_TIE_MAG_ABS_MAX = 100.0
+#: No night-to-night magnitude offset of one object is this large; a larger (or
+#: non-finite) offset is not applied (``10 ** (-0.4 * offset)`` would overflow).
+_TIE_OFFSET_MAX_MAG = 20.0
 _MAG_PER_LN10 = 2.5 / math.log(10.0)
 
 
@@ -303,6 +310,8 @@ def _fetch_chunk_data(
     loose_by_run: dict[int, frozenset[int]] = {}
     for obj_id, night_id, mn_run_id, loaded_at, mag, mag_err, loose_ids in tie_rows:
         loose_by_run[mn_run_id] = frozenset(loose_ids or ())
+        if mag is not None and not (math.isfinite(mag) and abs(mag) <= _TIE_MAG_ABS_MAX):
+            continue
         runs = runs_by_obj.setdefault(obj_id, {})
         nights_set, _ = runs.get(mn_run_id, (set(), loaded_at))
         nights_set.add(night_id)
@@ -791,9 +800,11 @@ def _fit_transit_shape(
     t, y, e = got
     t_night = t
     if tie_entry is not None and tie_ref is not None:
-        scale = 10.0 ** (-0.4 * (tie_entry[0] - tie_ref))
-        y, e = y * scale, e * scale
-        out["input"] = "tied"
+        offset = tie_entry[0] - tie_ref
+        if math.isfinite(offset) and abs(offset) <= _TIE_OFFSET_MAX_MAG:
+            scale = 10.0 ** (-0.4 * offset)
+            y, e = y * scale, e * scale
+            out["input"] = "tied"
     # time relative to the detection's tc, so finite-difference steps are not scaled by a BJD
     t_rel = t - det.tc
     sel = np.abs(t_rel) <= max(1.5 * d0, d0 + 1.0 / 24.0)

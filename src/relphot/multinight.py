@@ -89,6 +89,22 @@ __all__ = [
 #: median(chi^2_1) -- see the calibration-floor bisection in :func:`tie_nights`.
 _MEDIAN_CHI2_1 = 0.45494
 
+#: A fitted zero point (mag) of a tied star beyond this is a runaway of the alternating
+#: fit, not a calibration: the surfaces are mmag to sub-mag (the largest, a faint-end
+#: ``dm**2`` extrapolation, reaches ~2 mag), so :func:`tie_nights` drops such a star
+#: (:attr:`NightTie.rejected`, NaN ``mean_mag`` and ``zp``). A loose night's comparison
+#: star further than this from the night's median offset to the core frame is not fit.
+_ZP_RUNAWAY_MAG = 5.0
+#: A tie row (night, star) whose magnitude differs from the other nights' weighted mean
+#: by more than this (mag), beyond the night's own median offset, is not a calibrator:
+#: a nightly magnitude that far off (a garbage or blended measurement, typically with a
+#: huge error) has no weight by its error alone but, as a high-leverage row of the
+#: ``dm**2`` fit, wrecks the surface. Such rows are left out of the tie fit.
+_TIE_DISCREPANCY_MAG = 3.0
+#: A loose night's evaluated zero point (mag) beyond this, or non-finite, is not a
+#: number a surface can mean (a degenerate fit): the star's ``zp`` is NaN.
+_ZP_ABSURD_MAG = 50.0
+
 
 @dataclass(slots=True)
 class NightProducts:
@@ -767,7 +783,9 @@ class NightTie:
     are the raw (uncalibrated) per-night magnitude ``m``/its statistical
     error ``s``. ``tie_star`` marks which (night, star) entries were used in
     the converged fit; ``rejected`` marks a star clipped at the whole-star
-    level (excluded from every night). ``floor`` is the post-convergence
+    level (excluded from every night), including one whose zero point ran away
+    (``|Z| >`` :data:`_ZP_RUNAWAY_MAG`; its ``zp`` and ``mean_mag`` are NaN, never a
+    diverged number). ``floor`` is the post-convergence
     empirical calibration floor, ``(n_nights, n_aper, n_bins)``, fit
     independently in each of ``floor_mag_centres``'s equal-count magnitude
     bins (NaN where a bin had too few common tie stars) -- see
@@ -867,6 +885,13 @@ def tie_nights(
     settings: MultiNightSettings,
 ) -> NightTie:
     """Fit the per-(night, aperture) zero-point tie described in the module docstring.
+
+    Two guards keep a star whose nights disagree wildly (typically one night a
+    few-mag-fainter measurement with a mag-sized error, as forced photometry gives) from
+    breaking the fit: at the first iteration a tie row more than
+    :data:`_TIE_DISCREPANCY_MAG` from the other nights' mean (beyond the night's median
+    offset) is not a tie row, and a star whose zero point ever exceeds
+    :data:`_ZP_RUNAWAY_MAG` is rejected with NaN ``zp``/``mean_mag``.
 
     Raises
     ------
@@ -980,6 +1005,7 @@ def tie_nights(
         z = np.zeros((n_nights, n_global), dtype=np.float64)
         seeing_z = np.zeros((n_nights, n_global), dtype=np.float64)
         rej = np.zeros(n_global, dtype=bool)
+        runaway_star = np.zeros(n_global, dtype=bool)
         mag0_a: float | None = None
         seeing_mag0_a: float | None = None
         seeing_crowd0_a: float | None = None
@@ -993,6 +1019,9 @@ def tie_nights(
             m_all, m_loo, wtot_loo = _weighted_mean_and_loo(w, v)
 
             if mag0_a is None:
+                d_loo = np.where(tie_base, mn - m_loo, np.nan)
+                off_n = nanmedian_quiet(d_loo, axis=1)
+                tie_base = tie_base & ~(np.abs(d_loo - off_n[:, None]) > _TIE_DISCREPANCY_MAG)
                 any_tie0 = tie_base.any(axis=0)
                 mag0_a = float(nanmedian_quiet(np.where(any_tie0, m_all, np.nan)))
                 mag0[a] = mag0_a
@@ -1041,9 +1070,15 @@ def tie_nights(
                 seeing_z_new = np.zeros((n_nights, n_global), dtype=np.float64)
 
             z_new = z_poly + seeing_z_new
+            # A star whose other nights disagree wildly with this one feeds its own
+            # magnitude back through the dm**2 term and diverges; drop it, with every
+            # night's zero point, before the number spreads.
+            runaway_star |= (np.abs(z_new) > _ZP_RUNAWAY_MAG).any(axis=0)
+            z_new = np.where(runaway_star[None, :], 0.0, z_new)
+            seeing_z_new = np.where(runaway_star[None, :], 0.0, seeing_z_new)
             seeing_z = seeing_z_new
 
-            active = tie_eff
+            active = tie_eff & ~runaway_star[None, :]
             if np.any(active):
                 delta = float(np.nanmax(np.abs(np.where(active, z_new - z, 0.0))))
             else:
@@ -1069,7 +1104,7 @@ def tie_nights(
                 )
             else:
                 newly_rejected = np.zeros(n_global, dtype=bool)
-            rej = rej | newly_rejected
+            rej = rej | newly_rejected | runaway_star
 
             if delta < settings.tol_mag:
                 break
@@ -1096,8 +1131,14 @@ def tie_nights(
 
         resid = mn - z - m_loo
         absent = xmatch.index < 0  # (n_nights, n_global)
-        zp[:, :, a] = np.where(absent, np.nan, z)
-        mean_mag[:, a] = m_all
+        if np.any(runaway_star):
+            logger.warning(
+                "aperture %d: %d star(s) whose zero point ran away (|Z| > %.1f mag) are "
+                "excluded (rejected, NaN zp and mean_mag)", a, int(np.count_nonzero(runaway_star)),
+                _ZP_RUNAWAY_MAG,
+            )
+        zp[:, :, a] = np.where(absent | runaway_star[None, :], np.nan, z)
+        mean_mag[:, a] = np.where(runaway_star, np.nan, m_all)
         tie_star[:, :, a] = tie_eff
         rejected[:, a] = rej
         n_tie[:, a] = tie_eff.sum(axis=1)
@@ -1292,6 +1333,10 @@ def tie_loose_nights(
        ``settings.loose_spatial_degree`` / ``loose_mag_degree`` in the core tie's
        ``xi``, ``eta`` and ``dm = mean_mag - mag0``, clipping stars beyond
        ``settings.clip_sigma`` robust sigmas until the set is stable. No seeing term.
+       Before the first fit, a star more than :data:`_ZP_RUNAWAY_MAG` from the night's
+       median offset to the frame (or with a non-finite one) is left out, and a star
+       whose evaluated zero point is non-finite or beyond :data:`_ZP_ABSURD_MAG` gets
+       a NaN ``zp`` and is not a fit star.
        The surface is stored in the core basis (unused terms zero), so
        :func:`evaluate_zero_point` evaluates it unchanged.
     3. The calibration floor is measured per bin of the core tie's magnitude bins
@@ -1400,6 +1445,13 @@ def tie_loose_nights(
                 comparison[gid, a] & np.isfinite(mn) & np.isfinite(sn) & (n_frame[gid] >= 2)
                 & ~rejected[gid, a]
             )
+            d_off = mn - fr
+            base &= np.isfinite(d_off)
+            if np.any(base):
+                # a star far from the night's own offset to the frame (or with a garbage
+                # frame) is not a calibrator, and one such row ruins the first fit
+                off = float(np.median(d_off[base]))
+                base &= np.abs(d_off - off) <= _ZP_RUNAWAY_MAG
             rows = base.copy()
             fit = None
             for _ in range(settings.max_iter):
@@ -1410,7 +1462,7 @@ def tie_loose_nights(
                     )
                     raise MultiNightError(msg)
                 fit = _weighted_lstsq(x_z[rows], (mn - fr)[rows], 1.0 / err2[rows])
-                if fit is None:
+                if fit is None or not np.all(np.isfinite(fit)):
                     msg = f"aperture {a}: singular loose-night fit for {night.label}"
                     raise MultiNightError(msg)
                 r = mn - fr - x_z @ fit
@@ -1430,7 +1482,16 @@ def tie_loose_nights(
                 raise MultiNightError(msg)
 
             coef[n, a, term_cols] = fit
-            zp[n, gid, a] = x_z @ fit
+            zp_fit = x_z @ fit
+            sane = np.isfinite(zp_fit) & (np.abs(zp_fit) <= _ZP_ABSURD_MAG)
+            if not np.all(sane):
+                logger.warning(
+                    "aperture %d: loose night %s: %d star(s) with a non-finite or absurd "
+                    "zero point (|Z| > %.0f mag) are excluded (NaN zp)",
+                    a, night.label, int(np.count_nonzero(~sane)), _ZP_ABSURD_MAG,
+                )
+            rows = rows & sane
+            zp[n, gid, a] = np.where(sane, zp_fit, np.nan)
             tie_star[n, gid[rows], a] = True
             n_tie[n, a] = int(np.count_nonzero(rows))
 

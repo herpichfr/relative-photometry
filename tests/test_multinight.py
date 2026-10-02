@@ -21,6 +21,7 @@ from relphot.config import MultiNightSettings, settings_to_dict
 from relphot.decorrelate import compute_crowding
 from relphot.exceptions import ConfigError, MultiNightError
 from relphot.multinight import (
+    _ZP_RUNAWAY_MAG,
     NightCrossMatch,
     NightProducts,
     build_multinight_lightcurves,
@@ -948,3 +949,92 @@ def test_save_load_round_trip_with_loose_and_old_file_without_it(tmp_path) -> No
     assert tie_old.loose.dtype == bool and tie_old.loose.shape == (4,)
     assert not tie_old.loose.any()
     np.testing.assert_array_equal(tie_old.zp, tie.zp)
+
+
+def _discrepant_night_scenario(dm2: float, disc_mag: float, n_bad: int):
+    """Three nights, the last with a strong ``dm**2`` zero-point term, plus ``n_bad`` stars
+    the anchor never measures and the middle night sees ``disc_mag`` fainter with a
+    mag-sized error (a garbage forced-photometry measurement): returns ``(nights, truth, bad)``."""
+    zp_coefs = [
+        (0.0,) * 8,
+        (0.01, 0.01, -0.01, 0.0, 0.0, 0.0, 0.01, -0.005),
+        (-0.02, -0.01, -0.02, 0.005, 0.0, 0.0, -0.03, dm2),
+    ]
+    nights, truth = _synthetic_tie_scenario(
+        n_nights=3, n_stars=3000, seed=5, zp_coefs=zp_coefs, n_aper=2,
+    )
+    comparison = np.nonzero(truth["comparison_mask"])[0]
+    bad = np.random.default_rng(1).choice(comparison, n_bad, replace=False)
+    nights[0].epoch_ok[bad, :] = False
+    nights[1].lc[bad] *= np.float32(10.0 ** (-0.4 * disc_mag))
+    nights[1].rms[bad, :] = 80.0
+    return nights, truth, bad
+
+
+def _tie_discrepant_scenario(dm2: float, disc_mag: float, n_bad: int):
+    nights, truth, bad = _discrepant_night_scenario(dm2, disc_mag, n_bad)
+    nights = check_compatible(nights)
+    anchor_index = resolve_anchor_index(nights, "auto")
+    xmatch = crossmatch_nights(nights, anchor_index, 1.0)
+    tie = tie_nights(nights, xmatch, anchor_index, MultiNightSettings())
+    return truth, xmatch, tie, bad
+
+
+def test_tie_is_not_ruined_by_stars_with_a_garbage_night() -> None:
+    # without the first-iteration discrepancy cut these rows (large weight in their own
+    # night, uninformative partner) leave no tie star at all: MultiNightError
+    truth, xmatch, tie, _bad = _tie_discrepant_scenario(dm2=-0.03, disc_mag=5.0, n_bad=20)
+    a = 1
+    assert np.all(tie.n_tie[:, a] > 100)
+    for n in (1, 2):
+        g = np.nonzero(tie.tie_star[n, :, a])[0]
+        resid = tie.zp[n, g, a] - _truth_zp(truth, n)[xmatch.index[n, g]]
+        assert float(np.sqrt(np.mean(resid**2))) * 1000.0 < 1.0, n
+    assert int(tie.n_iter[a]) < 20
+
+
+def test_a_star_whose_zero_point_runs_away_is_nan_not_a_number() -> None:
+    truth, xmatch, tie, bad = _tie_discrepant_scenario(dm2=-0.1, disc_mag=10.0, n_bad=10)
+    a = 1
+    assert np.all(tie.rejected[bad, a])
+    assert not np.any(np.isfinite(tie.mean_mag[bad, a]))
+    assert not np.any(np.isfinite(tie.zp[:, bad, a]))
+    finite_zp = tie.zp[:, :, a][np.isfinite(tie.zp[:, :, a])]
+    assert float(np.max(np.abs(finite_zp))) <= _ZP_RUNAWAY_MAG
+    assert float(np.nanmax(np.abs(tie.mean_mag[:, a]))) < 100.0
+    g = np.nonzero(tie.tie_star[2, :, a])[0]
+    resid = tie.zp[2, g, a] - _truth_zp(truth, 2)[xmatch.index[2, g]]
+    assert float(np.sqrt(np.mean(resid**2))) * 1000.0 < 1.0
+
+
+def test_loose_night_fit_ignores_core_stars_with_garbage_frame_and_mean_mag() -> None:
+    nights, truth = _loose_scenario()
+    settings = MultiNightSettings()
+    core, loose = split_loose_nights(nights, (nights[-1].label,))
+    anchor_index = resolve_anchor_index(core, "auto")
+    xmatch = crossmatch_nights(core + loose, anchor_index, 1.0)
+    tie_core = tie_nights(core, core_crossmatch(xmatch, 3), anchor_index, settings)
+    a = 1
+    n_core_global = tie_core.mean_mag.shape[0]
+    on_loose = xmatch.index[3, :n_core_global]
+    candidates = np.nonzero(
+        tie_core.tie_star[:, :, a].all(axis=0) & (on_loose >= 0)
+        & loose[0].comparison_mask[np.where(on_loose >= 0, on_loose, 0), a]
+    )[0]
+    poisoned = candidates[:4]
+    assert poisoned.size == 4
+    # what a diverged core tie leaves: 1e19..1e40 zero points and a ~1e36 mean magnitude
+    non_anchor = [n for n in range(3) if n != anchor_index]
+    tie_core.mean_mag[poisoned, a] = 7.6e35
+    tie_core.zp[non_anchor[0], poisoned, a] = -1.2e40
+    tie_core.zp[non_anchor[1], poisoned, a] = 1.85e19
+
+    tie = tie_loose_nights(core, loose, xmatch, tie_core, settings)
+
+    assert np.all(np.isfinite(tie.coef[3, a])) and np.max(np.abs(tie.coef[3, a])) < 1.0
+    assert not np.any(np.isfinite(tie.zp[3, poisoned, a]))
+    assert not np.any(tie.tie_star[3, poisoned, a])
+    g = np.nonzero(tie.tie_star[3, :, a])[0]
+    resid = tie.zp[3, g, a] - _truth_zp(truth, 3)[xmatch.index[3, g]]
+    assert float(np.sqrt(np.mean(resid**2))) * 1000.0 < 2.0
+    assert np.all(tie.floor[3, a] < 0.1)  # not the 1.0 mag the bisection saturates at

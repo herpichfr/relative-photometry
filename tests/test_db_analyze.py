@@ -21,6 +21,7 @@ from relphot.config import DbSettings, Settings
 from relphot.db.analyze import (
     _concat_night_normalised_flux,
     _fetch_chunk_data,
+    _fit_transit_shape,
     _matchable_shapes,
     _NightData,
     _ObjTask,
@@ -2020,3 +2021,29 @@ def test_recompute_matches_skips_loose_night_shapes(test_conn) -> None:
         cur.execute("SELECT det_a, det_b FROM relphot.transit_match WHERE obj_id = %s", (obj,))
         assert cur.fetchall() == [(det_ids[0], det_ids[1])]
     test_conn.commit()
+
+
+def test_a_degenerate_tie_magnitude_leaves_the_night_untied(test_conn) -> None:
+    obj, nights = _object_on_three_nights(test_conn, "tie_garbage")
+    run = _insert_loose_run(test_conn, "run_garbage", [])
+    _insert_tie(test_conn, run, obj, nights[0], 15.0)
+    _insert_tie(test_conn, run, obj, nights[1], -2.96e20)  # what a degenerate tie once wrote
+    _insert_tie(test_conn, run, obj, nights[2], 15.1)
+    test_conn.commit()
+
+    task = _fetch_chunk_data(test_conn, [obj], _SETTINGS.db)[obj]
+    assert set(task.night_ties) == {nights[0], nights[2]}
+    assert task.tie is None  # a night the run does not tie voids the tie
+
+
+def test_an_absurd_tie_offset_is_not_applied_and_does_not_overflow() -> None:
+    t = 2460000.0 + np.linspace(0.0, 0.3, 120)
+    flux = np.where(np.abs(t - 2460000.15) < 0.04, 0.98, 1.0)
+    nd = _NightData(1, date(2025, 1, 1), t, flux, np.full(120, 0.002))
+    det = _TransitDet(det_id=1, night_id=1, tc=2460000.15, depth=0.02, duration_h=2.0)
+
+    # 10 ** (-0.4 * -9e19) overflows a float: an OverflowError before the guard
+    assert _fit_transit_shape(nd, det, (-1e20, 1.0), -1e19)["input"] == "night"
+    assert _fit_transit_shape(nd, det, (float("nan"), 0.01), 15.0)["input"] == "night"
+    assert _fit_transit_shape(nd, det, (15.0, 0.01), float("inf"))["input"] == "night"
+    assert _fit_transit_shape(nd, det, (15.0, 0.01), 15.02)["input"] == "tied"
