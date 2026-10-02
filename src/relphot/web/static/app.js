@@ -441,7 +441,9 @@ function renderDetections(rows) {
       tr.appendChild(td);
     }
     const tdStatus = document.createElement("td");
-    tdStatus.appendChild(detectionStatusSelect(r));
+    // a transit event's verdict is also its night's EXOP verdict: set it in Night reviews or in
+    // the similar-events window, not here; the other kinds keep their selector
+    tdStatus.appendChild(r.kind === "transit" ? detectionStatusText(r) : detectionStatusSelect(r));
     tr.appendChild(tdStatus);
     tbody.appendChild(tr);
   }
@@ -463,13 +465,38 @@ function detectionStatusSelect(det) {
   sel.value = det.status || "UNCONFIRMED";
   sel.addEventListener("change", () => patchDetection(det.det_id, { status: sel.value }, det));
   wrap.appendChild(sel);
+  appendAutoRejection(wrap, det);
+  return wrap;
+}
+
+// The same status without the selector: the effective status as the similar-events window shows
+// it (UNCONFIRMED / CONFIRMED / REJECTED / "REJECTED (auto)"), plus the cross-candidate check's
+// reason. It is set in Night reviews (EXOP verdict) or with the similar-events bulk verdict.
+function detectionStatusText(det) {
+  const wrap = document.createElement("div");
+  const effective = det.effective_status || det.status || "UNCONFIRMED";
+  const badge = document.createElement("span");
+  badge.className = `event-status ${effective.split(" ")[0].toLowerCase()}`;
+  badge.textContent = effective;
+  badge.title = "set with the EXOP verdict of this night in Night reviews, or with the "
+    + "bulk verdict of the similar-events window";
+  wrap.appendChild(badge);
+  appendAutoRejection(wrap, det, effective === "REJECTED (auto)");
+  return wrap;
+}
+
+// The cross-candidate check's verdict on an event, under its status (`skipText`: the status
+// above already says "REJECTED (auto)").
+function appendAutoRejection(wrap, det, skipText) {
   if (det.auto_status === "REJECTED") {
-    const eff = document.createElement("div");
-    eff.className = "auto-reject";
-    eff.textContent = det.effective_status === "REJECTED (auto)"
-      ? "REJECTED (auto)"
-      : `auto-rejected; the verdict ${det.status} stands`;
-    wrap.appendChild(eff);
+    if (!skipText) {
+      const eff = document.createElement("div");
+      eff.className = "auto-reject";
+      eff.textContent = det.effective_status === "REJECTED (auto)"
+        ? "REJECTED (auto)"
+        : `auto-rejected; the verdict ${det.status} stands`;
+      wrap.appendChild(eff);
+    }
     if (det.auto_reason) {
       const why = document.createElement("div");
       why.className = "auto-reject-reason";
@@ -477,7 +504,6 @@ function detectionStatusSelect(det) {
       wrap.appendChild(why);
     }
   }
-  return wrap;
 }
 
 // The events of other objects on the same night that made an event look like a systematic:
@@ -576,7 +602,7 @@ function renderTransitEvents(events) {
     }
     tr.appendChild(tdNotes);
     const tdStatus = document.createElement("td");
-    tdStatus.appendChild(detectionStatusSelect(ev));
+    tdStatus.appendChild(detectionStatusText(ev));
     const similar = similarEventsDetails(ev);
     if (similar) tdStatus.appendChild(similar);
     tr.appendChild(tdStatus);
@@ -612,8 +638,8 @@ async function patchDetection(detId, body, ev) {
 }
 
 // Re-fetch the current object and redraw everything a verdict can change (flags, counters,
-// the per-night review table and both event tables).
-async function refreshObject() {
+// the per-night review table and both event tables); `message` goes to the night-review summary.
+async function refreshObject(message) {
   if (!state.currentObject) return;
   const objId = state.currentObject.object.obj_id;
   const resp = await fetch(`/api/object/${objId}`);
@@ -624,7 +650,7 @@ async function refreshObject() {
   renderDetections(data.detections);
   renderTransitEvents(data.transit_events);
   renderRepeatFamilies(data);
-  renderNightReviews(data.nights, data.object);
+  renderNightReviews(data.nights, data.object, message);
   prefillEditBox(data.object);
 }
 
@@ -1192,7 +1218,15 @@ async function saveNightReview(index, exopSel, varSel, noteInput, msgSpan) {
   state.currentObject.object = obj;
   renderMeta(obj);
   prefillEditBox(obj);
-  renderNightReviews(nights, obj, `Saved night ${night.label}.`);
+  const changed = (data.events_updated || []).length;
+  const message = `Saved night ${night.label}.`
+    + (changed ? ` ${changed} transit event(s) of this night set to match.` : "");
+  renderNightReviews(nights, obj, message);
+  if (changed) {
+    // the night's EXOP verdict is the status of its transit events: redraw them and the stack
+    await refreshObject(message);
+    if (state.similar) loadSimilar(state.similar.detId, true);
+  }
 }
 
 // The table of night reviews scrolls in a box tall enough for its header and exactly this many rows.
@@ -2528,7 +2562,9 @@ async function applySimilarReview() {
     return;
   }
   msg.className = "";
-  msg.textContent = `${status} on ${data.updated.length} event(s).`;
+  const nReviews = (data.night_reviews || []).length;
+  msg.textContent = `${status} on ${data.updated.length} event(s); the EXOP verdict of ${nReviews}`
+    + " object-night(s) follows (Night reviews).";
   $("similar-action").value = "";
   $("similar-notes").value = "";
   // the server is the truth: the rejected look-alikes drop out of the list and the Transit

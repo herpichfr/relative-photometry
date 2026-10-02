@@ -224,6 +224,29 @@ tbody tr:nth-child(even) {
     max-width: 22rem;
 }
 
+/* a transit event's status in the Transit events / Detections tables (read-only) */
+.event-status {
+    display: inline-block;
+    border: 1px solid #999;
+    border-radius: 3px;
+    padding: 0 5px;
+    font-size: 0.85em;
+    font-weight: bold;
+    color: #555;
+}
+
+.event-status.confirmed {
+    border-color: #2e7d32;
+    color: #2e7d32;
+    background: #e8f5e9;
+}
+
+.event-status.rejected {
+    border-color: #b00020;
+    color: #b00020;
+    background: #fdecee;
+}
+
 details.similar-events summary {
     cursor: pointer;
     font-size: 0.85em;
