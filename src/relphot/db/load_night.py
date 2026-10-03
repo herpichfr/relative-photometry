@@ -37,6 +37,7 @@ import math
 import re
 import time
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -194,7 +195,16 @@ def _json_safe(value: object) -> object:
 
 
 def _row_extra(row: dict, cols: list[str]) -> dict[str, object]:
-    return {c: _json_safe(row[c]) for c in cols if c in row}
+    extra = {c: _json_safe(row[c]) for c in cols if c in row}
+    clipped = extra.get("transit_edge_clip_bjd")
+    if isinstance(clipped, str):
+        # the search-metrics table holds the excluded edge epochs as one comma-joined string
+        times = [float(x) for x in clipped.split(",") if x]
+        if times:
+            extra["transit_edge_clip_bjd"] = times
+        else:
+            del extra["transit_edge_clip_bjd"]
+    return extra
 
 
 def _nan_to_none(value: float | None) -> float | None:
@@ -205,6 +215,36 @@ def _is_incomplete_transit(flags_str: str, partial: bool) -> bool:
     """Whether a transit event is incomplete (EDGE/PARTIAL), so its duration is a minimum."""
     tokens = set(flags_str.split("|"))
     return partial or "EDGE" in tokens or "PARTIAL" in tokens
+
+
+def _transit_extra_cols(columns: Iterable[str]) -> list[str]:
+    """The search-metrics ``columns`` kept in a transit detection's ``extra``."""
+    aper_re = re.compile(r"^transit_depth_aper(\d+)$")
+    n_aper = 0
+    for col in columns:
+        m = aper_re.match(col)
+        if m:
+            n_aper = max(n_aper, int(m.group(1)) + 1)
+    return [
+        *_TRANSIT_EXTRA_BASE,
+        *[f"transit_depth_aper{a}" for a in range(n_aper)],
+        *[f"transit_sigma_depth_aper{a}" for a in range(n_aper)],
+    ]
+
+
+def _transit_detection_row(
+    row: object, row_d: dict, obj_id: int, night_id: int, extra_cols: list[str]
+) -> tuple:
+    """The ``relphot.detection`` COPY tuple of one transit candidate row of the search metrics."""
+    return (
+        obj_id, night_id, "transit",
+        _real_safe(row.transit_snr), _real_safe(row.transit_depth),
+        _nan_to_none(row.transit_tc_bjd_tdb),
+        _real_safe(row.transit_duration_hours), int(row.transit_tier),
+        str(row.transit_flags_str), None, None, None, None,
+        Jsonb(_row_extra(row_d, extra_cols)),
+        _is_incomplete_transit(str(row.transit_flags_str), bool(row.transit_partial)),
+    )
 
 
 def _restore_detection_reviews(
@@ -416,6 +456,9 @@ _TRANSIT_EXTRA_BASE = [
     "transit_r90_evaluated", "transit_r90_pass", "transit_top1_share", "transit_top3_share",
     "transit_reg_dchi2_ratio", "transit_reg_depth_ratio", "transit_clip3_dchi2",
     "transit_dbic_flat",
+    # EDGE_OUTLIER (relphot.numeric.edge_outlier_mask): comma-joined BJDs of the excluded edge
+    # epochs, stored as a list of floats; absent from search-metrics files written before it.
+    "transit_edge_clip_bjd",
     # NEIGHBOUR_SHARED_EVENT partner (relphot.transit_neighbour): same, absent before it.
     "transit_shared_partner", "transit_shared_sep_arcsec", "transit_shared_depth",
     "transit_shared_dip_sigma", "transit_shared_dtc_hours", "transit_shared_deficit_ratio",
@@ -824,17 +867,7 @@ def load_night(
             if df_sm is not None:
                 df_sm_store = df_sm[df_sm["star_id"].isin(store_id_set)]
 
-                n_aper = 0
-                aper_re = re.compile(r"^transit_depth_aper(\d+)$")
-                for col in df_sm.columns:
-                    m = aper_re.match(col)
-                    if m:
-                        n_aper = max(n_aper, int(m.group(1)) + 1)
-                transit_extra_cols = [
-                    *_TRANSIT_EXTRA_BASE,
-                    *[f"transit_depth_aper{a}" for a in range(n_aper)],
-                    *[f"transit_sigma_depth_aper{a}" for a in range(n_aper)],
-                ]
+                transit_extra_cols = _transit_extra_cols(df_sm.columns)
 
                 detection_rows = []
                 catalog_rows = []
@@ -846,17 +879,7 @@ def load_night(
 
                     if row.transit_candidate:
                         detection_rows.append(
-                            (
-                                obj_id, night_id, "transit",
-                                _real_safe(row.transit_snr), _real_safe(row.transit_depth),
-                                _nan_to_none(row.transit_tc_bjd_tdb),
-                                _real_safe(row.transit_duration_hours), int(row.transit_tier),
-                                str(row.transit_flags_str), None, None, None, None,
-                                Jsonb(_row_extra(row_d, transit_extra_cols)),
-                                _is_incomplete_transit(
-                                    str(row.transit_flags_str), bool(row.transit_partial)
-                                ),
-                            )
+                            _transit_detection_row(row, row_d, obj_id, night_id, transit_extra_cols)
                         )
                         n_transit_detections += 1
                     if row.variability_candidate:

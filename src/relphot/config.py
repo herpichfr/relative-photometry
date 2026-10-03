@@ -505,6 +505,17 @@ class DbSettings:
     #: ... and the binomial probability of that many coincidences by chance (events spread
     #: uniformly over the night) is below this.
     coincidence_max_p: float = 1e-3
+    #: Automatic rejection of per-night search transit events from their stored shape
+    #: (``relphot db analyze``, :mod:`relphot.db.coincidence`; reasons unioned with the
+    #: coincidence veto, a person's status always wins): NO_DIP when the converged trapezoid
+    #: depth is below ``auto_nodip_depth`` ...
+    auto_nodip_depth: float = 1e-3
+    #: ... NO_BASELINE when a converged fit has fewer than ``auto_nobaseline_min_epochs`` epochs
+    #: outside the fitted trapezoid and a depth above ``auto_nobaseline_min_depth`` (the baseline
+    #: is then extrapolated, not measured). (EDGE_OUTLIER, the third rule, has no threshold: an
+    #: edge outlier excluded from the fit that was the only data beyond the search box on its side.)
+    auto_nobaseline_min_epochs: int = 5
+    auto_nobaseline_min_depth: float = 0.2
     #: Repeated transit events of one object (``relphot db analyze``, :mod:`relphot.db.families`):
     #: two eligible events are linked when both the depth / T14 / ingress match probability and the
     #: probability of a common trapezoid (joint refit of their light curves) are at least this.
@@ -575,6 +586,18 @@ class DbSettings:
         value = self.coincidence_min_similar
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             msg = f"db.coincidence_min_similar must be an integer >= 1, got {value!r}"
+            raise ConfigError(msg)
+        for name in ("auto_nodip_depth", "auto_nobaseline_min_depth"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool) or not isinstance(value, int | float)
+                or not (math.isfinite(value) and value > 0)
+            ):
+                msg = f"db.{name} must be a positive number, got {value!r}"
+                raise ConfigError(msg)
+        value = self.auto_nobaseline_min_epochs
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            msg = f"db.auto_nobaseline_min_epochs must be an integer >= 1, got {value!r}"
             raise ConfigError(msg)
         for name in (
             "repeat_p_min", "repeat_rho_max_cgs", "repeat_veto_dchi2",
@@ -699,6 +722,17 @@ class SearchSettings:
     #: remove a real percent-level transit dip.
     lc_clip_sigma: float = 6.0
     lc_clip_window: int = 15
+    #: Edge clip (:func:`relphot.numeric.edge_outlier_mask`), combined (AND) with the rolling-median
+    #: clip above because that one cannot see the first and last epoch of a series: an isolated
+    #: run of at most this many epochs at either end of a night that deviates by more than
+    #: ``lc_clip_sigma`` robust point-to-point sigmas from the median of the next
+    #: ``edge_clip_ref_epochs`` epochs (and ends sharply) is excluded from the search, from the
+    #: cross-aperture depth, from the variability metrics and from the analyze trapezoid fit.
+    #: A run of more epochs is never clipped (a real partial transit at the night edge).
+    #: 0 turns the edge clip off.
+    edge_clip_max_epochs: int = 2
+    #: Number of epochs after the edge run whose median is the reference level of the edge clip.
+    edge_clip_ref_epochs: int = 6
     duration_min_hours: float = 0.4
     duration_max_hours: float = 2.5
     n_durations: int = 15

@@ -22,3 +22,13 @@ def test_keep_this_control_is_wired_to_its_endpoint_and_marks_superseded_events(
     assert "if (competing.length === 0) return null;" in js
     # superseded events are labelled, and drawn grey and dashed on the light curve
     assert "superseded by det" in js and 'dash: "dash"' in js
+
+
+def test_edge_clipped_epochs_are_drawn_as_grey_crosses_and_auto_reasons_are_generic():
+    js = (STATIC / "app.js").read_text()
+    assert "function edgeClipTrace(" in js and "ev.edge_clip_bjd" in js
+    assert 'symbol: "x"' in js and "edge outlier (excluded from the fit)" in js
+    assert "if (clipTrace) traces.push(clipTrace);" in js
+    # the automatic-rejection wording no longer says it is only the cross-candidate check
+    assert "rejected by the cross-candidate check" not in js
+    assert "det.auto_reason" in js

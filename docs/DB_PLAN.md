@@ -155,7 +155,9 @@ default true). On T80S 20251104-06 the cut keeps ~97 % of stars.
 - `transit_shape(det_id pk fk detection on delete cascade, obj_id, tc float8, tc_err, depth real, depth_err,
   t14_h real, t14_err, t14_lower_limit bool not null default false, incomplete_reason text,
   ingress_frac real /* T12/T14 in [0, 0.5] */, ingress_err, chi2_red real, n_points int,
-  input text /* 'tied' | 'night' */, converged bool, computed_at)` -- trapezoid fit to one per-night transit.
+  input text /* 'tied' | 'night' */, converged bool, edge_clip_bjd float8[] /* schema v14: edge epochs excluded
+  from the fit */, edge_adjacent bool /* they were the only data beyond the detection's box on that side */,
+  n_outside int /* epochs outside the fitted trapezoid */, computed_at)` -- trapezoid fit to one per-night transit.
   For an incomplete event `t14_h` is the observed in-transit span (a lower limit), `t14_err` is NULL and
   `ingress_frac`/`ingress_err` are NULL unless both ingress and egress were observed.
 - `transit_coincidence(det_id pk fk detection on delete cascade, night_id fk night on delete cascade, n_similar int,
@@ -388,6 +390,32 @@ detection but `relphot db analyze` marks it `auto_status = 'REJECTED'` with `aut
   refreshes the objects whose verdict changed. A night reload deletes the search detections, and with them their
   verdict: run `relphot db analyze` again afterwards.
 - After migration 009 run `relphot db analyze --all` once to fill the verdicts of the nights already loaded.
+
+### Edge clip and the shape rules (schema v14)
+
+`robust_clip_series` cannot see the first and last epoch of a night, so a high edge epoch survives it, bends the
+baseline and makes the rest of the night look like a dip (the labelled "Bad phot edge" events). `edge_outlier_mask`
+(`relphot.numeric`; `[search] lc_clip_sigma` = 6, `edge_clip_max_epochs` = 2, `edge_clip_ref_epochs` = 6, 0 = off)
+drops an isolated run of 1-2 edge epochs that deviate by more than 6 robust point-to-point sigmas from the median of
+the next 6 (the run must end sharply; a run of 3 or more, a trend or a ramp is never touched). It is applied, ANDed
+with `robust_clip_series`, in the transit search (`search_one_star`; the epochs set the informational
+`EDGE_OUTLIER` flag bit 16 and `detection.extra['transit_edge_clip_bjd']`), the cross-aperture depth, the
+variability metrics and, before the trapezoid fit, in `analyze` (so RERUN shapes exclude them too; stored in
+`transit_shape.edge_clip_bjd`, `edge_adjacent`, `n_outside`). The web draws the epochs as grey crosses.
+
+The same per-night pass that writes the coincidence veto (`update_auto_verdicts`) also applies three shape rules
+to the search events with a stored shape, and unions the reasons in `auto_reason` (`; `-joined, rule order
+coincidence, EDGE_OUTLIER, NO_DIP, NO_BASELINE; a person's status always wins; recomputed from scratch, only
+changed rows are written, so a re-run is idempotent and a reason goes exactly when its rule stops firing):
+`EDGE_OUTLIER` (the fit excluded edge epochs that were the only data beyond the search box on that side), `NO_DIP`
+(converged depth < `db.auto_nodip_depth` = 1e-3), `NO_BASELINE` (converged, fewer than
+`db.auto_nobaseline_min_epochs` = 5 epochs outside the fitted trapezoid and depth > `db.auto_nobaseline_min_depth`
+= 0.2). Read-only replay on the live DB (1598 search events): 118 / 15 / 20 events, union 152 (REJECTED 121,
+UNCONFIRMED 31, CONFIRMED 0 of 2).
+
+`relphot db analyze --keep-vetted` and `relphot db reload-search` leave vetted events alone (`relphot.db.vetted`:
+CONFIRMED/REJECTED status or notes, a RERUN event, a supersede link, any event of an object with a
+`user_night_review` row for the night): no refit, no automatic verdict, no replacement, no orphan.
 
 ## Repeated transit events (schema v12)
 

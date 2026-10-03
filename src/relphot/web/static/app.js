@@ -450,9 +450,10 @@ function renderDetections(rows) {
 }
 
 // A REJECTED event is no evidence; a CONFIRMED one is evidence that no longer awaits review.
-// The select is the person's verdict; an event the cross-candidate check rejected automatically
-// (too many similar events on its night) is shown as "REJECTED (auto)" with the reason, and only
-// a person's CONFIRMED overrides that.
+// The select is the person's verdict; an event an automatic rule rejected (too many similar events
+// on its night, an edge outlier, no dip, no baseline; every rule that fired is named in the
+// reason) is shown as "REJECTED (auto)" with the reason, and only a person's CONFIRMED overrides
+// that.
 function detectionStatusSelect(det) {
   const wrap = document.createElement("div");
   const sel = document.createElement("select");
@@ -470,8 +471,7 @@ function detectionStatusSelect(det) {
 }
 
 // The same status without the selector: the effective status as the similar-events window shows
-// it (UNCONFIRMED / CONFIRMED / REJECTED / "REJECTED (auto)"), plus the cross-candidate check's
-// reason. It is set in Night reviews (EXOP verdict) or with the similar-events bulk verdict.
+// it (UNCONFIRMED / CONFIRMED / REJECTED / "REJECTED (auto)"), plus the automatic reason(s). It is set in Night reviews (EXOP verdict) or with the similar-events bulk verdict.
 function detectionStatusText(det) {
   const wrap = document.createElement("div");
   const effective = det.effective_status || det.status || "UNCONFIRMED";
@@ -504,8 +504,8 @@ function supersededNote(det) {
   return div;
 }
 
-// The cross-candidate check's verdict on an event, under its status (`skipText`: the status
-// above already says "REJECTED (auto)").
+// The automatic verdict on an event (coincidence, edge outlier, no dip, no baseline), under its
+// status (`skipText`: the status above already says "REJECTED (auto)").
 function appendAutoRejection(wrap, det, skipText) {
   if (det.auto_status === "REJECTED") {
     if (!skipText) {
@@ -1617,6 +1617,28 @@ function trapezoidTrace(ev, baseline, yOf) {
   };
 }
 
+// The edge epochs the trapezoid fits of this night excluded (an isolated outlier at the start or end
+// of the night, `edge_clip_bjd` of schema v14): grey crosses on top of their points, or null.
+function edgeClipTrace(lc, x, yOf, events) {
+  const times = [];
+  for (const ev of events) for (const b of ev.edge_clip_bjd || []) times.push(b);
+  if (times.length === 0) return null;
+  const xs = [];
+  const ys = [];
+  lc.bjd_tdb.forEach((t, i) => {
+    if (Number.isFinite(lc.flux[i]) && times.some((b) => Math.abs(t - b) < 2e-5)) {
+      xs.push(x[i]);
+      ys.push(yOf(lc.flux[i]));
+    }
+  });
+  if (xs.length === 0) return null;
+  return {
+    x: xs, y: ys, type: "scatter", mode: "markers",
+    marker: { symbol: "x", size: 10, color: "rgb(130,130,130)", line: { width: 2, color: "rgb(130,130,130)" } },
+    name: "edge outlier (excluded from the fit)", hoverinfo: "x+y+name",
+  };
+}
+
 // ---------------------------------------------------------------------
 // Residuals (obs - model) of the fitted trapezoid, in a small panel under the light curve
 // ---------------------------------------------------------------------
@@ -1786,6 +1808,8 @@ function plotNightLc(nightId, lc) {
     });
   }
   for (const ev of fitted) traces.push(trapezoidTrace(ev, baseline, yOf));
+  const clipTrace = edgeClipTrace(lc, x, yOf, nightEvents);
+  if (clipTrace) traces.push(clipTrace);
   const transit = nightEvents.length ? null : bestTransitForNight(nightId);
   if (transit) {
     const tc = transit.tc_bjd_tdb - 2460000;
@@ -2537,8 +2561,8 @@ function renderSimilarSide() {
     box.textContent = effective;
     if (ev.auto_status === "REJECTED") {
       box.title = effective === "REJECTED (auto)"
-        ? "rejected by the cross-candidate check; a person's CONFIRMED overrides it"
-        : `rejected by the cross-candidate check; the verdict ${ev.status} stands`;
+        ? `rejected automatically (${ev.auto_reason || "see the reason"}); a person's CONFIRMED overrides it`
+        : `rejected automatically; the verdict ${ev.status} stands`;
     }
     if (i === 0) {
       const tag = document.createElement("small");
@@ -2603,8 +2627,9 @@ async function applySimilarReview() {
   }
   const autoRejected = ticked.filter((r) => r.auto_status === "REJECTED").length;
   if (status === "CONFIRMED" && autoRejected > 0 && !window.confirm(
-    `${autoRejected} of the ${ticked.length} selected event(s) were rejected automatically by the`
-    + " cross-candidate check (too many similar events on their night). CONFIRM them anyway?"
+    `${autoRejected} of the ${ticked.length} selected event(s) were rejected automatically`
+    + " (see their reasons: too many similar events, edge outlier, no dip, no baseline)."
+    + " CONFIRM them anyway?"
   )) return;
   const detId = s.detId;
   $("similar-apply").disabled = true;

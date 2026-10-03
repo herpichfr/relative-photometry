@@ -150,8 +150,8 @@ def test_migration_004_from_v3_maps_class_to_flags(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-    assert current_version(test_conn) == 13
+    assert init_schema(test_conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    assert current_version(test_conn) == 14
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -285,7 +285,7 @@ def test_migration_005_verify_status_backfill_and_check(test_conn) -> None:
             )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [5, 6, 7, 8, 9, 10, 11, 12, 13]
+    assert init_schema(test_conn) == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -308,7 +308,7 @@ def test_migration_007_night_zero_point_defaults_existing_nights_to_assumed(test
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [7, 8, 9, 10, 11, 12, 13]
+    assert init_schema(test_conn) == [7, 8, 9, 10, 11, 12, 13, 14]
 
     with test_conn.cursor() as cur:
         cur.execute("SELECT zp, zp_source FROM relphot.night")
@@ -335,7 +335,7 @@ def test_migration_008_night_zero_point_source_accepts_measured(test_conn) -> No
         cur.execute("UPDATE relphot.night SET zp_source = 'measured'")
     test_conn.rollback()
 
-    assert init_schema(test_conn) == [8, 9, 10, 11, 12, 13]
+    assert init_schema(test_conn) == [8, 9, 10, 11, 12, 13, 14]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -376,7 +376,7 @@ def test_migration_009_coincidence_columns_and_table_from_v8(test_conn) -> None:
         (det_id,) = cur.fetchone()
     test_conn.commit()
 
-    assert init_schema(test_conn) == [9, 10, 11, 12, 13]
+    assert init_schema(test_conn) == [9, 10, 11, 12, 13, 14]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -475,8 +475,8 @@ def test_migration_006_guided_reprocessing_schema_from_v5(test_conn) -> None:
         )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12, 13]
-    assert current_version(test_conn) == 13
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12, 13, 14]
+    assert current_version(test_conn) == 14
 
     with test_conn.cursor() as cur:
         # existing rows: searches' detections, no inflation information, no new estimate info
@@ -570,7 +570,7 @@ def test_migration_006_user_night_review_from_v5_backfills_object_level_flags(te
                 )
     test_conn.commit()
 
-    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12, 13]
+    assert init_schema(test_conn) == [6, 7, 8, 9, 10, 11, 12, 13, 14]
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -799,7 +799,7 @@ def test_migration_010_loose_night_ids_from_v9(test_conn) -> None:
             (["a", "b"],),
         )
     test_conn.commit()
-    assert init_schema(test_conn) == [10, 11, 12, 13]
+    assert init_schema(test_conn) == [10, 11, 12, 13, 14]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -841,7 +841,7 @@ def test_migration_011_members_from_v10(test_conn) -> None:
         (obj_id,) = cur.fetchone()
     test_conn.commit()
 
-    assert init_schema(test_conn) == [11, 12, 13]
+    assert init_schema(test_conn) == [11, 12, 13, 14]
     assert init_schema(test_conn) == []
 
     with test_conn.cursor() as cur:
@@ -994,8 +994,8 @@ def test_migration_011_members_from_v10(test_conn) -> None:
 def test_migration_012_repeat_events_from_v11(test_conn) -> None:
     _apply_up_to(test_conn, 11)
     test_conn.commit()
-    assert init_schema(test_conn) == [12, 13]
-    assert current_version(test_conn) == 13
+    assert init_schema(test_conn) == [12, 13, 14]
+    assert current_version(test_conn) == 14
 
     with test_conn.cursor() as cur:
         cur.execute(
@@ -1135,8 +1135,8 @@ def test_migration_013_supersede_from_v12(test_conn) -> None:
         det_ids = [row[0] for row in cur.fetchall()]
     test_conn.commit()
 
-    assert init_schema(test_conn) == [13]
-    assert current_version(test_conn) == 13
+    assert init_schema(test_conn) == [13, 14]
+    assert current_version(test_conn) == 14
 
     with test_conn.cursor() as cur:
         # no row is linked by the migration
@@ -1159,4 +1159,49 @@ def test_migration_013_supersede_from_v12(test_conn) -> None:
             "SELECT count(*) FROM relphot.detection WHERE superseded_by = %s", (det_ids[1],)
         )
         assert cur.fetchone() == (1,)
+    test_conn.commit()
+
+
+def test_migration_014_edge_clip_columns_from_v13(test_conn) -> None:
+    _apply_up_to(test_conn, 13)
+    test_conn.commit()
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO relphot.object (name, ra, dec) VALUES ('o', 0, 0) RETURNING obj_id"
+        )
+        (obj_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.night (telescope, night_date, label, source_dir) "
+            "VALUES ('T80S', '2025-01-01', 'a', '/tmp/a') RETURNING night_id"
+        )
+        (night_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.detection (obj_id, night_id, kind) "
+            "VALUES (%s, %s, 'transit') RETURNING det_id",
+            (obj_id, night_id),
+        )
+        (det_id,) = cur.fetchone()
+        cur.execute(
+            "INSERT INTO relphot.transit_shape (det_id, obj_id, tc, input, converged) "
+            "VALUES (%s, %s, 2460000.5, 'night', true)",
+            (det_id, obj_id),
+        )
+    test_conn.commit()
+
+    assert init_schema(test_conn) == [14]
+    assert current_version(test_conn) == 14
+
+    with test_conn.cursor() as cur:
+        # an existing shape row keeps its values; the new columns are NULL until re-analysed
+        cur.execute(
+            "SELECT tc, edge_clip_bjd, edge_adjacent, n_outside FROM relphot.transit_shape"
+        )
+        assert cur.fetchone() == (2460000.5, None, None, None)
+        cur.execute(
+            "UPDATE relphot.transit_shape SET edge_clip_bjd = %s, edge_adjacent = true, "
+            "n_outside = 3",
+            ([2460000.25, 2460000.75],),
+        )
+        cur.execute("SELECT edge_clip_bjd, edge_adjacent, n_outside FROM relphot.transit_shape")
+        assert cur.fetchone() == ([2460000.25, 2460000.75], True, 3)
     test_conn.commit()

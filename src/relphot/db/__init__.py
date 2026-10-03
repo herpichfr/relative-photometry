@@ -19,7 +19,7 @@ reprocess requests. Requires the ``db`` extra
 from __future__ import annotations
 
 from relphot.db.analyze import AnalyzeReport, analyze
-from relphot.db.coincidence import CoincidenceReport, update_coincidence
+from relphot.db.coincidence import CoincidenceReport, update_auto_verdicts, update_coincidence
 from relphot.db.connect import connect, default_env_path, read_env_value, resolve_dsn
 from relphot.db.families import FamilyReport, update_families
 from relphot.db.load_members import MembersLoadReport, load_members
@@ -50,6 +50,7 @@ __all__ = [
     "refresh_objects",
     "reprocess",
     "resolve_dsn",
+    "update_auto_verdicts",
     "update_coincidence",
     "update_families",
 ]

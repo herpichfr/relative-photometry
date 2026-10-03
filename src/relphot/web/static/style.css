@@ -211,7 +211,7 @@ tbody tr:nth-child(even) {
     font-weight: bold;
 }
 
-/* an event the cross-candidate check rejected automatically (a person's status still applies) */
+/* an event an automatic rule rejected (coincidence, edge outlier, no dip, no baseline); a person's status still applies */
 .auto-reject {
     color: #b00020;
     font-size: 0.85em;

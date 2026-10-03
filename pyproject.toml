@@ -41,6 +41,9 @@ ignore = []
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "slow: seeded Monte-Carlo test that takes tens of seconds (deselect with -m 'not slow')",
+]
 filterwarnings = [
     "ignore::astropy.wcs.wcs.FITSFixedWarning",
 ]

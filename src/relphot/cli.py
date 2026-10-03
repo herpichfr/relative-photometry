@@ -781,6 +781,12 @@ def _partner_gaia_ids(shared_event, neighbour) -> np.ndarray:
     )
 
 
+def _edge_clip_strings(transit_result, n_stars: int) -> np.ndarray:
+    """Per star, the comma-joined BJDs of the edge epochs excluded from its search ('' if none)."""
+    per_star = transit_result.edge_clip_bjd or [()] * n_stars
+    return np.array([",".join(f"{b:.6f}" for b in bjds) for bjds in per_star], dtype=object)
+
+
 def _search_table_columns(
     night, tilemap, comparison_result, star_stats, star_best_aper,
     transit_result, variability_result, variable_match, planet_match, neighbour,
@@ -836,6 +842,7 @@ def _search_table_columns(
         "transit_reg_depth_ratio": transit_result.reg_depth_ratio,
         "transit_clip3_dchi2": transit_result.clip3_dchi2,
         "transit_dbic_flat": transit_result.dbic_flat,
+        "transit_edge_clip_bjd": _edge_clip_strings(transit_result, n_stars),
         "transit_shared_partner": shared_event.partner,
         "transit_shared_sep_arcsec": shared_event.sep_arcsec,
         "transit_shared_depth": shared_event.depth,
@@ -1055,6 +1062,7 @@ def _run_search(args: argparse.Namespace) -> int:
 
     # --- transit candidates ---
     transit_rows = []
+    edge_clip_strs = _edge_clip_strings(transit_result, night.n_stars)
     cand_idx = np.nonzero(transit_result.candidate)[0]
     for i in cand_idx:
         t_tile = int(tilemap.core_tile[i])
@@ -1094,6 +1102,7 @@ def _run_search(args: argparse.Namespace) -> int:
             "reg_depth_ratio": float(transit_result.reg_depth_ratio[i]),
             "clip3_dchi2": float(transit_result.clip3_dchi2[i]),
             "dbic_flat": float(transit_result.dbic_flat[i]),
+            "edge_clip_bjd": str(edge_clip_strs[i]),
             "shared_partner": int(shared_event.partner[i]),
             "shared_sep_arcsec": float(shared_event.sep_arcsec[i]),
             "shared_depth": float(shared_event.depth[i]),
@@ -1584,6 +1593,54 @@ def _run_db_load_night(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _run_db_reload_search(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    try:
+        from relphot.db import connect
+        from relphot.db.reload_search import reload_search_detections
+    except ImportError:
+        logger.error("the 'db' extra is required: pip install 'relphot[db]'")
+        return 1
+
+    try:
+        settings: Settings = load_settings(args.config)
+    except RelphotError:
+        logger.exception("failed to load config %s", args.config)
+        return 1
+
+    try:
+        conn = connect(args.dsn)
+    except RelphotError:
+        logger.exception("failed to connect to the database")
+        return 1
+
+    exit_code = 0
+    try:
+        for night_dir in args.night_dirs:
+            try:
+                report = reload_search_detections(
+                    conn, night_dir, lc_stem=args.lc_stem, settings=settings
+                )
+            except (OSError, RelphotError):
+                logger.exception("failed to reload the search events of %s", night_dir)
+                exit_code = 1
+                continue
+            print(
+                f"{night_dir}: night_id={report.night_id} label={report.label} "
+                f"unvetted_replaced={report.n_deleted} new={report.n_inserted} "
+                f"vetted_kept={report.n_vetted_kept} "
+                f"new_skipped_vetted={report.n_skipped_vetted} "
+                f"new_skipped_no_star={report.n_skipped_no_star} "
+                f"elapsed={report.elapsed_s:.1f}s"
+            )
+    finally:
+        conn.close()
+    return exit_code
+
+
 def _run_db_load_members(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -1698,7 +1755,7 @@ def _run_db_analyze(args: argparse.Namespace) -> int:
     try:
         report = analyze(
             conn, all_candidates=args.all, obj_ids=args.obj_id, settings=settings,
-            workers=args.workers,
+            workers=args.workers, keep_vetted=args.keep_vetted,
         )
     finally:
         conn.close()
@@ -1710,6 +1767,8 @@ def _run_db_analyze(args: argparse.Namespace) -> int:
         f"period_estimates={report.n_period_estimates} "
         f"coincidence_rejected={report.n_coincidence_rejected} "
         f"coincidence_nights={report.n_coincidence_nights} "
+        f"auto_rejected={report.n_auto_rejected} edge_outlier={report.n_edge_outlier} "
+        f"no_dip={report.n_no_dip} no_baseline={report.n_no_baseline} "
         f"repeat_links={report.n_repeat_links} repeat_families={report.n_repeat_families} "
         f"coarsened={report.n_coarsened} elapsed={report.elapsed_s:.1f}s"
     )
@@ -2160,6 +2219,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     db_load_night.set_defaults(func=_run_db_load_night)
 
+    db_reload_search = db_subparsers.add_parser(
+        "reload-search",
+        help=(
+            "replace only the unvetted search transit events of loaded nights by those of their "
+            "current *_search_metrics.parquet (vetted events, light curves, ties untouched)"
+        ),
+    )
+    db_reload_search.add_argument(
+        "night_dirs", nargs="+", metavar="NIGHT_RELPHOT_DIR",
+        help="a night's relphot/ directory, as given to load-night",
+    )
+    db_reload_search.add_argument(
+        "--lc-stem", default=None,
+        help=(
+            "lc/<stem>_*.parquet stem (default: discovered; required if more than "
+            "one *_starstats.parquet is present)"
+        ),
+    )
+    db_reload_search.add_argument(
+        "--dsn", default=None,
+        help="PostgreSQL DSN (default: RELPHOT_DB_DSN or ~/.config/relphot/relphotdb.env)",
+    )
+    db_reload_search.add_argument(
+        "--config", type=Path, default=None,
+        help="TOML settings file (settings.db drives the object-flag refresh)",
+    )
+    db_reload_search.set_defaults(func=_run_db_reload_search)
+
     db_load_members = db_subparsers.add_parser(
         "load-members", help="load reference and comparison members for a night"
     )
@@ -2190,6 +2277,14 @@ def build_parser() -> argparse.ArgumentParser:
     db_analyze.add_argument(
         "--obj-id", type=int, action="append", default=None, dest="obj_id",
         help="analyse only this object id (repeatable); overrides --all and the default selection",
+    )
+    db_analyze.add_argument(
+        "--keep-vetted", action="store_true",
+        help=(
+            "leave the events a person has vetted (CONFIRMED/REJECTED status or notes, RERUN "
+            "events, supersede links, objects with a night review) exactly as stored: no refit, "
+            "no automatic verdict"
+        ),
     )
     db_analyze.add_argument(
         "--workers", type=int, default=None,

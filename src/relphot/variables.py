@@ -39,6 +39,7 @@ from astropy.table import Table, vstack
 from scipy.spatial import cKDTree
 
 from relphot.numeric import (
+    edge_outlier_mask,
     fit_noise_floor,
     mad_sigma,
     nanmedian_quiet,
@@ -486,6 +487,11 @@ def compute_star_variability(
         # for the same reason relphot.transit_search does: a robust, global
         # clip this far out cannot remove real stellar variability.
         keep = robust_clip_series(y_norm, search.lc_clip_sigma, search.lc_clip_window)
+        # ... which cannot see the first and last epoch (edge_outlier_mask covers those)
+        keep &= edge_outlier_mask(
+            t_g, y_norm, err_norm, search.lc_clip_sigma,
+            search.edge_clip_max_epochs, search.edge_clip_ref_epochs,
+        )
         if not np.all(keep):
             idx = idx[keep]
             t_g = t_g[keep]
