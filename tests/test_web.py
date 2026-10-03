@@ -844,6 +844,35 @@ def _add_lookalikes(test_conn, ids: dict, n: int = 25) -> list[int]:
     return det_ids
 
 
+def test_object_detail_carries_the_new_auto_reasons_and_the_edge_clipped_epochs(
+    client, test_conn
+) -> None:
+    test_client, ids = client
+    reason = (
+        "too many similar events: 9 other events on this night; edge outlier: 1 isolated edge "
+        "epoch was excluded from the fit and the only data beyond the search box on its side"
+    )
+    with test_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE relphot.detection SET auto_status = 'REJECTED', auto_reason = %s "
+            "WHERE det_id = %s",
+            (reason, ids["det_a"]),
+        )
+        cur.execute(
+            "UPDATE relphot.transit_shape SET edge_clip_bjd = %s, edge_adjacent = true, "
+            "n_outside = 2 WHERE det_id = %s",
+            ([2460310.6, 2460310.7], ids["det_a"]),
+        )
+    test_conn.commit()
+    data = test_client.get(f"/api/object/{ids['obj_both']}").json()
+    ev_a, ev_b = data["transit_events"]
+    assert (ev_a["auto_reason"], ev_a["effective_status"]) == (reason, "REJECTED (auto)")
+    assert ev_a["edge_clip_bjd"] == [2460310.6, 2460310.7]
+    assert ev_b["edge_clip_bjd"] is None
+    det = next(d for d in data["detections"] if d["det_id"] == ids["det_a"])
+    assert det["auto_reason"] == reason
+
+
 def test_object_detail_carries_the_automatic_rejection_and_the_similar_events(
     client, test_conn
 ) -> None:

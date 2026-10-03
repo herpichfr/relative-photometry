@@ -12,6 +12,7 @@ from collections.abc import Callable
 import numpy as np
 
 __all__ = [
+    "edge_outlier_mask",
     "fit_noise_floor",
     "mad_sigma",
     "nanmedian_quiet",
@@ -306,6 +307,12 @@ def robust_clip_series(y: np.ndarray, clip_sigma: float, window: int) -> np.ndar
     transit dip for a point in need of clipping. Returns all-``True`` when
     ``y`` is too short (< 3 points) or the residual scatter is zero/non-finite.
 
+    Blind spot: ``mode="nearest"`` pads the series with copies of its first/last point, so
+    the rolling median of the first and last epoch holds 8 of 15 copies of the point itself
+    and its residual is exactly 0. An outlier at either end of the series is therefore
+    never clipped here, however large; :func:`edge_outlier_mask` covers that case and callers
+    that need it combine the two masks.
+
     Parameters
     ----------
     y : np.ndarray
@@ -330,3 +337,87 @@ def robust_clip_series(y: np.ndarray, clip_sigma: float, window: int) -> np.ndar
     if not np.isfinite(sigma) or sigma <= 0:
         return np.ones_like(y, dtype=bool)
     return np.abs(resid) <= clip_sigma * sigma
+
+
+def edge_outlier_mask(
+    t: np.ndarray,
+    y: np.ndarray,
+    err: np.ndarray | None = None,
+    z: float = 6.0,
+    k_max: int = 2,
+    n_ref: int = 6,
+    z_ref: float = 3.0,
+    min_n: int = 15,
+) -> np.ndarray:
+    """Boolean keep-mask that drops an isolated outlier run of 1..``k_max`` epochs at either end.
+
+    :func:`robust_clip_series` cannot see the first and last epoch of a series (see its
+    docstring), and a high edge epoch makes the rest of a night look like a dip. At each end
+    of the time-sorted, finite epochs the ``j`` outermost epochs (``j = k_max .. 1``, the
+    largest first) are dropped when all of them deviate from the median of the next
+    ``n_ref`` epochs (``y_end[j:j+n_ref]``) by more than ``z * s`` on the same side, and the
+    epoch right after them is consistent with that median within ``z_ref * s``, i.e. the run
+    ends sharply. A run of ``k_max + 1`` or more deviant epochs, a trend and a ramp therefore
+    never qualify (a real partial transit at the start or end of a night is kept).
+
+    ``s = max(1.4826 * MAD(diff(y)) / sqrt(2), median(err), 1e-4)`` is a robust
+    point-to-point scatter, floored by the median error (when ``err`` is given) and by
+    ``1e-4`` (``y`` is a flux normalised to about 1). Two-sided: a low edge epoch is treated
+    like a high one. Non-finite epochs are neither judged nor dropped (kept ``True``), the
+    input need not be sorted, and nothing is dropped when fewer than ``min_n`` finite epochs
+    exist or when ``k_max < 1``.
+
+    Parameters
+    ----------
+    t, y : np.ndarray
+        Epoch times and the (normalised) flux, same shape.
+    err : np.ndarray or None
+        Flux errors, same normalisation as ``y``.
+    z : float
+        Deviation threshold of the dropped epochs, in units of ``s``.
+    k_max : int
+        Longest run of edge epochs that may be dropped.
+    n_ref : int
+        Number of epochs, after the run, whose median is the reference level.
+    z_ref : float
+        The first epoch after the run must lie within ``z_ref * s`` of the reference.
+    min_n : int
+        Fewest finite epochs for the clip to act at all.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean keep-mask in the input order, same shape as ``y``.
+    """
+    t = np.asarray(t, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    keep = np.ones(y.shape, dtype=bool)
+    k_max, n_ref = int(k_max), max(int(n_ref), 1)
+    finite = np.flatnonzero(np.isfinite(t) & np.isfinite(y))
+    if k_max < 1 or finite.size < max(int(min_n), n_ref + k_max + 1):
+        return keep
+    order = finite[np.argsort(t[finite], kind="stable")]
+    ys = y[order]
+    diffs = np.diff(ys)
+    sigma = 1.4826 * float(np.median(np.abs(diffs - np.median(diffs)))) / np.sqrt(2.0)
+    err_floor = 0.0
+    if err is not None:
+        err_f = np.asarray(err, dtype=np.float64)[order]
+        err_f = err_f[np.isfinite(err_f)]
+        if err_f.size:
+            err_floor = float(np.median(err_f))
+    s = max(sigma, err_floor, 1e-4)
+
+    n = ys.size
+    for at_start in (True, False):
+        y_end = ys if at_start else ys[::-1]
+        for j in range(k_max, 0, -1):
+            ref = float(np.median(y_end[j : j + n_ref]))
+            if abs(y_end[j] - ref) > z_ref * s:
+                continue  # the run does not end sharply
+            dev = y_end[:j] - ref
+            if np.all(np.abs(dev) > z * s) and (np.all(dev > 0) or np.all(dev < 0)):
+                dropped = order[:j] if at_start else order[n - j :]
+                keep[dropped] = False
+                break
+    return keep

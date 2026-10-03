@@ -88,7 +88,9 @@ class ReprocessReport:
 
 
 def _load_task(conn: psycopg.Connection, req: dict, settings: Settings) -> _ObjTask:
-    task = _fetch_chunk_data(conn, [req["obj_id"]], settings.db).get(req["obj_id"])
+    task = _fetch_chunk_data(conn, [req["obj_id"]], settings.db, settings.search).get(
+        req["obj_id"]
+    )
     if task is None:
         msg = f"object {req['obj_id']} not found"
         raise ReprocessError(msg)
@@ -151,7 +153,7 @@ def _process_transit(conn: psycopg.Connection, req: dict, settings: Settings) ->
     tie_mags = [entry[0] for entry in task.night_ties.values()]
     tie_ref = float(np.mean(tie_mags)) if tie_mags else None
     start = _TransitDet(det_id=0, night_id=nd.night_id, tc=tc, depth=None, duration_h=width_h)
-    shape = _fit_transit_shape(nd, start, task.night_ties.get(nd.night_id), tie_ref)
+    shape = _fit_transit_shape(nd, start, task.night_ties.get(nd.night_id), tie_ref, task.search)
     if not shape["converged"]:
         msg = (
             f"the trapezoid fit did not converge ({shape['n_points']} points within "

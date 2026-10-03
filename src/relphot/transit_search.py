@@ -51,6 +51,10 @@ Every candidate is finally screened by the informational "R90" false-positive fl
 event, whether the star's own seeing/background/centroid explain it, whether it survives
 a residual clip and whether it beats a flat light curve. They are reported as ``R90_*``
 bits and raw features next to the other vetting flags and never change candidacy or tier.
+
+An isolated outlier among the first or last one or two epochs of a night is excluded before any
+fit by :func:`relphot.numeric.edge_outlier_mask` (the rolling-median clip cannot see those two
+epochs); the star gets the informational ``EDGE_OUTLIER`` bit and the epoch times are kept.
 """
 
 from __future__ import annotations
@@ -62,7 +66,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from relphot.cotrend import compute_frame_error_scale
-from relphot.numeric import mad_sigma, nanmedian_quiet, robust_clip_series
+from relphot.numeric import edge_outlier_mask, mad_sigma, nanmedian_quiet, robust_clip_series
 from relphot.transit_r90 import R90Features, compute_r90_features
 
 if TYPE_CHECKING:
@@ -77,6 +81,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "FLAG_APERTURE_INCONSISTENT",
     "FLAG_EDGE",
+    "FLAG_EDGE_OUTLIER",
     "FLAG_FEW_POINTS",
     "FLAG_HIGH_BETA",
     "FLAG_NAMES",
@@ -148,6 +153,13 @@ FLAG_R90_FIT_FAIL = 1 << 14
 #: candidates. Informational exactly like ``FLAG_ON_VARIABLE``: not in ``HARD_REJECT_FLAGS``,
 #: ignored by :func:`tier_for_flags`.
 FLAG_NEIGHBOUR_SHARED_EVENT = 1 << 15
+#: One or two isolated edge epochs (first and/or last of the night) deviated by more than
+#: ``lc_clip_sigma`` robust sigmas from their neighbours and were excluded from the search of this
+#: star (:func:`relphot.numeric.edge_outlier_mask`, ``edge_clip_*`` settings): the rolling-median
+#: clip cannot see them and a high edge epoch makes the rest of the night look like a dip. The
+#: epoch times are in ``detection.extra['transit_edge_clip_bjd']``. Informational exactly like
+#: ``FLAG_ON_VARIABLE``: not in ``HARD_REJECT_FLAGS``, ignored by :func:`tier_for_flags`.
+FLAG_EDGE_OUTLIER = 1 << 16
 
 FLAG_NAMES: tuple[tuple[int, str], ...] = (
     (FLAG_SHARED_EPOCH, "SHARED_EPOCH"),
@@ -166,6 +178,7 @@ FLAG_NAMES: tuple[tuple[int, str], ...] = (
     (FLAG_R90_FLAT, "R90_FLAT"),
     (FLAG_R90_FIT_FAIL, "R90_FIT_FAIL"),
     (FLAG_NEIGHBOUR_SHARED_EVENT, "NEIGHBOUR_SHARED_EVENT"),
+    (FLAG_EDGE_OUTLIER, "EDGE_OUTLIER"),
 )
 
 #: All R90 bits; a screened candidate passes R90 iff none of them is set.
@@ -300,6 +313,8 @@ class StarSearchResult:
     aperture_inconsistent: bool = False
     few_points: bool = False
     r90: R90Features | None = None
+    #: times (BJD) of the edge epochs :func:`~relphot.numeric.edge_outlier_mask` excluded
+    edge_clip_t: np.ndarray = field(default_factory=lambda: np.array([]))
     t_good: np.ndarray | None = None
     y_good: np.ndarray | None = None
     err_good: np.ndarray | None = None
@@ -357,6 +372,8 @@ class TransitSearchResult:
     reg_depth_ratio: np.ndarray
     clip3_dchi2: np.ndarray
     dbic_flat: np.ndarray
+    #: per star, the times (BJD) of the edge epochs excluded from its search (``EDGE_OUTLIER``)
+    edge_clip_bjd: list[tuple[float, ...]] = field(default_factory=list)
 
 
 def fit_nuisance_model(
@@ -491,6 +508,15 @@ def search_one_star(
     # before any fit -- see robust_clip_series's docstring for why this is
     # outlier rejection, not a systematics model, and safe for transit-safety.
     keep = robust_clip_series(y_good, settings.lc_clip_sigma, settings.lc_clip_window)
+    # robust_clip_series cannot see the first and last epoch, so a high edge epoch survives
+    # it and manufactures a dip out of the rest of the night: edge_outlier_mask covers those
+    # two (isolated runs of at most edge_clip_max_epochs only; never a real partial transit).
+    keep_edge = edge_outlier_mask(
+        t_good, y_good, err_good, settings.lc_clip_sigma,
+        settings.edge_clip_max_epochs, settings.edge_clip_ref_epochs,
+    )
+    edge_clip_t = t_good[~keep_edge]
+    keep &= keep_edge
     if not np.all(keep):
         idx_good = idx_good[keep]
         t_good, y_good, err_good = t_good[keep], y_good[keep], err_good[keep]
@@ -771,6 +797,7 @@ def search_one_star(
         high_beta=bool(is_high_beta),
         few_points=bool(is_few_points),
         r90=r90,
+        edge_clip_t=edge_clip_t,
     )
     if keep_grid:
         in_best = (t_good >= best_tc - best_dur / 2.0) & (t_good <= best_tc + best_dur / 2.0)
@@ -814,6 +841,10 @@ def depth_at_other_aperture(
     cbv_g = cbv_rows[:, idx_good] if cbv_rows.size else cbv_rows.reshape(0, idx_good.size)
 
     keep = robust_clip_series(y_g, settings.lc_clip_sigma, settings.lc_clip_window)
+    keep &= edge_outlier_mask(
+        t_g, y_g, err_g, settings.lc_clip_sigma,
+        settings.edge_clip_max_epochs, settings.edge_clip_ref_epochs,
+    )
     if not np.all(keep):
         t_g, y_g, err_g = t_g[keep], y_g[keep], err_g[keep]
         cbv_g = cbv_g[:, keep]
@@ -907,6 +938,7 @@ def search_transits(
     depth_per_aper = np.full((n_stars, n_aper), np.nan)
     sigma_depth_per_aper = np.full((n_stars, n_aper), np.nan)
     flags = np.zeros(n_stars, dtype=np.int64)
+    edge_clip_bjd: list[tuple[float, ...]] = [() for _ in range(n_stars)]
     r90_evaluated = np.zeros(n_stars, dtype=bool)
     r90_pass = np.zeros(n_stars, dtype=bool)
     r90_columns = {
@@ -1001,6 +1033,9 @@ def search_transits(
             sigma_depth_per_aper[i, a2] = se2
 
         flag_bits = 0
+        if result.edge_clip_t.size:
+            edge_clip_bjd[i] = tuple(float(b) for b in result.edge_clip_t)
+            flag_bits |= FLAG_EDGE_OUTLIER
         if result.edge:
             flag_bits |= FLAG_EDGE
         if result.too_deep:
@@ -1091,6 +1126,7 @@ def search_transits(
         frame_error_scale=frame_error_scale,
         r90_evaluated=r90_evaluated,
         r90_pass=r90_pass,
+        edge_clip_bjd=edge_clip_bjd,
         **r90_columns,
     )
 

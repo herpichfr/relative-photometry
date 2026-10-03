@@ -1,11 +1,18 @@
-"""Automatic cross-candidate check of one night's transit events (``relphot db analyze``).
+"""Automatic verdicts on one night's transit events (``relphot db analyze``).
 
-See docs/DB_PLAN.md ("Coincident events"). One planet cannot transit two stars at once, so an
-event whose trapezoid fit (``relphot.transit_shape``) has many look-alikes on the SAME night --
-other objects' events with the same centre time and a similar T14 and depth -- is a systematic
-(on the live data these coincide with seeing excursions and are spread uniformly over the
-detector). Such an event stays a detection but is marked ``detection.auto_status = 'REJECTED'``
-with ``auto_reason``; ``detection.status`` is the PERSON's verdict and is never set here.
+Two kinds of rule write ``detection.auto_status = 'REJECTED'`` and ``auto_reason`` in ONE per-night
+pass, :func:`update_auto_verdicts`, which unions the reasons of every rule that fires: the
+cross-candidate (coincidence) veto below and the shape rules of :func:`shape_reasons`
+(``EDGE_OUTLIER``, ``NO_DIP``, ``NO_BASELINE``, read from the ``transit_shape`` row). A person's
+``status`` always wins (:func:`relphot.web.app._effective_status`).
+
+The coincidence veto, see docs/DB_PLAN.md ("Coincident events"). One planet cannot transit two
+stars at once, so an event whose trapezoid fit (``relphot.transit_shape``) has many look-alikes
+on the SAME night -- other objects' events with the same centre time and a similar T14 and
+depth -- is a systematic (on the live data these coincide with seeing excursions and are spread
+uniformly over the detector). Such an event stays a detection but is marked
+``detection.auto_status = 'REJECTED'`` with ``auto_reason``; ``detection.status`` is the PERSON's
+verdict and is never set here.
 
 :func:`coincidence` is the pure numpy/scipy computation, no database. For every event *i*, over
 the other events *j* of the night:
@@ -24,12 +31,16 @@ the other events *j* of the night:
   ``p_chance_i = P(Binomial(M_i, pbar_i) >= n_i)`` (1 when ``n_i = 0``);
 - rejected iff ``n_i >= coincidence_min_similar`` and ``p_chance_i < coincidence_max_p``.
 
-:func:`update_coincidence` runs it per night on the stored shapes: it rewrites the night's
-``relphot.transit_coincidence`` rows, clears ``auto_status`` / ``auto_reason`` of all the night's
-transit detections and sets them again for the rejected events, and reports the objects whose
-automatic verdict changed (their flags need a refresh). Only converged shapes of the search's own
-per-night transit detections (``origin = 'search'``) are judged or counted; a user-origin detection
-is neither. It does not commit.
+:func:`update_auto_verdicts` (alias ``update_coincidence``) runs it per night on the stored
+shapes: it rewrites the night's ``relphot.transit_coincidence`` rows, evaluates the shape
+rules, writes the unioned verdict of the night's transit detections (only rows whose verdict
+differs, clearing a reason exactly when its rule no longer fires) and reports the objects whose
+automatic verdict changed (their flags need a refresh). Only converged shapes of the search's
+own per-night transit detections (``origin = 'search'``) are judged or counted by the coincidence
+rule, and only those detections are judged by the shape rules; a user-origin detection is
+neither. With ``skip_det_ids`` (the events a person has vetted, :mod:`relphot.db.vetted`) those
+events are still counted as look-alikes of the others but their own verdict and
+``transit_coincidence`` row are left exactly as stored. It does not commit.
 """
 
 from __future__ import annotations
@@ -37,7 +48,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -48,7 +59,14 @@ from relphot.config import DbSettings
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CoincidenceReport", "CoincidenceResult", "coincidence", "update_coincidence"]
+__all__ = [
+    "CoincidenceReport",
+    "CoincidenceResult",
+    "coincidence",
+    "shape_reasons",
+    "update_auto_verdicts",
+    "update_coincidence",
+]
 
 #: Rows of the pairwise matrices computed at a time (bounds the memory of a large night).
 _BLOCK = 512
@@ -199,11 +217,19 @@ def coincidence(
 
 @dataclass(slots=True)
 class CoincidenceReport:
-    """What one :func:`update_coincidence` call did."""
+    """What one :func:`update_auto_verdicts` call did.
+
+    ``n_rejected`` counts the events auto-rejected after the pass (by any rule), the ``n_*``
+    rule counts the events each rule fired on (one event can be counted under several).
+    """
 
     n_nights: int = 0
     n_events: int = 0
     n_rejected: int = 0
+    n_coincidence: int = 0
+    n_edge_outlier: int = 0
+    n_no_dip: int = 0
+    n_no_baseline: int = 0
     #: objects with an event whose automatic verdict (rejected or not) changed
     changed_obj_ids: list[int] = field(default_factory=list)
 
@@ -215,12 +241,23 @@ _EVENTS_SQL = """
     ORDER BY d.det_id
 """
 
+#: the stored shapes the shape rules (:func:`shape_reasons`) judge: every search event with a row
+_SHAPE_EVENTS_SQL = """
+    SELECT d.det_id, ts.depth, ts.converged, ts.edge_clip_bjd, ts.edge_adjacent, ts.n_outside
+    FROM relphot.detection d JOIN relphot.transit_shape ts ON ts.det_id = d.det_id
+    WHERE d.night_id = %s AND d.kind = 'transit' AND d.origin = 'search'
+    ORDER BY d.det_id
+"""
+
 _INSERT_SQL = """
     INSERT INTO relphot.transit_coincidence
         (det_id, night_id, n_similar, n_expected, p_chance, similar_det_ids, rejected,
          computed_at)
     VALUES (%s, %s, %s, %s, %s, %s::bigint[], %s, now())
 """
+
+#: the rules of the verdict pass, in the order their reasons are written
+_RULE_ORDER = ("COINCIDENCE", "EDGE_OUTLIER", "NO_DIP", "NO_BASELINE")
 
 
 def _short_p(p: float) -> str:
@@ -238,31 +275,89 @@ def _reason(n_similar: int, window_days: float, n_expected: float, p_chance: flo
     )
 
 
-def update_coincidence(
+def shape_reasons(
+    depth: float | None,
+    converged: bool | None,
+    edge_clip_bjd: Sequence[float] | None,
+    edge_adjacent: bool | None,
+    n_outside: int | None,
+    settings: DbSettings | None = None,
+) -> dict[str, str]:
+    """The shape rules that reject one stored per-night transit event: ``{rule: reason}``.
+
+    From its ``transit_shape`` row (``relphot.db.analyze._fit_transit_shape``); a NULL input
+    never fires a rule:
+
+    - ``EDGE_OUTLIER``: the fit excluded isolated edge epoch(s) and they were the only epoch(s)
+      beyond the detection's own search box on that side (``edge_adjacent``): the box starts or
+      ends right next to the artefact that made the dip;
+    - ``NO_DIP``: a converged fit with a depth below ``auto_nodip_depth``;
+    - ``NO_BASELINE``: a converged fit with fewer than ``auto_nobaseline_min_epochs`` epochs
+      outside the fitted trapezoid (``n_outside``) and a depth above ``auto_nobaseline_min_depth``:
+      the baseline is extrapolated from almost nothing, not measured.
+    """
+    s = settings if settings is not None else DbSettings()
+    reasons: dict[str, str] = {}
+    if edge_adjacent and edge_clip_bjd:
+        k = len(edge_clip_bjd)
+        what = "isolated edge epochs were" if k > 1 else "isolated edge epoch was"
+        reasons["EDGE_OUTLIER"] = (
+            f"edge outlier: {k} {what} excluded from the fit and the only data beyond the "
+            "search box on its side"
+        )
+    if converged and depth is not None and math.isfinite(depth):
+        if depth < s.auto_nodip_depth:
+            reasons["NO_DIP"] = (
+                f"no dip: the fitted trapezoid depth is {depth:.1e} (< {s.auto_nodip_depth:.0e})"
+            )
+        if (
+            n_outside is not None and n_outside < s.auto_nobaseline_min_epochs
+            and depth > s.auto_nobaseline_min_depth
+        ):
+            reasons["NO_BASELINE"] = (
+                f"no baseline: only {n_outside} epoch{'s' if n_outside != 1 else ''} outside the "
+                f"fitted trapezoid (< {s.auto_nobaseline_min_epochs}) for a depth of {depth:.2f} "
+                f"(> {s.auto_nobaseline_min_depth:g})"
+            )
+    return reasons
+
+
+def update_auto_verdicts(
     conn: psycopg.Connection,
     night_ids: Sequence[int],
     settings: DbSettings | None = None,
+    skip_det_ids: Collection[int] = (),
 ) -> CoincidenceReport:
     """Re-evaluate every night in ``night_ids`` from its stored transit shapes (module docstring).
 
-    Per night: the ``transit_coincidence`` rows are deleted and inserted afresh, the night's
-    transit detections lose their ``auto_status`` / ``auto_reason`` and the rejected ones get
-    ``auto_status = 'REJECTED'`` and a reason. The whole night is judged, whichever objects were
-    just analysed. Returns the report with ``changed_obj_ids`` (sorted): the objects that have an
-    event whose automatic verdict changed, whose flags the caller must refresh. Does not commit.
+    Per night: the ``transit_coincidence`` rows are deleted and inserted afresh and every rule
+    (coincidence, then :func:`shape_reasons`) is evaluated; an event rejected by one or more rules
+    gets ``auto_status = 'REJECTED'`` and ``auto_reason`` = the reasons of all the rules that fire,
+    joined by ``"; "``. The verdict is computed from scratch from the stored shapes each time and
+    only the rows whose ``auto_status`` / ``auto_reason`` differ are written, so a re-run is
+    idempotent and a reason disappears exactly when its rule no longer fires (a transit
+    detection no rule rejects is cleared). A person's ``status`` is never touched. Events in
+    ``skip_det_ids`` keep their stored verdict and coincidence row (module docstring). The whole
+    night is judged, whichever objects were just analysed. Returns the report with
+    ``changed_obj_ids`` (sorted): the objects that have an event whose automatic verdict
+    (rejected or not) changed, whose flags the caller must refresh. Does not commit.
     """
     s = settings if settings is not None else DbSettings()
     report = CoincidenceReport()
     changed: set[int] = set()
+    skip = {int(i) for i in skip_det_ids}
 
     with conn.cursor() as cur:
         for night_id in sorted({int(n) for n in night_ids}):
             cur.execute(
-                "SELECT det_id, obj_id, auto_status FROM relphot.detection "
+                "SELECT det_id, obj_id, auto_status, auto_reason FROM relphot.detection "
                 "WHERE night_id = %s AND kind = 'transit'",
                 (night_id,),
             )
-            before = {det_id: (obj_id, auto) for det_id, obj_id, auto in cur.fetchall()}
+            before = {
+                det_id: (obj_id, auto, why) for det_id, obj_id, auto, why in cur.fetchall()
+                if det_id not in skip
+            }
 
             cur.execute(_EVENTS_SQL, (night_id,))
             events = cur.fetchall()
@@ -286,20 +381,18 @@ def update_coincidence(
             else:
                 res = None
 
-            cur.execute("DELETE FROM relphot.transit_coincidence WHERE night_id = %s", (night_id,))
             cur.execute(
-                "UPDATE relphot.detection SET auto_status = NULL, auto_reason = NULL "
-                "WHERE night_id = %s AND kind = 'transit' "
-                "AND (auto_status IS NOT NULL OR auto_reason IS NOT NULL)",
-                (night_id,),
+                "DELETE FROM relphot.transit_coincidence "
+                "WHERE night_id = %s AND det_id <> ALL(%s)",
+                (night_id, sorted(skip)),
             )
 
-            rejected_ids: set[int] = set()
+            # rule -> {det_id: reason}
+            fired: dict[str, dict[int, str]] = {rule: {} for rule in _RULE_ORDER}
             if res is not None:
                 rows = []
-                reasons = []
                 for i, det_id in enumerate(det_ids):
-                    if not res.evaluated[i]:
+                    if not res.evaluated[i] or det_id in skip:
                         continue
                     rejected = bool(res.rejected[i])
                     rows.append((
@@ -307,33 +400,68 @@ def update_coincidence(
                         float(res.p_chance[i]), [det_ids[j] for j in res.similar[i]], rejected,
                     ))
                     if rejected:
-                        rejected_ids.add(det_id)
-                        reasons.append((
-                            _reason(
-                                int(res.n_similar[i]), float(res.window_days[i]),
-                                float(res.n_expected[i]), float(res.p_chance[i]),
-                            ),
-                            det_id,
-                        ))
+                        fired["COINCIDENCE"][det_id] = _reason(
+                            int(res.n_similar[i]), float(res.window_days[i]),
+                            float(res.n_expected[i]), float(res.p_chance[i]),
+                        )
                 if rows:
                     cur.executemany(_INSERT_SQL, rows)
-                if reasons:
-                    cur.executemany(
-                        "UPDATE relphot.detection SET auto_status = 'REJECTED', auto_reason = %s "
-                        "WHERE det_id = %s",
-                        reasons,
-                    )
                 report.n_events += len(rows)
 
-            for det_id, (obj_id, auto) in before.items():
-                if (auto == "REJECTED") != (det_id in rejected_ids):
+            cur.execute(_SHAPE_EVENTS_SQL, (night_id,))
+            for det_id, depth, converged, clip_bjd, adjacent, n_outside in cur.fetchall():
+                if det_id in skip:
+                    continue
+                for rule, why in shape_reasons(
+                    depth, converged, clip_bjd, adjacent, n_outside, s
+                ).items():
+                    fired[rule][det_id] = why
+
+            desired: dict[int, str] = {}
+            for rule in _RULE_ORDER:
+                for det_id, why in fired[rule].items():
+                    desired[det_id] = f"{desired[det_id]}; {why}" if det_id in desired else why
+
+            updates_set = []
+            updates_clear = []
+            for det_id, (obj_id, auto, why) in before.items():
+                new = desired.get(det_id)
+                if (auto == "REJECTED") != (new is not None):
                     changed.add(obj_id)
+                if new is None:
+                    if auto is not None or why is not None:
+                        updates_clear.append((det_id,))
+                elif auto != "REJECTED" or why != new:
+                    updates_set.append((new, det_id))
+            if updates_clear:
+                cur.executemany(
+                    "UPDATE relphot.detection SET auto_status = NULL, auto_reason = NULL "
+                    "WHERE det_id = %s",
+                    updates_clear,
+                )
+            if updates_set:
+                cur.executemany(
+                    "UPDATE relphot.detection SET auto_status = 'REJECTED', auto_reason = %s "
+                    "WHERE det_id = %s",
+                    updates_set,
+                )
+
             report.n_nights += 1
-            report.n_rejected += len(rejected_ids)
+            report.n_rejected += sum(1 for det_id in desired if det_id in before)
+            report.n_coincidence += len(fired["COINCIDENCE"])
+            report.n_edge_outlier += len(fired["EDGE_OUTLIER"])
+            report.n_no_dip += len(fired["NO_DIP"])
+            report.n_no_baseline += len(fired["NO_BASELINE"])
 
     report.changed_obj_ids = sorted(changed)
     logger.info(
-        "coincidence: %d nights, %d events judged, %d auto-rejected, %d objects changed",
-        report.n_nights, report.n_events, report.n_rejected, len(report.changed_obj_ids),
+        "auto verdicts: %d nights, %d events judged, %d auto-rejected (coincidence %d, "
+        "edge outlier %d, no dip %d, no baseline %d), %d objects changed",
+        report.n_nights, report.n_events, report.n_rejected, report.n_coincidence,
+        report.n_edge_outlier, report.n_no_dip, report.n_no_baseline, len(report.changed_obj_ids),
     )
     return report
+
+
+#: the coincidence veto's original name; the pass now also applies the shape rules
+update_coincidence = update_auto_verdicts

@@ -101,7 +101,8 @@ def _fmt_duration(hours: float | None, lower_limit: bool | None) -> str | None:
 
 def _effective_status(status: str | None, auto_status: str | None) -> str:
     """A detection's status as it counts: a person's CONFIRMED / REJECTED stands, else
-    ``'REJECTED (auto)'`` when the cross-candidate check rejected it, else UNCONFIRMED."""
+    ``'REJECTED (auto)'`` when an automatic rule rejected it (the coincidence veto or a shape
+    rule, ``auto_reason`` says which), else UNCONFIRMED."""
     status = status or "UNCONFIRMED"
     if status == "UNCONFIRMED" and auto_status == "REJECTED":
         return "REJECTED (auto)"
@@ -694,6 +695,11 @@ def object_detail(obj_id: int):
             )
             ties = _rows_to_dicts(cur, cur.fetchall())
 
+            # schema v14: the edge epochs the shape fit excluded (drawn as grey crosses)
+            shape_extra = (
+                ", ts.edge_clip_bjd" if column_exists(conn, "transit_shape", "edge_clip_bjd")
+                else ""
+            )
             cur.execute(
                 "SELECT d.det_id, d.night_id, n.label AS night_label, n.telescope, "
                 "n.night_date, d.tc_bjd_tdb AS det_tc, d.depth AS det_depth, "
@@ -704,7 +710,7 @@ def object_detail(obj_id: int):
                 "ts.tc, ts.tc_err, ts.depth, ts.depth_err, ts.t14_h, ts.t14_err, "
                 "ts.t14_lower_limit, ts.incomplete_reason, "
                 "ts.ingress_frac, ts.ingress_err, ts.chi2_red, ts.n_points, ts.input, "
-                "ts.converged "
+                "ts.converged" + shape_extra + " "
                 "FROM relphot.detection d "
                 "JOIN relphot.night n ON n.night_id = d.night_id "
                 "LEFT JOIN relphot.transit_shape ts ON ts.det_id = d.det_id "

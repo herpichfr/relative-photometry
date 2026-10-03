@@ -19,16 +19,20 @@ For each object needing analysis, :func:`analyze` deletes its existing
   allows a non-empty period range;
 - for every per-night ``'transit'`` detection, a trapezoid fit
   (``relphot.transit_shape``: tc, depth, T14, ingress fraction, one constant
-  baseline, on tied flux when a multi-night tie covers the night), and, for
+  baseline, on tied flux when a multi-night tie covers the night; an isolated outlier at the
+  first or last one or two epochs of the night is excluded first, see
+  :func:`relphot.numeric.edge_outlier_mask`), and, for
   every pair of converged fits of one object, a "matching transits"
   probability from depth and shape (``relphot.transit_match``). Events are
   never merged and no status is changed;
-- once every chunk is committed, the cross-candidate check of
+- once every chunk is committed, the automatic verdicts of
   :mod:`relphot.db.coincidence` on every night that has a transit shape of a target object:
   the whole night is re-judged from the stored shapes (not only the target objects'), events
-  with too many look-alikes on the night get ``detection.auto_status = 'REJECTED'`` (the
-  person's ``status`` is never touched) and the objects whose automatic verdict changed are
-  refreshed;
+  with too many look-alikes on the night (coincidence), whose fit excluded the only data beyond
+  their search box on one side (EDGE_OUTLIER), with no depth (NO_DIP) or no measured baseline
+  (NO_BASELINE) get ``detection.auto_status = 'REJECTED'`` and a reason naming every rule that
+  fired (the person's ``status`` is never touched) and the objects whose automatic verdict
+  changed are refreshed;
 - once the coincidence check is done, the repeated-event families of
   :mod:`relphot.db.families` for the same objects: every pair of an object's eligible transit
   events (not rejected by the person, not auto-rejected) is scored, mutually linked events form
@@ -73,7 +77,7 @@ import math
 import os
 import time
 import warnings
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
@@ -82,9 +86,11 @@ import numpy as np
 import psycopg
 from psycopg.types.json import Jsonb
 
-from relphot.config import DbSettings, Settings
-from relphot.db.coincidence import update_coincidence
+from relphot.config import DbSettings, SearchSettings, Settings
+from relphot.db.coincidence import update_auto_verdicts
 from relphot.db.refresh import refresh_objects
+from relphot.db.vetted import vetted_det_ids
+from relphot.numeric import edge_outlier_mask
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +125,12 @@ class AnalyzeReport:
     n_coincidence_rejected: int = 0
     #: nights the cross-candidate check re-judged
     n_coincidence_nights: int = 0
+    #: events auto-rejected by any rule of the verdict pass, and those each rule fired on (an
+    #: event can be counted under several rules)
+    n_auto_rejected: int = 0
+    n_edge_outlier: int = 0
+    n_no_dip: int = 0
+    n_no_baseline: int = 0
     #: pairs of eligible transit events scored, and families of repeated events found
     n_repeat_links: int = 0
     n_repeat_families: int = 0
@@ -160,6 +172,8 @@ class _ObjTask:
     transits: list[_TransitDet] = field(default_factory=list)
     #: this object's nights the best tie run ties loosely (no BLS, no transit matching)
     loose_night_ids: frozenset[int] = frozenset()
+    #: search settings (the edge clip of the transit shape fit)
+    search: SearchSettings = field(default_factory=SearchSettings)
 
 
 @dataclass(slots=True)
@@ -213,9 +227,15 @@ def _best_run_id(runs: dict[int, tuple[set[int], object]], obj_night_ids: set[in
 
 
 def _fetch_chunk_data(
-    conn: psycopg.Connection, obj_ids: list[int], settings: DbSettings
+    conn: psycopg.Connection, obj_ids: list[int], settings: DbSettings,
+    search: SearchSettings | None = None,
+    exclude_det_ids: Collection[int] = (),
 ) -> dict[int, _ObjTask]:
-    """Bulk-fetch every input :func:`_compute_object` needs for ``obj_ids`` in five queries."""
+    """Bulk-fetch every input :func:`_compute_object` needs for ``obj_ids`` in five queries.
+
+    The transit detections in ``exclude_det_ids`` (vetted events a ``keep_vetted`` analysis must
+    not refit) are left out of the tasks' ``transits``.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -294,7 +314,10 @@ def _fetch_chunk_data(
         )
 
     transits_by_obj: dict[int, list[_TransitDet]] = {}
+    excluded = set(exclude_det_ids)
     for obj_id, det_id, night_id, tc, depth, duration_h, det_flags in transit_rows:
+        if det_id in excluded:
+            continue
         transits_by_obj.setdefault(obj_id, []).append(
             _TransitDet(
                 det_id=det_id, night_id=night_id, tc=float(tc),
@@ -353,6 +376,7 @@ def _fetch_chunk_data(
             night_ties=night_ties,
             transits=transits_by_obj.get(obj_id, []),
             loose_night_ids=loose_ids,
+            search=search if search is not None else SearchSettings(),
         )
     return tasks
 
@@ -751,7 +775,7 @@ def _incompleteness(
 
 def _fit_transit_shape(
     nd: _NightData, det: _TransitDet, tie_entry: tuple[float, float] | None,
-    tie_ref: float | None,
+    tie_ref: float | None, search: SearchSettings | None = None,
 ) -> dict:
     """Trapezoid + constant-baseline fit to one night's light curve around ``det``.
 
@@ -763,7 +787,14 @@ def _fit_transit_shape(
     values and are bounded to depth > 0, ``t14`` in [0.3, 3] x the detection
     duration, ingress fraction in [0, 0.5], ``tc`` within half a duration of the
     detection. Errors come from ``(J^T J)^-1`` scaled by ``max(1, chi2_red)``.
-    No trend is fitted: the baseline is one constant.
+    No trend is fitted: the baseline is one constant. First, an isolated outlier run of at most
+    ``search.edge_clip_max_epochs`` epochs at the start or end of the night
+    (:func:`relphot.numeric.edge_outlier_mask`; ``search`` defaults to
+    :class:`~relphot.config.SearchSettings`) is excluded, since the free baseline would
+    otherwise be bent by it or extrapolated from the one or two epochs left outside the
+    transit. ``edge_clip_bjd`` lists those epochs, ``edge_adjacent`` says they were the only
+    epochs beyond the detection's own box on that side and ``n_outside`` counts the night's
+    epochs outside the fitted trapezoid (the baseline's support).
 
     Duration is reported for every event, but for an incomplete one (see
     :func:`_incompleteness`) ``t14_h`` is the observed in-transit span, a lower limit
@@ -781,6 +812,7 @@ def _fit_transit_shape(
         "ingress_frac": None, "ingress_err": None, "chi2_red": None, "n_points": 0,
         "input": "night", "converged": False, "t14_lower_limit": False,
         "incomplete_reason": None,
+        "edge_clip_bjd": None, "edge_adjacent": None, "n_outside": None,
     }
 
     def apply_incompleteness(t_night: np.ndarray, tc: float, t14: float) -> bool:
@@ -798,6 +830,24 @@ def _fit_transit_shape(
         apply_incompleteness(np.empty(0), det.tc, d0)
         return out
     t, y, e = got
+    srch = search if search is not None else SearchSettings()
+    keep_edge = edge_outlier_mask(
+        t, y, e, srch.lc_clip_sigma, srch.edge_clip_max_epochs, srch.edge_clip_ref_epochs
+    )
+    if not keep_edge.all():
+        clipped = ~keep_edge
+        out["edge_clip_bjd"] = [float(b) for b in t[clipped]]
+        # the excluded epochs of an end are "adjacent" when they are the only epochs beyond the
+        # detection's own box on that side (the box ends right next to the artefact)
+        box_lo, box_hi = det.tc - 0.5 * d0, det.tc + 0.5 * d0
+        t_mid = float(np.median(t))
+        adjacent = False
+        if (clipped & (t < t_mid)).any():
+            adjacent |= bool(np.array_equal(t < box_lo, clipped & (t < t_mid)))
+        if (clipped & (t >= t_mid)).any():
+            adjacent |= bool(np.array_equal(t > box_hi, clipped & (t >= t_mid)))
+        out["edge_adjacent"] = adjacent
+        t, y, e = t[keep_edge], y[keep_edge], e[keep_edge]
     t_night = t
     if tie_entry is not None and tie_ref is not None:
         offset = tie_entry[0] - tie_ref
@@ -850,6 +900,7 @@ def _fit_transit_shape(
     out.update(
         tc=tc_fit, depth=_real_safe(x[1]), t14_h=float(x[2] * 24.0),
         ingress_frac=_real_safe(x[3]), chi2_red=_real_safe(chi2_red),
+        n_outside=int(np.count_nonzero(np.abs(t_night - tc_fit) > 0.5 * float(x[2]))),
     )
     edges_seen = apply_incompleteness(t_night, tc_fit, float(x[2]))
     if err is not None and bool(res.success) and np.all(np.isfinite(err[:3])):
@@ -973,7 +1024,9 @@ def _transit_shapes(task: _ObjTask) -> list[dict]:
         nd = night_by_id.get(det.night_id)
         if nd is None:
             continue
-        shapes.append(_fit_transit_shape(nd, det, task.night_ties.get(det.night_id), tie_ref))
+        shapes.append(
+            _fit_transit_shape(nd, det, task.night_ties.get(det.night_id), tie_ref, task.search)
+        )
     return shapes
 
 
@@ -981,8 +1034,9 @@ _SHAPE_INSERT_SQL = """
     INSERT INTO relphot.transit_shape
         (det_id, obj_id, tc, tc_err, depth, depth_err, t14_h, t14_err,
          t14_lower_limit, incomplete_reason, ingress_frac, ingress_err,
-         chi2_red, n_points, input, converged, computed_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+         chi2_red, n_points, input, converged, edge_clip_bjd, edge_adjacent, n_outside,
+         computed_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
 """
 
 _MATCH_INSERT_SQL = """
@@ -1034,7 +1088,7 @@ def _shape_values(obj_id: int, sh: dict) -> tuple:
         sh["det_id"], obj_id, sh["tc"], sh["tc_err"], sh["depth"], sh["depth_err"],
         sh["t14_h"], sh["t14_err"], sh["t14_lower_limit"], sh["incomplete_reason"],
         sh["ingress_frac"], sh["ingress_err"], sh["chi2_red"], sh["n_points"], sh["input"],
-        sh["converged"],
+        sh["converged"], sh["edge_clip_bjd"], sh["edge_adjacent"], sh["n_outside"],
     )
 
 
@@ -1585,6 +1639,7 @@ def analyze(
     settings: Settings | None = None,
     workers: int | None = None,
     chunk_size: int = _DEFAULT_CHUNK_SIZE,
+    keep_vetted: bool = False,
 ) -> AnalyzeReport:
     """Recompute periodograms, transit shapes/matches, period estimates and (via
     :func:`~relphot.db.refresh.refresh_objects`) PERIOD for objects needing analysis.
@@ -1599,6 +1654,13 @@ def analyze(
     time, so an interrupted run keeps every chunk already committed. Afterwards the
     cross-candidate check (:mod:`relphot.db.coincidence`) re-judges every night with a transit
     shape of a target object, in one further transaction.
+
+    ``keep_vetted`` leaves the events a person has vetted (:mod:`relphot.db.vetted`) exactly as
+    they are: their ``transit_shape`` row is not refit, their verdict (``auto_status`` /
+    ``auto_reason``) and ``transit_coincidence`` row are not rewritten; their stored shapes still
+    take part in the object's ``transit_match`` rows (recomputed from the stored shapes) and in the
+    look-alike counts of the other events. Everything about the unvetted events and the objects'
+    periodograms is recomputed as usual.
     """
     t0 = time.monotonic()
     settings = settings if settings is not None else Settings()
@@ -1625,7 +1687,13 @@ def analyze(
                     ls_fap_threshold=db_settings.ls_fap_threshold,
                     class_multinight_kinds=db_settings.class_multinight_kinds,
                 )
-                tasks = _fetch_chunk_data(conn, chunk, db_settings)
+                frozen: set[int] = set()
+                if keep_vetted:
+                    with conn.cursor() as cur:
+                        frozen = vetted_det_ids(cur, obj_ids=chunk)
+                tasks = _fetch_chunk_data(
+                    conn, chunk, db_settings, settings.search, exclude_det_ids=frozen
+                )
                 if executor is not None and len(tasks) > 1:
                     results = list(executor.map(_compute_object, tasks.values()))
                 else:
@@ -1642,8 +1710,9 @@ def analyze(
                         {"obj_ids": obj_id_list},
                     )
                     cur.execute(
-                        "DELETE FROM relphot.transit_shape WHERE obj_id = ANY(%(obj_ids)s)",
-                        {"obj_ids": obj_id_list},
+                        "DELETE FROM relphot.transit_shape "
+                        "WHERE obj_id = ANY(%(obj_ids)s) AND det_id <> ALL(%(frozen)s)",
+                        {"obj_ids": obj_id_list, "frozen": sorted(frozen)},
                     )
                     insert_rows = []
                     shape_rows = []
@@ -1655,7 +1724,8 @@ def analyze(
                         lower_limit_rows.extend(
                             (bool(sh["t14_lower_limit"]), sh["det_id"]) for sh in result.shapes
                         )
-                        match_rows.extend(_match_values(obj_id, m) for m in result.matches)
+                        if not keep_vetted:
+                            match_rows.extend(_match_values(obj_id, m) for m in result.matches)
                         est = result.estimate
                         if est is not None:
                             estimate_rows.append(_estimate_values(obj_id, est))
@@ -1700,6 +1770,10 @@ def analyze(
                     if match_rows:
                         cur.executemany(_MATCH_INSERT_SQL, match_rows)
                         n_matches += len(match_rows)
+                    if keep_vetted:
+                        # the frozen shapes were not refit: match from every stored shape
+                        for obj_id in obj_id_list:
+                            n_matches += recompute_matches(conn, obj_id, db_settings)
                     if estimate_rows:
                         cur.executemany(_ESTIMATE_INSERT_SQL, estimate_rows)
                         n_estimates += len(estimate_rows)
@@ -1718,15 +1792,24 @@ def analyze(
             executor.shutdown(wait=True)
 
     n_coincidence_rejected = n_coincidence_nights = 0
+    n_auto_rejected = n_edge_outlier = n_no_dip = n_no_baseline = 0
     try:
         night_ids = _coincidence_night_ids(conn, target_ids)
         if night_ids:
-            coincidence_report = update_coincidence(conn, night_ids, db_settings)
-            n_coincidence_rejected = coincidence_report.n_rejected
-            n_coincidence_nights = coincidence_report.n_nights
-            if coincidence_report.changed_obj_ids:
+            skip: set[int] = set()
+            if keep_vetted:
+                with conn.cursor() as cur:
+                    skip = vetted_det_ids(cur, night_ids=night_ids)
+            verdict_report = update_auto_verdicts(conn, night_ids, db_settings, skip)
+            n_coincidence_rejected = verdict_report.n_coincidence
+            n_coincidence_nights = verdict_report.n_nights
+            n_auto_rejected = verdict_report.n_rejected
+            n_edge_outlier = verdict_report.n_edge_outlier
+            n_no_dip = verdict_report.n_no_dip
+            n_no_baseline = verdict_report.n_no_baseline
+            if verdict_report.changed_obj_ids:
                 refresh_objects(
-                    conn, coincidence_report.changed_obj_ids,
+                    conn, verdict_report.changed_obj_ids,
                     bls_min_snr=db_settings.bls_min_snr,
                     ls_fap_threshold=db_settings.ls_fap_threshold,
                     class_multinight_kinds=db_settings.class_multinight_kinds,
@@ -1755,5 +1838,7 @@ def analyze(
         n_bls=n_bls, n_coarsened=n_coarsened, elapsed_s=time.monotonic() - t0,
         n_transit_shapes=n_shapes, n_transit_matches=n_matches, n_period_estimates=n_estimates,
         n_coincidence_rejected=n_coincidence_rejected, n_coincidence_nights=n_coincidence_nights,
+        n_auto_rejected=n_auto_rejected, n_edge_outlier=n_edge_outlier, n_no_dip=n_no_dip,
+        n_no_baseline=n_no_baseline,
         n_repeat_links=n_repeat_links, n_repeat_families=n_repeat_families,
     )
