@@ -32,7 +32,7 @@ esac
 PERM=/mnt/sto01/$TEL/reduced/$NIGHT
 STG=/ssdsto1/data/${TEL}_reduced/$NIGHT
 SCRA=/mnt/sto01/scratch/aperture/$TEL/reduced/$NIGHT
-OLD=/mnt/sto01/scratch/psf_v1/$TEL/reduced/$NIGHT      # superseded PSF v1 products are moved here
+OLD=${PSF_REDO_OLD:-/mnt/sto01/scratch/psf_v1}/$TEL/reduced/$NIGHT      # superseded products are moved here (PSF_REDO_OLD overrides the root for a later redo pass)
 LOGD=/ssdsto1/data/${TEL}_reduced/psf_redo_logs        # outside the staged tree (logging inside it broke the size verification of earlier pipelines)
 LOG=$LOGD/$NIGHT.log; STATE=$LOGD/$NIGHT.state; MEMLOG=$LOGD/$NIGHT.mem.log; NFF=$LOGD/$NIGHT.nf; NIDF=$LOGD/$NIGHT.nid
 export TMPDIR=/ssdsto1/data/mnt OMP_NUM_THREADS=2      # relphot steps; the fit/finalize commands set OMP_NUM_THREADS=1 explicitly
@@ -174,7 +174,7 @@ step_finalize() {
     echo "code dir:    $CODE"
     echo "telescope:   $TEL   night: $NIGHT   nproc: $NP   pass1_step: $STEP1"
     echo "mode: $MODE"
-    echo "supersedes: $OLD/psf (PSF v1)"
+    echo "supersedes: $OLD/psf"
     echo "input night dir:       $PERM"
     echo "input forced dir: $SCRA/forced"
     echo "input catalogue dir: $SCRA"
