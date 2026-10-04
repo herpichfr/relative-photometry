@@ -5,7 +5,8 @@ Environment: PSF_OUT (required) output dir (also holds psf_work/ from run_night.
 PSF_FORCED (default $PSF_PROD/forced) forced catalogues; PSF_FAINTZP=0 switches the faint-star zero-point correction off.
 Faint-star zero point: the PSF flux of faint / blended sources depends on the frame's PSF width (up to 25-40 % at 1500-4000 counts).  A per-frame,
 common-mode correction a_j * h(cell_i) (cell = night-median SNR bin x night-median CHI2_CORE class, h estimated night-wide, rank-1) is applied to
-FLUX_APER_1 / FLUXERR_APER_1 of stars with night-median SNR < FZP_SNRCEIL (~100) only; brighter stars are never touched (FZP_MAG = 0) and define the frame zero point; raw flux in FLUX_PSF_RAW, applied correction in FZP_MAG [mag], frame amplitude in FZP_A, per-night table psf_faint_zp.csv.
+FLUX_APER_1 / FLUXERR_APER_1 of stars with night-median SNR < FZP_SNRCEIL (30) only; brighter stars are never touched (FZP_MAG = 0) and define the frame zero point;
+cells whose per-frame scatter the model does not reduce by FZP_GAIN are dropped (weak-bias nights end up uncorrected); raw flux in FLUX_PSF_RAW, applied correction in FZP_MAG [mag], frame amplitude in FZP_A, per-night table psf_faint_zp.csv.
   The <stem>_proc.fits links are relative (../<stem>_proc.fits): the PSF catalogues
 live in <night>/psf/, the images in <night>/.  Exit 0 and a final FINALIZE_OK line on success."""
 import sys, os, glob, pickle, json, time
@@ -15,7 +16,8 @@ import psfphot as P
 FZP_ON = os.environ.get('PSF_FAINTZP', '1') != '0'
 FZP_MINFR = 0.5        # a star enters the fit if it is good (FLAGS & 252 == 0, flux > 0) in >= this fraction of the frames (and >= 5)
 FZP_SNRMIN = 2.0       # ... and has night-median SNR >= this
-FZP_SNRCEIL = 100.0    # stars with night-median SNR >= this (lowered if fewer than 50 fit stars lie above it) are NEVER corrected (FZP_MAG = 0 exactly) and define zp_j
+FZP_SNRCEIL = 30.0     # stars with night-median SNR >= this (lowered if fewer than 50 fit stars lie above it) are NEVER corrected (FZP_MAG = 0 exactly) and define zp_j
+FZP_GAIN = 0.5         # a cell is corrected only if the rank-1 model leaves a per-frame cell-median scatter <= GAIN * the raw scatter (else h = 0 and the fit is redone without it)
 FZP_UQ = (.01, .03, .06, .12, .25, .45, .70)   # candidate SNR-bin edges as star-count quantiles of log10(SNR) below the ceiling
 FZP_DLOG = 0.2         # dex: SNR bins are never wider than this (extra edges on a regular log10(SNR) grid)
 FZP_NV = 3             # chi2 classes (quantiles of the star's night-median CHI2_CORE) inside each SNR bin
@@ -68,13 +70,22 @@ def faint_zp(fx, fe, fg, ch):
         E[:, c] = 1.2533 * 1.4826 * np.nanmedian(np.abs(Yb - med[None, :]), axis=0) / np.sqrt(np.maximum(np.isfinite(Yb).sum(0), 1))
     R = M - zp[:, None]
     Wm = np.where(np.isfinite(R) & np.isfinite(E) & (E > 0), 1.0 / (E ** 2 + FZP_SFLOOR ** 2), 0.0); R = np.where(Wm > 0, R, 0.0)
-    af = R[:, np.argmax((Wm * R * R).sum(0))].copy()
-    for _ in range(FZP_NITER):
-        h = (Wm * af[:, None] * R).sum(0) / np.maximum((Wm * af[:, None] ** 2).sum(0), 1e-30)
-        af = (Wm * h[None, :] * R).sum(1) / np.maximum((Wm * h[None, :] ** 2).sum(1), 1e-30)
-        sc = np.abs(h).max()
-        if not sc > 0: info['status'] = 'no_signal'; cell[:] = -1; return a, sa, used, cell, np.zeros(1), info
-        h /= sc; af *= sc
+    act = np.ones(nc, bool); W0 = Wm
+    for _o in range(6):
+        Wm = W0 * act[None, :]
+        af = R[:, np.argmax((Wm * R * R).sum(0))].copy()
+        for _ in range(FZP_NITER):
+            h = (Wm * af[:, None] * R).sum(0) / np.maximum((Wm * af[:, None] ** 2).sum(0), 1e-30)
+            af = (Wm * h[None, :] * R).sum(1) / np.maximum((Wm * h[None, :] ** 2).sum(1), 1e-30)
+            sc = np.abs(h).max()
+            if not sc > 0: info['status'] = 'no_signal'; cell[:] = -1; return a, sa, used, cell, np.zeros(1), info
+            h /= sc; af *= sc
+        Vv = W0 > 0; nv = np.maximum(Vv.sum(0), 2); Rv = np.where(Vv, R, 0.0); rr = np.where(Vv, R - af[:, None] * h[None, :], 0.0)
+        sraw = np.sqrt(np.maximum((Rv ** 2).sum(0) / nv - (Rv.sum(0) / nv) ** 2, 0.0)); sres = np.sqrt(np.maximum((rr ** 2).sum(0) / nv - (rr.sum(0) / nv) ** 2, 0.0))
+        new = (sres <= FZP_GAIN * sraw) & (np.abs(h) > 0)
+        if (new == act).all(): break
+        act = new
+    h = np.where(act, h, 0.0)
     fr = (Wm > 0).any(1); af = af - np.median(af[fr])
     res = R - af[:, None] * h[None, :]
     sa = np.sqrt(np.maximum((Wm * res ** 2).sum(1) / np.maximum((Wm > 0).sum(1) - 1, 1), 1.0)) / np.sqrt(np.maximum((Wm * h[None, :] ** 2).sum(1), 1e-30))
