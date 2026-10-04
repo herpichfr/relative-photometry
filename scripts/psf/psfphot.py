@@ -4,8 +4,8 @@
 Per source: a (2h+1)^2 stamp is fitted by weighted linear least squares with the PSFEx model of that position
 (cubic B-spline interpolation) rendered at the catalogue position of the primary and of every neighbouring source (master rows +
 per-frame detections not in the master) + a local background plane (3 parameters).  Only the flux of the primary is kept.
-Position handling: a rigid per-frame offset between the PSFEx model frame and the catalogue positions is calibrated on bright
-isolated stars (affine, 3 terms); stars with flux/err > SNR_REF and no neighbour within ISO_REF*FWHM get a linearised
+Position handling: a smooth per-frame shift field between the PSFEx model frame and the catalogue positions is calibrated on bright
+isolated stars (spread over the detector, best-chi2 half, polynomial of degree 1-3 chosen by 5-fold CV); stars with flux/err > SNR_REF and no neighbour within ISO_REF*FWHM get a linearised
 centroid refinement (|shift| <= MAXSHIFT_REF px, else the catalogue position is kept); stamps with a poor core fit get up to
 NPEEL extra sources from the smoothed residual image (companions merged in the master catalogue), fitted jointly with the
 primary.  Pixel weights: ERR plane first, then model-based Poisson variance.  FLAGS bit meaning: see FLAG_DOC.
@@ -193,18 +193,62 @@ class StampFit:
         if bad.any(): self.solve()
         return tot
 
-def _calibrate_shift(psf, sci, err, dq, X, Y, F, flags, iso, hs, ok, interp, nstar=60, affine=True):
-    """Rigid per-frame offset (dx,dy) between the PSFEx model frame and the catalogue positions, from free-shift fits of
-    bright isolated unsaturated stars: the star sits at catalogue position + (dx,dy) w.r.t. the model."""
+CAL_GRID = 10      # shift calibration: stars stratified over a CAL_GRID x CAL_GRID grid of the detector, brightest first in each cell ...
+CAL_NMAX = 400     # ... at most this many candidates in all (cell rank first, so the truncation keeps the sampling even)
+CAL_MAXS = 12.0    # px; fitted free shifts beyond this are dropped
+CAL_NSEED = 40     # the CAL_NSEED candidates nearest the detector centre are searched on a coarse grid over +-6 px around 0, then Nelder-Mead ...
+CAL_KNN = 6        # ... every further one (outwards) on a +-4.5 px grid around the median shift of its CAL_KNN nearest fitted stars (the field grows to the corners)
+CAL_KEEP = 0.5     # fraction of the candidates (lowest chi2 at the best shift) kept: blends / extended objects bias the centroid
+CAL_DEGS = (1, 2, 3)   # polynomial degrees of the shift field tried, chosen by 5-fold CV of the median residual
+CAL_NMIN = (8, 24, 45) # fewest kept stars for each of CAL_DEGS (the higher degrees also need >= 7 of the 3x3 detector cells occupied)
+
+
+def _pbasis(u, v, deg):
+    return np.stack([u ** (t - j) * v ** j for t in range(deg + 1) for j in range(t + 1)], 1)
+
+
+def _shift_eval(sm, xy):
+    """Shift field (n,2) at pixel positions xy (n,2); arguments are clamped to the box of the calibration stars (no extrapolation)."""
+    xy = np.atleast_2d(xy); b = sm['box']; hx, hy = sm['nx'] / 2.0, sm['ny'] / 2.0
+    x = np.clip(xy[:, 0], b[0], b[1]); y = np.clip(xy[:, 1], b[2], b[3])
+    return _pbasis((x - hx) / hx, (y - hy) / hy, sm['deg']) @ sm['coef'].T
+
+
+def _clipfit(B, yv, nit=5, k=3.0):
+    ok = np.ones(len(yv), bool)
+    for _ in range(nit):
+        c = np.linalg.lstsq(B[ok], yv[ok], rcond=None)[0]; r = yv - B @ c
+        sd = 1.4826 * np.median(np.abs(r[ok] - np.median(r[ok]))) + 0.05
+        ok2 = np.abs(r) < k * sd
+        if ok2.sum() < B.shape[1] + 2: break
+        ok = ok2
+    return c, ok, sd
+
+
+def _calibrate_shift(psf, sci, err, dq, X, Y, F, flags, iso, hs, ok, interp, nstar=CAL_NMAX, affine=True):
+    """Smooth per-frame shift field (dx,dy)(x,y) between the PSFEx model frame and the catalogue positions, from free-shift fits of
+    bright isolated unsaturated stars (stratified over the detector, searched from the centre outwards, shifts up to CAL_MAXS px): the star sits at catalogue position +
+    (dx,dy) w.r.t. the model.  The stars with the best fit chi2 (CAL_KEEP) are fitted with a 3-sigma-clipped polynomial in
+    ((x-nx/2)/(nx/2), (y-ny/2)/(ny/2)) of degree 1 (affine) to 3, the degree being chosen by 5-fold CV (a higher degree must lower the
+    median CV residual by > 2%).  Returns (model dict for _shift_eval, n stars fitted, mad, diagnostics dict)."""
     from scipy.optimize import minimize
     ny, nx = sci.shape
+    sm0 = dict(deg=0, coef=np.zeros((2, 1)), box=(-1e9, 1e9, -1e9, 1e9), nx=nx, ny=ny)
     snr = F['SNR'].values; fa = np.nan_to_num(F['FLUX_APER_5'].values, nan=0.0)
     cand = np.nonzero(ok & (snr > 100) & iso & ((flags & (F_SATNL | F_EDGE)) == 0) & ((F['FLAGS'].values & 0xFC) == 0))[0]
+    dg = dict(shift_deg=0, shift_nuse=0, shift_max=0.0)
     if len(cand) < 8:
-        return np.zeros(2), np.zeros((2, 3)), 0, np.nan
-    cand = cand[np.argsort(-fa[cand])][3:3 + nstar]
+        return sm0, 0, np.nan, dg
+    cand = cand[np.argsort(-fa[cand], kind='stable')][3:]
+    cell = np.clip((X[cand] / nx * CAL_GRID).astype(int), 0, CAL_GRID - 1) * CAL_GRID + np.clip((Y[cand] / ny * CAL_GRID).astype(int), 0, CAL_GRID - 1)
+    rank = np.zeros(len(cand), int)
+    for c_ in np.unique(cell):
+        m_ = np.nonzero(cell == c_)[0]; rank[m_] = np.arange(len(m_))
+    cand = cand[np.lexsort((np.arange(len(cand)), rank))][:nstar]       # cell rank first (even sampling), flux order within a rank
     use_b = (interp or INTERP) == 'bspline'
     wf = bspline_w if use_b else cubic_w
+    cand = cand[np.argsort(np.hypot(X[cand] - nx / 2.0, Y[cand] - ny / 2.0), kind='stable')]
+    offs0, offs1 = np.arange(-6.0, 6.1, 1.5), np.arange(-4.5, 4.6, 1.5)
     res = []
     for i in cand:
         xs, ys = X[i], Y[i]; xi, yi = int(round(xs)), int(round(ys))
@@ -224,24 +268,45 @@ def _calibrate_shift(psf, sci, err, dq, X, Y, F, flags, iso, hs, ok, interp, nst
             A = np.concatenate([M.reshape(-1, 1), base], 1) * w[:, None]
             sol = np.linalg.lstsq(A, yw, rcond=None)[0]
             return float(((yw - A @ sol) ** 2).sum())
-        o = minimize(chi, [0.0, 0.0], method='Nelder-Mead', options=dict(xatol=2e-3, fatol=1e-3, maxiter=80))
-        if np.all(np.abs(o.x) < 1.0): res.append((xs, ys, o.x[0], o.x[1]))
+        pc, offs = np.zeros(2), offs0
+        if len(res) >= CAL_NSEED:
+            R_ = np.array(res); pc = np.median(R_[np.argsort(np.hypot(R_[:, 0] - xs, R_[:, 1] - ys), kind='stable')[:CAL_KNN], 2:4], 0); offs = offs1
+        g = np.array([[chi(pc + [a, b]) for b in offs] for a in offs]); ia, ib = np.unravel_index(np.argmin(g), g.shape)
+        p0 = pc + [offs[ia], offs[ib]]
+        o = minimize(chi, p0, method='Nelder-Mead', options=dict(xatol=2e-3, fatol=1e-3, maxiter=120, initial_simplex=np.array([p0, p0 + [0.5, 0.0], p0 + [0.0, 0.5]])))
+        if np.all(np.abs(o.x) < CAL_MAXS): res.append((xs, ys, o.x[0], o.x[1], o.fun))
     if len(res) < 8:
-        return np.zeros(2), np.zeros((2, 3)), len(res), np.nan
-    res = np.array(res)
-    x0, y0 = nx / 2.0, ny / 2.0
-    B = np.c_[np.ones(len(res)), (res[:, 0] - x0) / 1000.0, (res[:, 1] - y0) / 1000.0]
-    coef = np.zeros((2, 3)); mads = []
-    for k in range(2):
-        ok_ = np.ones(len(res), bool)
-        for _ in range(5):
-            c, *_r = np.linalg.lstsq(B[ok_], res[ok_, 2 + k], rcond=None)
-            r = res[:, 2 + k] - B @ c
-            sd = 1.4826 * np.median(np.abs(r[ok_] - np.median(r[ok_]))) + 1e-4
-            ok_ = np.abs(r) < 3 * sd
-        coef[k] = c; mads.append(sd)
-    return coef[:, 0], coef, len(res), float(np.hypot(*mads))
-
+        return sm0, len(res), np.nan, dg
+    res = np.array(res); nres = len(res)
+    sel = res[:, 4] <= np.quantile(res[:, 4], CAL_KEEP)
+    if sel.sum() < 8: sel[:] = True
+    R = res[sel]; n = len(R)
+    hx, hy = nx / 2.0, ny / 2.0
+    u, v = (R[:, 0] - hx) / hx, (R[:, 1] - hy) / hy
+    occ = len(np.unique(np.clip((R[:, 0] / nx * 3).astype(int), 0, 2) * 3 + np.clip((R[:, 1] / ny * 3).astype(int), 0, 2)))
+    degs = [dg_ for dg_, nm in zip(CAL_DEGS, CAL_NMIN) if n >= nm and (dg_ == 1 or occ >= 7)]
+    fold = np.random.RandomState(0).permutation(n) % 5
+    best = None
+    for dgr in degs if len(degs) > 1 else []:
+        B = _pbasis(u, v, dgr); e_ = np.zeros(n)
+        for k_ in range(5):
+            tr = fold != k_
+            cx_, cy_ = [_clipfit(B[tr], R[tr, 2 + a])[0] for a in range(2)]
+            e_[~tr] = np.hypot(R[~tr, 2] - B[~tr] @ cx_, R[~tr, 3] - B[~tr] @ cy_)
+        sc = float(np.median(e_))
+        if best is None or sc < 0.98 * best[0]: best = (sc, dgr)
+    deg = best[1] if best else 1
+    box = (R[:, 0].min(), R[:, 0].max(), R[:, 1].min(), R[:, 1].max())
+    for deg in ((deg, 1) if deg > 1 else (1,)):
+        B = _pbasis(u, v, deg); coef = np.zeros((2, B.shape[1])); mads = []; oks = np.ones(n, bool)
+        for k in range(2):
+            c, ok_, sd = _clipfit(B, R[:, 2 + k]); coef[k] = c; mads.append(sd); oks &= ok_
+        sm = dict(deg=deg, coef=coef, box=box, nx=nx, ny=ny)
+        gxy = np.stack(np.meshgrid(np.linspace(box[0], box[1], 17), np.linspace(box[2], box[3], 17)), -1).reshape(-1, 2)
+        fmax = float(np.abs(_shift_eval(sm, gxy)).max())
+        if fmax < CAL_MAXS + 1.0: break         # a wild field (sparse corners) falls back to the affine one
+    dg = dict(shift_deg=deg, shift_nuse=int(oks.sum()), shift_max=fmax)
+    return sm, nres, float(np.hypot(*mads)), dg
 
 
 def fit_frame(sci_path, fcat_path, dcat_path, psf_path, scale_arcsec, h_override=None, order=0, kmax=30, verbose=False, interp=None,
@@ -273,20 +338,37 @@ def fit_frame(sci_path, fcat_path, dcat_path, psf_path, scale_arcsec, h_override
     r_core = fw          # px
     r_chi = max(3.0, 1.2 * fw)
     margin = 20
-    # neighbours: master rows + unmatched per-frame detections
+    # sources: master rows + extra sources (both WCS-derived: they get the shift) + unmatched per-frame detections (true pixel positions)
     ok = np.isfinite(X) & np.isfinite(Y)
-    tm = cKDTree(np.c_[X[ok], Y[ok]])
+    exy = np.zeros((0, 2)) if extra_xy is None else np.asarray(extra_xy, dtype=float).reshape(-1, 2)
+    wxy = np.vstack([np.c_[X, Y], exy])
+    wtree = cKDTree(np.where(np.isfinite(wxy).all(1)[:, None], wxy, -1e9))
+    xyq = np.where(ok[:, None], wxy[:n], -1e9)
+    iso_cal = wtree.query_ball_point(xyq, hs + 8.0, return_length=True) == 1     # calibration stars: isolated among master rows + extras
+    sigfloor = float(np.nanmedian(err[::50, ::50]))
+    sm = dict(deg=0, coef=np.zeros((2, 1)), box=(-1e9, 1e9, -1e9, 1e9), nx=nx, ny=ny); info['shift_n'] = 0
+    if recal:
+        sm, info['shift_n'], info['shift_mad'], dgn = _calibrate_shift(psf, sci, err, dq, X, Y, F, np.zeros(n, dtype=np.int32), iso_cal, hs, ok, interp)
+        info.update(dgn)
+        if not affine_shift:
+            sm = dict(sm, deg=0, coef=sm['coef'][:, :1])
+    cA = sm['coef']; gg = np.zeros((2, 2))
+    if sm['deg'] >= 1: gg = cA[:, 1:3] * np.array([1000.0 / (nx / 2.0), 1000.0 / (ny / 2.0)])   # linear terms at the detector centre, px per 1000 px
+    info['shift_x'], info['shift_y'] = float(cA[0, 0]), float(cA[1, 0])
+    info['shift_gx'], info['shift_gy'] = float(np.hypot(*gg[0])), float(np.hypot(*gg[1]))
+    if debug is not None: debug['shift_model'] = sm
+    def shift_at(xy):
+        return _shift_eval(sm, xy)
+    wxy = wxy + shift_at(wxy)
     nuis = np.zeros((0, 2))
     if use_det and dcat_path is not None and os.path.exists(dcat_path):
         D = pd.read_csv(dcat_path, usecols=['X_IMAGE', 'Y_IMAGE'])
         dxy = np.c_[D['X_IMAGE'].values - 1.0, D['Y_IMAGE'].values - 1.0]
         dxy = dxy[np.isfinite(dxy).all(1)]   # robo43 detection catalogues can carry all-NaN rows
-        dd, _ = tm.query(dxy)
+        dd, _ = cKDTree(wxy[:n][ok]).query(dxy)    # unmatched = no (shifted) master row within 2.5 px
         nuis = dxy[dd > 2.5]
-    info['nuis_det_xy'] = nuis.copy() if use_det else np.zeros((0, 2))
-    if extra_xy is not None and len(extra_xy):
-        nuis = np.vstack([nuis, np.asarray(extra_xy, dtype=float).reshape(-1, 2)])
-    allxy = np.vstack([np.c_[X, Y], nuis])
+    info['nuis_det_xy'] = nuis - shift_at(nuis) if use_det else np.zeros((0, 2))   # back in WCS pixel space (build_static converts with the frame WCS)
+    allxy = np.vstack([wxy[:n], nuis, wxy[n:]])
     fap = np.zeros(len(allxy)); fap[:n] = np.nan_to_num(F['FLUX_APER_5'].values, nan=0.0)
     allok = np.isfinite(allxy).all(1)
     tree = cKDTree(np.where(allok[:, None], allxy, -1e9))
@@ -294,22 +376,9 @@ def fit_frame(sci_path, fcat_path, dcat_path, psf_path, scale_arcsec, h_override
     xyq = np.where(np.isfinite(allxy[:n]).all(1)[:, None], allxy[:n], -1e9)
     cnt4 = tree.query_ball_point(xyq, r_flag, return_length=True)
     cnt14 = tree.query_ball_point(xyq, 1.4 / scale_arcsec, return_length=True)
-    iso_cal = tree.query_ball_point(xyq, hs + 8.0, return_length=True) == 1
     flags = np.zeros(n, dtype=np.int32)
     flags[cnt4 > 1] |= F_NEIGHBOUR
     flags[cnt14 > 1] |= F_GROUP
-    sigfloor = float(np.nanmedian(err[::50, ::50]))
-    coefA = np.zeros((2, 3)); info['shift_n'] = 0
-    if recal:
-        shift0, coefA, info['shift_n'], info['shift_mad'] = _calibrate_shift(psf, sci, err, dq, X, Y, F, flags, iso_cal, hs, ok, interp)
-        if not affine_shift:
-            coefA = np.zeros((2, 3)); coefA[:, 0] = shift0
-    info['shift_x'], info['shift_y'] = float(coefA[0, 0]), float(coefA[1, 0])
-    info['shift_gx'], info['shift_gy'] = float(np.hypot(coefA[0, 1], coefA[0, 2])), float(np.hypot(coefA[1, 1], coefA[1, 2]))
-    def shift_at(xy):
-        xy = np.atleast_2d(xy)
-        return np.c_[np.ones(len(xy)), (xy[:, 0] - nx / 2.0) / 1000.0, (xy[:, 1] - ny / 2.0) / 1000.0] @ coefA.T
-    allxy = allxy + shift_at(allxy)
     peel_xy = []
     do_peel = PEEL if peel is None else peel
     X = allxy[:n, 0].copy(); Y = allxy[:n, 1].copy()
