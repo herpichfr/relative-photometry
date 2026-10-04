@@ -160,6 +160,10 @@ if __name__ == '__main__':
                 allinfo.append(info)
                 if 'error' in info: print('ERROR pass 1', stem, info['error'], flush=True)
                 print('P1', stem, {k: (round(v, 1) if isinstance(v, float) else v) for k, v in info.items() if k != 'stem'}, flush=True)
+        err1 = sorted(i.get('stem', '?') for i in allinfo if 'error' in i)
+        if err1:
+            print(f'FRAME_ERRORS pass 1 {len(err1)}: {" ".join(err1)}', flush=True)
+            sys.exit(1)
         STATIC = build_static(p1)
     else:
         STATIC = pd.read_csv(f'{W}/static_extras.csv'); print('using existing static_extras.csv', len(STATIC))

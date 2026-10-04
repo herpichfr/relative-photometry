@@ -280,6 +280,7 @@ def fit_frame(sci_path, fcat_path, dcat_path, psf_path, scale_arcsec, h_override
     if use_det and dcat_path is not None and os.path.exists(dcat_path):
         D = pd.read_csv(dcat_path, usecols=['X_IMAGE', 'Y_IMAGE'])
         dxy = np.c_[D['X_IMAGE'].values - 1.0, D['Y_IMAGE'].values - 1.0]
+        dxy = dxy[np.isfinite(dxy).all(1)]   # robo43 detection catalogues can carry all-NaN rows
         dd, _ = tm.query(dxy)
         nuis = dxy[dd > 2.5]
     info['nuis_det_xy'] = nuis.copy() if use_det else np.zeros((0, 2))
