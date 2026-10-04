@@ -1,5 +1,5 @@
 #!/bin/bash
-# redo_all.sh [TEL:NIGHT ...] -- in-place PSF redo (psf_redo.sh) of all 14 nights, strictly one at a time; the two re-fits first, then the re-finalizes.
+# redo_all.sh [TEL:NIGHT ...] -- in-place PSF redo (psf_redo.sh) of all 14 nights, strictly one at a time; the re-fits first, then the re-finalizes.
 # With arguments: only the listed TEL:NIGHT, still in this order and with the mode listed below.
 # Stops at the first failing night.  Per-night logs/markers: /ssdsto1/data/<TEL>_reduced/psf_redo_logs/<NIGHT>.{log,state}
 # (a rerun of this script resumes a failed night; finished nights are skipped step by step).  Log: /ssdsto1/data/psf_redo_all.log
@@ -7,7 +7,7 @@
 set -uo pipefail
 HERE=$(dirname "$(readlink -f "$0")")
 LOG=/ssdsto1/data/psf_redo_all.log
-ALL="T80S:20251107:refit T80S:20251207:refit ROBO43:20250911:refinalize T80S:20251104:refinalize T80S:20251105:refinalize T80S:20251106:refinalize T80S:20251112:refinalize T80S:20251118:refinalize T80S:20251130:refinalize T80S:20251201:refinalize T80S:20251204:refinalize T80S:20251206:refinalize T80S:20251208:refinalize T80S:20251209:refinalize"
+ALL="T80S:20251107:refit T80S:20251207:refit T80S:20251104:refit T80S:20251130:refit T80S:20251206:refit T80S:20251209:refit ROBO43:20250911:refinalize T80S:20251105:refinalize T80S:20251106:refinalize T80S:20251112:refinalize T80S:20251118:refinalize T80S:20251201:refinalize T80S:20251204:refinalize T80S:20251208:refinalize"
 say() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 
 KEYS=
