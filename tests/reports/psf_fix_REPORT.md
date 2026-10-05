@@ -360,8 +360,8 @@ Fraction flagged (flagged / testable):
 - **Deployment**:
   - The reprocess worker was restarted on the new code. It had been running code from 2026-10-04 08:14, so an old worker would
     have cleared the new reasons on any night it re-analysed.
-  - **`relphot db analyze --all --keep-vetted` was not run here** (the production run is left to the user). Expected:
-    `variability=15`, `auto_rejected` 762 > 775.
+  - **Applied** by the user with `relphot db analyze --all --keep-vetted`: 15 events carry the VARIABILITY reason, and
+    `auto_rejected` went 762 > 775.
 
 ## Long-period variables: a slope would not help (not implemented)
 
@@ -385,8 +385,8 @@ The proposal: remove a slope from LPV light curves before the EXOP search, to cu
 - **What the events look like**, for the 24 strongest (`figures/psf_fix/lpv_top24.png`):
   - Mostly abrupt flux steps of 2-30 %, and dips that follow the PSF FWHM.
   - Example: det 93793, a 29 % dip while the seeing is sharpest, correlation with FWHM 0.57.
-  - This points to a bright-star systematic (saturation or non-linearity), not variability.
-- **Candidate follow-up (not measured)**: a bright-star test applying to every star, measured with injections like the dip tests.
+  - This points to a bright-star systematic, not variability. Saturation was later not supported (`bright_false_events_REPORT.md`).
+- **Follow-up, measured in `bright_false_events_REPORT.md`**: a bright-star test applying to every star, measured with injections like the dip tests.
   Either a step model against a box, or the dip's correlation with the frame FWHM.
 
 ## Decisions recorded
@@ -394,7 +394,7 @@ The proposal: remove a slope from LPV light curves before the EXOP search, to cu
 - **The VARIABILITY rule is in; the shape test is information only.**
 - **The variability-subtracted EXOP search** (plan in `PLAN_IMPROVE_DETECT.md`, decisions a-h): deferred by the user on
   2026-10-05.
-- **Bright-star false events**: the step and seeing tests are being measured; the result will go in its own report.
+- **Bright-star false events**: measured, see `bright_false_events_REPORT.md`. No strong rule; saturation is not supported.
 
 ## Where things are
 
@@ -422,6 +422,6 @@ The scratch of this work was deleted after this report: the local `/ssdsto1/data
 - **VARIABILITY rule**:
   - Measured on one snapshot of the DB.
   - Its reason text has not been seen in a browser.
-  - It has not been run on production (`analyze` was left to the user).
+  - Applied on production by the user (15 events, checked in the DB).
 - **The dip tests' no-injection control** is only 15 events.
 - **No web page was clicked in a browser**; the API and the served `app.js` were checked.
