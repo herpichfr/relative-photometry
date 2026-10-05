@@ -72,3 +72,35 @@ The fit scripts alone (environment: `PSF_OUT` required; `PSF_PROD`, `PSF_FORCED`
 PSF_OUT=<dir> python run_night.py <TEL> <night> <nproc> [pass1_step=7] [max_frames]   # ends with RUN_NIGHT_OK
 PSF_OUT=<dir> python finalize.py <TEL> <night> [rel_thr=auto]                          # ends with FINALIZE_OK
 ```
+
+## Redoing a loaded night after a code fix
+
+```
+scripts/psf/psf_redo.sh T80S 20251107 refit         # PSF fit (pass 1 + static extras + pass 2, PSFEx models reused) + finalize
+scripts/psf/psf_redo.sh T80S 20251105 refinalize    # finalize only, from the current psf_work/
+PSF_REDO_OLD=/mnt/sto01/scratch/<name> scripts/psf/psf_redo.sh T80S 20251130 relphot   # relphot chain + DB load only
+scripts/psf/redo_all.sh [TEL:NIGHT ...]             # all nights, one at a time (re-fits first); no tie
+```
+
+- **The night keeps its night_id.**
+- **The superseded `psf/` and `relphot/` are moved, never deleted**, to `${PSF_REDO_OLD:-/mnt/sto01/scratch/psf_v1}/<TEL>/reduced/<night>/`.
+  `relphot` mode requires `PSF_REDO_OLD`.
+- **Logs and markers**: `/ssdsto1/data/<TEL>_reduced/psf_redo_logs/<night>[.relphot].{log,state}`. A rerun resumes after the last
+  finished step.
+- **Provenance**: a line is appended to `psf/PROVENANCE.txt`.
+- **After a redo, `relphot db analyze` must run.** The reload deletes the night's transit fits, and only `analyze` restores them.
+  For a T80S night, `tie_psf.sh` runs it.
+
+## Registration and faint-star zero point
+
+- **Registration** (`psfphot._calibrate_shift`): a smooth per-frame shift field of polynomial degree 1-3, chosen by CV, fitted to
+  bright isolated stars searched from the centre outwards. It is clamped to the calibration stars' box, with an affine fallback.
+  - It is recorded per frame in the raw pickles as `shift_deg`, `shift_nuse` and `shift_max`.
+  - shift_max > 2 px marks a frame with a bad WCS.
+- **Faint-star zero point** (`finalize.py`): `dm_ij = zp_j + a_j h(cell)`, cell = night-median SNR bin x CHI2_CORE class.
+  - **Never corrected**: stars with night-median SNR >= 30, which define zp_j.
+  - **Gain test**: a cell is corrected only if the model halves its per-frame scatter (`FZP_GAIN` 0.5).
+  - **Columns**: `FLUX_PSF_RAW` holds the raw flux, `FZP_MAG` the applied correction in mag, `FZP_A` the frame amplitude.
+  - **Outputs**: per night, `psf_faint_zp.csv` and a `faint_zp` entry in `psf_flag_counts.json`.
+  - **Switch**: `PSF_FAINTZP=0` turns it off.
+  - **Details and validation**: `tests/reports/psf_fix_REPORT.md`.
