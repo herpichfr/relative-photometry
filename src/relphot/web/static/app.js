@@ -1810,6 +1810,7 @@ function plotNightLc(nightId, lc) {
   for (const ev of fitted) traces.push(trapezoidTrace(ev, baseline, yOf));
   const clipTrace = edgeClipTrace(lc, x, yOf, nightEvents);
   if (clipTrace) traces.push(clipTrace);
+  // no trapezoid fit on this night (e.g. not analysed since the night was reloaded): the search detection's box, labelled so it is not mistaken for a fit
   const transit = nightEvents.length ? null : bestTransitForNight(nightId);
   if (transit) {
     const tc = transit.tc_bjd_tdb - 2460000;
@@ -1818,11 +1819,11 @@ function plotNightLc(nightId, lc) {
     const yTop = Math.max(...lc.flux.filter((v) => Number.isFinite(v)));
     shapes.push({
       type: "rect", x0: tc - halfDur, x1: tc + halfDur, y0: yOf(1 - depth), y1: yOf(yTop),
-      line: { color: "rgba(200,30,30,0.6)" }, fillcolor: "rgba(200,30,30,0.08)",
+      line: { color: "rgba(200,30,30,0.6)", dash: "dash" }, fillcolor: "rgba(200,30,30,0.08)",
     });
     annotations.push({
       x: tc, y: 1, yref: "paper", showarrow: false, yanchor: "bottom",
-      text: `T14 ${transit.duration_display || ""}`,
+      text: `search box, no trapezoid fit · T14 ${transit.duration_display || ""}`,
     });
   }
   const yaxis = useMag
