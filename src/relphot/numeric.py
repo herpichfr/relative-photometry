@@ -231,7 +231,11 @@ def fit_noise_floor(
 
     Bins stars by magnitude using equal-count bins. For each bin, computes
     the median of ``log10(sigma)`` over valid members. Bins with fewer than
-    ``min_bin_stars`` members are dropped. Returns a function that
+    ``min_bin_stars`` members are dropped. The bin count is capped at
+    ``max(1, n_valid // min_bin_stars)``, ``n_valid`` being the number of valid
+    entries with finite magnitude, so a small sample (e.g. 45 stars) still gives
+    bins of at least ``min_bin_stars`` stars; the cap is inactive for
+    ``n_valid >= n_bins * min_bin_stars``. Returns a function that
     interpolates the floor at arbitrary magnitudes (constant beyond the ends).
 
     Parameters
@@ -243,7 +247,7 @@ def fit_noise_floor(
     valid : np.ndarray
         Boolean mask of valid entries, same shape as ``mag``.
     n_bins : int
-        Number of bins to attempt.
+        Number of bins to attempt (upper limit, see the cap above).
     min_bin_stars : int
         Minimum number of stars required to keep a bin.
 
@@ -254,7 +258,9 @@ def fit_noise_floor(
         where ``log10_floors`` are the median log10(sigma) in each bin.
         If no bin survives the cut, returns a function giving NaN.
     """
-    edges = quantile_bin_edges(mag[valid], n_bins)
+    n_valid = int(np.count_nonzero(valid & np.isfinite(mag)))
+    n_bins_eff = max(1, min(n_bins, n_valid // max(min_bin_stars, 1)))
+    edges = quantile_bin_edges(mag[valid], n_bins_eff)
     if edges.size <= 1:
         return lambda m: np.full_like(m, np.nan, dtype=np.float64)
 
