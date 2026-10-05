@@ -30,9 +30,10 @@ For each object needing analysis, :func:`analyze` deletes its existing
   the whole night is re-judged from the stored shapes (not only the target objects'), events
   with too many look-alikes on the night (coincidence), whose fit excluded the only data beyond
   their search box on one side (EDGE_OUTLIER), with no depth (NO_DIP) or no measured baseline
-  (NO_BASELINE) get ``detection.auto_status = 'REJECTED'`` and a reason naming every rule that
-  fired (the person's ``status`` is never touched) and the objects whose automatic verdict
-  changed are refreshed;
+  (NO_BASELINE) or whose star's catalogue period explains the dip (VARIABILITY, no period of a
+  planet host is ever used) get ``detection.auto_status = 'REJECTED'`` and a reason naming every
+  rule that fired (the person's ``status`` is never touched) and the objects whose automatic
+  verdict changed are refreshed;
 - once the coincidence check is done, the repeated-event families of
   :mod:`relphot.db.families` for the same objects: every pair of an object's eligible transit
   events (not rejected by the person, not auto-rejected) is scored, mutually linked events form
@@ -131,6 +132,7 @@ class AnalyzeReport:
     n_edge_outlier: int = 0
     n_no_dip: int = 0
     n_no_baseline: int = 0
+    n_variability: int = 0
     #: pairs of eligible transit events scored, and families of repeated events found
     n_repeat_links: int = 0
     n_repeat_families: int = 0
@@ -1792,7 +1794,7 @@ def analyze(
             executor.shutdown(wait=True)
 
     n_coincidence_rejected = n_coincidence_nights = 0
-    n_auto_rejected = n_edge_outlier = n_no_dip = n_no_baseline = 0
+    n_auto_rejected = n_edge_outlier = n_no_dip = n_no_baseline = n_variability = 0
     try:
         night_ids = _coincidence_night_ids(conn, target_ids)
         if night_ids:
@@ -1807,6 +1809,7 @@ def analyze(
             n_edge_outlier = verdict_report.n_edge_outlier
             n_no_dip = verdict_report.n_no_dip
             n_no_baseline = verdict_report.n_no_baseline
+            n_variability = verdict_report.n_variability
             if verdict_report.changed_obj_ids:
                 refresh_objects(
                     conn, verdict_report.changed_obj_ids,
@@ -1839,6 +1842,6 @@ def analyze(
         n_transit_shapes=n_shapes, n_transit_matches=n_matches, n_period_estimates=n_estimates,
         n_coincidence_rejected=n_coincidence_rejected, n_coincidence_nights=n_coincidence_nights,
         n_auto_rejected=n_auto_rejected, n_edge_outlier=n_edge_outlier, n_no_dip=n_no_dip,
-        n_no_baseline=n_no_baseline,
+        n_no_baseline=n_no_baseline, n_variability=n_variability,
         n_repeat_links=n_repeat_links, n_repeat_families=n_repeat_families,
     )

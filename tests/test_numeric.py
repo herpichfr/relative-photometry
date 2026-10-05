@@ -202,6 +202,49 @@ def test_fit_noise_floor_no_bins() -> None:
     assert np.isnan(result[0])
 
 
+def test_fit_noise_floor_small_sample_caps_bins() -> None:
+    """45 valid stars, n_bins=20, min_bin_stars=5: bins capped to 9, the floor is finite."""
+    mag = np.linspace(10.0, 18.0, 45)
+    sigma = 1e-3 * 10.0 ** (0.2 * (mag - 15.0))
+    floor_func = fit_noise_floor(mag, sigma, np.ones(45, dtype=bool), n_bins=20, min_bin_stars=5)
+    test_mags = np.array([11.0, 13.0, 15.0, 17.0])
+    expected = 1e-3 * 10.0 ** (0.2 * (test_mags - 15.0))
+    assert np.all(np.abs(floor_func(test_mags) - expected) / expected < 0.1)
+
+
+def test_fit_noise_floor_cap_inactive_for_large_sample() -> None:
+    """For n_valid >= n_bins * min_bin_stars the floor equals the explicit-edge (uncapped) fit."""
+    rng = np.random.default_rng(seed=7)
+    mag = rng.uniform(10.0, 20.0, 200)
+    sigma = 1e-3 * 10.0 ** (0.2 * (mag - 15.0)) * (1 + 0.1 * rng.standard_normal(200))
+    valid = np.ones(200, dtype=bool)
+    valid[::10] = False  # 180 valid >= 8 * 10
+    floor_func = fit_noise_floor(mag, sigma, valid, n_bins=8, min_bin_stars=10)
+    edges = quantile_bin_edges(mag[valid], 8)
+    centres, floors = [], []
+    for i in range(len(edges) - 1):
+        hi = (mag <= edges[i + 1]) if i == len(edges) - 2 else (mag < edges[i + 1])
+        in_bin = valid & (mag >= edges[i]) & hi
+        centres.append((edges[i] + edges[i + 1]) / 2.0)
+        floors.append(nanmedian_quiet(np.log10(sigma[in_bin])))
+    test_mags = np.linspace(9.0, 21.0, 25)
+    expected = 10.0 ** np.interp(test_mags, centres, floors)
+    np.testing.assert_array_equal(floor_func(test_mags), expected)
+
+
+def test_fit_noise_floor_fewer_valid_than_min_bin_stars() -> None:
+    """4 valid stars with min_bin_stars=5 give NaN; 5 valid stars give a finite floor."""
+    mag = np.linspace(10.0, 18.0, 50)
+    sigma = np.full_like(mag, 1e-3)
+    valid = np.zeros(50, dtype=bool)
+    valid[:4] = True
+    m = np.array([10.5])
+    assert np.isnan(fit_noise_floor(mag, sigma, valid, n_bins=20, min_bin_stars=5)(m)[0])
+    valid[4] = True
+    floor_func = fit_noise_floor(mag, sigma, valid, n_bins=20, min_bin_stars=5)
+    np.testing.assert_allclose(floor_func(m), 1e-3)
+
+
 def test_unit_vectors_basic() -> None:
     """Unit vectors have magnitude 1."""
     ra = np.array([0.0, 90.0, 180.0])
