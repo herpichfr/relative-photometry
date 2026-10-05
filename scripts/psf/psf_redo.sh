@@ -2,10 +2,14 @@
 # psf_redo.sh TEL NIGHT MODE -- regenerate the PSF products of one night IN PLACE after a code fix, rerun relphot and reload the night into the DB.
 # MODE = refit        re-run the PSF fit (pass 1 + static extras + pass 2; the PSFEx models are reused) and finalize  (registration fix)
 #      = refinalize   reuse psf_work/ of the current PSF products, re-run finalize only                                (faint-star zero-point fix)
+#      = relphot      keep the PSF products in place ($PERM/psf), re-run only the relphot chain and reload the DB    (relphot code fix)
 #
 # Steps (a marker word per finished step goes to $STATE; a rerun skips finished steps, so a failed night can be resumed):
-#   pre -> FIT -> STAGE_WORK -> FINALIZE -> SWAP_PSF -> RELPHOT -> SWAP_RELPHOT -> DB_LOAD -> CLEAN
-# FIT runs in refit mode only, STAGE_WORK in refinalize mode only; the step that does not apply to the MODE logs that and still writes its marker.
+#   pre -> FIT -> STAGE_WORK -> FINALIZE -> SWAP_PSF -> RELPHOT -> SWAP_RELPHOT -> DB_LOAD -> [PROVENANCE] -> CLEAN
+# FIT runs in refit mode only, STAGE_WORK in refinalize mode only, FINALIZE and SWAP_PSF not in relphot mode; the step that does not apply to the MODE logs that and still writes its marker.
+# relphot mode: the PSF products in $PERM/psf are the input and stay untouched (NF = their forced catalogues); own files $LOGD/$NIGHT.relphot.{log,state,mem.log,nf,nid}
+#   (the $NIGHT.state of the PSF redo already holds every marker); log copied to $PERM/relphot/psf_redo_relphot.log (psf_redo.log stays); PROVENANCE appends one line to
+#   $PERM/psf/PROVENANCE.txt; PSF_REDO_OLD is required.  relphot runs from the PYTHONPATH in effect (pre logs the module path): export PYTHONPATH=<worktree>/src for an unreleased fix.
 # Fit inputs: images in $PERM, forced + detection catalogues in the scratch tree $SCRA (forced/*_proc_forced_catalog.csv, forced_reference.csv, *_proc_catalog.csv).
 # Fit/finalize/relphot run on the SSD staging dir $STG.  SWAP_PSF / SWAP_RELPHOT MOVE (never delete) the superseded PSF v1 products
 # $PERM/psf and $PERM/relphot to $OLD/psf and $OLD/relphot, then rsync the new ones from $STG into place with deploy/relocate_reduced.sh --sync
@@ -16,7 +20,7 @@
 # Exit 0 only after NIGHT_DONE; any failure logs "NIGHT_FAIL TEL NIGHT step" and exits 1.  The only thing ever deleted is $STG (and $STG/relphot) on the SSD.
 set -uo pipefail
 
-[ $# -eq 3 ] || { echo "usage: $0 TEL NIGHT MODE   (MODE = refit | refinalize)" >&2; exit 2; }
+[ $# -eq 3 ] || { echo "usage: $0 TEL NIGHT MODE   (MODE = refit | refinalize | relphot)" >&2; exit 2; }
 TEL=$1; NIGHT=$2; MODE=$3
 REPO=/home/herpich/Dropbox/relative-photometry
 CODE=$(dirname "$(readlink -f "$0")")          # = $REPO/scripts/psf
@@ -26,15 +30,19 @@ case $TEL in
   *) echo "unknown telescope $TEL (T80S or ROBO43)" >&2; exit 2 ;;
 esac
 case $MODE in
-  refit|refinalize) ;;
-  *) echo "unknown mode $MODE (refit or refinalize)" >&2; exit 2 ;;
+  refit|refinalize|relphot) ;;
+  *) echo "unknown mode $MODE (refit, refinalize or relphot)" >&2; exit 2 ;;
 esac
+if [ "$MODE" = relphot ] && [ -z "${PSF_REDO_OLD:-}" ]; then
+  echo "relphot mode needs PSF_REDO_OLD (root of the superseded relphot dir, e.g. /mnt/sto01/scratch/psf_v4_prebincap)" >&2; exit 2
+fi
 PERM=/mnt/sto01/$TEL/reduced/$NIGHT
 STG=/ssdsto1/data/${TEL}_reduced/$NIGHT
 SCRA=/mnt/sto01/scratch/aperture/$TEL/reduced/$NIGHT
 OLD=${PSF_REDO_OLD:-/mnt/sto01/scratch/psf_v1}/$TEL/reduced/$NIGHT      # superseded products are moved here (PSF_REDO_OLD overrides the root for a later redo pass)
 LOGD=/ssdsto1/data/${TEL}_reduced/psf_redo_logs        # outside the staged tree (logging inside it broke the size verification of earlier pipelines)
-LOG=$LOGD/$NIGHT.log; STATE=$LOGD/$NIGHT.state; MEMLOG=$LOGD/$NIGHT.mem.log; NFF=$LOGD/$NIGHT.nf; NIDF=$LOGD/$NIGHT.nid
+SFX=; [ "$MODE" = relphot ] && SFX=.relphot            # relphot mode: own log/markers, the $NIGHT.state of the PSF redo already holds every marker
+LOG=$LOGD/$NIGHT$SFX.log; STATE=$LOGD/$NIGHT$SFX.state; MEMLOG=$LOGD/$NIGHT$SFX.mem.log; NFF=$LOGD/$NIGHT$SFX.nf; NIDF=$LOGD/$NIGHT$SFX.nid
 export TMPDIR=/ssdsto1/data/mnt OMP_NUM_THREADS=2      # relphot steps; the fit/finalize commands set OMP_NUM_THREADS=1 explicitly
 mkdir -p "$LOGD" || exit 1
 exec 9> "$LOGD/$NIGHT.lock"
@@ -91,9 +99,23 @@ db_nid() {
   podman exec -i relphotdb-db psql -U postgres -At relphot -c "SELECT night_id FROM relphot.night WHERE source_dir = '$PERM/relphot'"
 }
 
-step_pre() {
-  [ -d "$PERM" ] || { log "$PERM does not exist"; return 1; }
-  local nscra nf nraw nid
+# relphot mode: the PSF products in place are the only input; NF = their forced catalogues (each needs a resolving proc.fits link)
+pre_nf_relphot() {
+  local nf nl l
+  [ -f "$PERM/psf/PROVENANCE.txt" ] || { log "$PERM/psf/PROVENANCE.txt missing (no PSF products)"; return 1; }
+  nf=$(ls "$PERM"/psf/*_proc_forced_catalog.csv 2>/dev/null | wc -l)
+  [ "$nf" -gt 0 ] || { log "no forced catalogues in $PERM/psf"; return 1; }
+  nl=0
+  for l in "$PERM"/psf/*_proc.fits; do [ -e "$l" ] && nl=$((nl + 1)); done
+  [ "$nl" -eq "$nf" ] || { log "resolving proc.fits links in $PERM/psf: $nl != forced catalogues $nf"; return 1; }
+  if [ -f "$NFF" ] && [ "$(cat "$NFF")" != "$nf" ]; then log "frame count changed: $(cat "$NFF") -> $nf"; return 1; fi
+  echo "$nf" > "$NFF"
+  log "relphot module: $(python -c 'import relphot; print(relphot.__file__)' 2>&1 | tail -n 1)"
+}
+
+# refit / refinalize: frame counts of the scratch tree and of the PSF products in place
+pre_nf_psf() {
+  local nscra nf nraw
   nscra=$(ls "$SCRA"/forced/*_proc_forced_catalog.csv 2>/dev/null | wc -l)
   [ "$nscra" -gt 0 ] || { log "no forced catalogues in $SCRA/forced"; return 1; }
   [ -s "$SCRA/forced/forced_reference.csv" ] || { log "$SCRA/forced/forced_reference.csv missing"; return 1; }
@@ -109,10 +131,16 @@ step_pre() {
     if [ -f "$NFF" ] && [ "$(cat "$NFF")" != "$nf" ]; then log "frame count changed: $(cat "$NFF") -> $nf"; return 1; fi
     echo "$nf" > "$NFF"
   fi
+}
+
+step_pre() {
+  local nid
+  [ -d "$PERM" ] || { log "$PERM does not exist"; return 1; }
+  if [ "$MODE" = relphot ]; then pre_nf_relphot || return 1; else pre_nf_psf || return 1; fi
   if ! has_marker SWAP_RELPHOT_MV; then
     [ -f "$PERM/relphot/lc/$STEM.npz" ] || { log "$PERM/relphot/lc/$STEM.npz missing (night not loaded?)"; return 1; }
   fi
-  if exists "$OLD/psf" && ! has_marker SWAP_PSF_MV; then log "$OLD/psf already exists"; return 1; fi
+  if [ "$MODE" != relphot ] && exists "$OLD/psf" && ! has_marker SWAP_PSF_MV; then log "$OLD/psf already exists"; return 1; fi
   if exists "$OLD/relphot" && ! has_marker SWAP_RELPHOT_MV; then log "$OLD/relphot already exists"; return 1; fi
   if [ -s "$NIDF" ]; then
     nid=$(cat "$NIDF")
@@ -125,6 +153,7 @@ step_pre() {
 }
 
 step_fit() {
+  if [ "$MODE" = relphot ]; then log "FIT not needed in relphot mode"; return 0; fi
   if [ "$MODE" != refit ]; then log "FIT not needed in $MODE mode (psf_work of $PERM/psf is reused)"; return 0; fi
   mkdir -p "$STG/psf/psf_work/psfex" "$STG/psf/psf_work/log" || return 1
   # reuse the PSFEx models; pass 1, static extras and pass 2 are redone (no pass1/ or static_extras.csv is copied)
@@ -156,6 +185,7 @@ step_stage_work() {
 }
 
 step_finalize() {
+  if [ "$MODE" = relphot ]; then log "FINALIZE not needed in relphot mode"; return 0; fi
   mkdir -p "$STG/psf/psf_work/log" || return 1
   OMP_NUM_THREADS=1 PSF_PROD=$PERM PSF_OUT=$STG/psf PSF_FORCED=$SCRA/forced python "$CODE/finalize.py" "$TEL" "$NIGHT" \
     > "$STG/psf/psf_work/log/finalize.log" 2>&1
@@ -184,6 +214,7 @@ step_finalize() {
 }
 
 step_swap_psf() {
+  if [ "$MODE" = relphot ]; then log "SWAP_PSF not needed in relphot mode ($PERM/psf stays in place)"; return 0; fi
   if ! has_marker SWAP_PSF_MV; then
     [ -d "$PERM/psf" ] || { log "$PERM/psf does not exist"; return 1; }
     exists "$OLD/psf" && { log "$OLD/psf already exists"; return 1; }
@@ -253,6 +284,10 @@ step_db_load() {
   log "DB night_id $nid unchanged"
 }
 
+step_provenance() {
+  echo "$(date '+%F %T') git HEAD $(git -C "$CODE" rev-parse HEAD): relphot re-run, supersedes $OLD/relphot" >> "$PERM/psf/PROVENANCE.txt"
+}
+
 step_clean() {
   local m
   cd / || return 1
@@ -274,6 +309,11 @@ step SWAP_PSF      step_swap_psf
 step RELPHOT       step_relphot
 step SWAP_RELPHOT  step_swap_relphot
 step DB_LOAD       step_db_load
+if [ "$MODE" = relphot ]; then step PROVENANCE step_provenance; fi
 step CLEAN         step_clean
 log "NIGHT_DONE $TEL $NIGHT"
-cp "$LOG" "$PERM/psf/psf_redo.log"
+if [ "$MODE" = relphot ]; then
+  cp "$LOG" "$PERM/relphot/psf_redo_relphot.log"       # psf_redo.log of the PSF redo stays untouched
+else
+  cp "$LOG" "$PERM/psf/psf_redo.log"
+fi
