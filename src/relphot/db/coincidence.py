@@ -1,10 +1,12 @@
 """Automatic verdicts on one night's transit events (``relphot db analyze``).
 
-Two kinds of rule write ``detection.auto_status = 'REJECTED'`` and ``auto_reason`` in ONE per-night
-pass, :func:`update_auto_verdicts`, which unions the reasons of every rule that fires: the
-cross-candidate (coincidence) veto below and the shape rules of :func:`shape_reasons`
-(``EDGE_OUTLIER``, ``NO_DIP``, ``NO_BASELINE``, read from the ``transit_shape`` row). A person's
-``status`` always wins (:func:`relphot.web.app._effective_status`).
+Three kinds of rule write ``detection.auto_status = 'REJECTED'`` and ``auto_reason`` in ONE
+per-night pass, :func:`update_auto_verdicts`, which unions the reasons of every rule that fires:
+the cross-candidate (coincidence) veto below, the shape rules of :func:`shape_reasons`
+(``EDGE_OUTLIER``, ``NO_DIP``, ``NO_BASELINE``, read from the ``transit_shape`` row) and the
+catalogue-period rule of :func:`variability_reasons` (``VARIABILITY``, read from the object's
+catalogue period and light curves). A person's ``status`` always wins
+(:func:`relphot.web.app._effective_status`).
 
 The coincidence veto, see docs/DB_PLAN.md ("Coincident events"). One planet cannot transit two
 stars at once, so an event whose trapezoid fit (``relphot.transit_shape``) has many look-alikes
@@ -37,10 +39,19 @@ rules, writes the unioned verdict of the night's transit detections (only rows w
 differs, clearing a reason exactly when its rule no longer fires) and reports the objects whose
 automatic verdict changed (their flags need a refresh). Only converged shapes of the search's
 own per-night transit detections (``origin = 'search'``) are judged or counted by the coincidence
-rule, and only those detections are judged by the shape rules; a user-origin detection is
-neither. With ``skip_det_ids`` (the events a person has vetted, :mod:`relphot.db.vetted`) those
-events are still counted as look-alikes of the others but their own verdict and
+rule, and only those detections are judged by the shape rules and ``VARIABILITY``; a
+user-origin detection is none of these. With ``skip_det_ids`` (the events a person has vetted,
+:mod:`relphot.db.vetted`) those events are still counted as look-alikes of the others (and as
+other events of their object for ``VARIABILITY``) but their own verdict and
 ``transit_coincidence`` row are left exactly as stored. It does not commit.
+
+``VARIABILITY`` (:mod:`relphot.dip_variability`) rejects a search event whose star's CATALOGUE
+period explains the dip: the object has a ``catalog_match`` row that is not a planet catalogue
+(:data:`relphot.objflags.PLANET_CATALOGS`) with ``period > 0`` and no planet-catalogue row at all
+(a known host's period is a transit period, so a repeat would confirm it). The period is that of
+the eligible row nearest on the sky, used as catalogued. The event's night is predicted from the
+object's other nights folded at that period (``auto_var_phase_*``), or other search events of the
+object repeat at multiples of it (``auto_var_repeat_p_max``); either fires the rule.
 """
 
 from __future__ import annotations
@@ -56,6 +67,8 @@ import psycopg
 from scipy.stats import binom
 
 from relphot.config import DbSettings
+from relphot.dip_variability import VariabilityVerdict, variability_verdict
+from relphot.objflags import PLANET_CATALOGS
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +79,7 @@ __all__ = [
     "shape_reasons",
     "update_auto_verdicts",
     "update_coincidence",
+    "variability_reasons",
 ]
 
 #: Rows of the pairwise matrices computed at a time (bounds the memory of a large night).
@@ -230,6 +244,7 @@ class CoincidenceReport:
     n_edge_outlier: int = 0
     n_no_dip: int = 0
     n_no_baseline: int = 0
+    n_variability: int = 0
     #: objects with an event whose automatic verdict (rejected or not) changed
     changed_obj_ids: list[int] = field(default_factory=list)
 
@@ -257,7 +272,38 @@ _INSERT_SQL = """
 """
 
 #: the rules of the verdict pass, in the order their reasons are written
-_RULE_ORDER = ("COINCIDENCE", "EDGE_OUTLIER", "NO_DIP", "NO_BASELINE")
+_RULE_ORDER = ("COINCIDENCE", "EDGE_OUTLIER", "NO_DIP", "NO_BASELINE", "VARIABILITY")
+
+#: the search events of one night that ``VARIABILITY`` may judge (the detection's own tc and
+#: duration, not the trapezoid fit)
+_VARIABILITY_EVENTS_SQL = """
+    SELECT det_id, obj_id, tc_bjd_tdb, duration_h FROM relphot.detection
+    WHERE night_id = %s AND kind = 'transit' AND origin = 'search'
+      AND tc_bjd_tdb IS NOT NULL AND duration_h IS NOT NULL
+    ORDER BY det_id
+"""
+
+_CATALOG_SQL = """
+    SELECT obj_id, catalog, name, type, period, period_err, sep_arcsec
+    FROM relphot.catalog_match WHERE obj_id = ANY(%s)
+"""
+
+#: every night's light curve of the objects, one row per (object, night)
+_LC_SQL = """
+    SELECT obj_id, night_id, bjd_tdb, flux, flux_err FROM relphot.lightcurve
+    WHERE obj_id = ANY(%s) ORDER BY obj_id, night_id
+"""
+
+#: every search event of the objects, on any night (whatever its status or supersede link)
+_OTHER_EVENTS_SQL = """
+    SELECT det_id, obj_id, night_id, tc_bjd_tdb, duration_h FROM relphot.detection
+    WHERE obj_id = ANY(%s) AND kind = 'transit' AND origin = 'search'
+      AND tc_bjd_tdb IS NOT NULL AND duration_h IS NOT NULL
+    ORDER BY det_id
+"""
+
+#: the catalogued type of an exoplanet transit (VSX): its period is a transit period
+_PLANET_TYPE = "EP"
 
 
 def _short_p(p: float) -> str:
@@ -273,6 +319,111 @@ def _reason(n_similar: int, window_days: float, n_expected: float, p_chance: flo
         f"±{window_days * 1440.0:.0f} min with similar depth and T14 "
         f"(expected {n_expected:.1f} by chance, p={_short_p(p_chance)})"
     )
+
+
+def _variability_period(rows: Sequence[tuple]) -> tuple[float, float | None, str] | None:
+    """``(period, period_err, catalog)`` of one object's catalogue period, or ``None``.
+
+    ``rows`` are its ``catalog_match`` rows ``(catalog, name, type, period, period_err,
+    sep_arcsec)``. An object with a planet-catalogue row (:data:`PLANET_CATALOGS`) has none; else
+    the eligible row (``period > 0``, not a type marking an exoplanet transit: VSX ``EP``, matched
+    as a token of the ``|`` / ``,``-separated type) nearest on the sky (NULL separation last)
+    gives it.
+    """
+    if any(row[0] in PLANET_CATALOGS for row in rows):
+        return None
+    eligible = [
+        row for row in rows
+        if row[3] is not None and math.isfinite(row[3]) and row[3] > 0
+        and _PLANET_TYPE not in {tok.strip().upper() for tok in re.split(r"[|,]", row[2] or "")}
+    ]
+    if not eligible:
+        return None
+    catalog, _name, _type, period, period_err, _sep = min(
+        eligible, key=lambda row: (row[5] is None, row[5] or 0.0, row[0], row[1])
+    )
+    return float(period), (float(period_err) if period_err else None), catalog
+
+
+def _variability_reason(period: float, catalog: str, verdict: VariabilityVerdict) -> str:
+    """The reason of a fired ``VARIABILITY``, naming the test(s) that fired with their numbers."""
+    which = f"P={period:.4f} d ({catalog})"
+    phase = (
+        f"predicts this dip from {verdict.n_nights} other night"
+        f"{'s' if verdict.n_nights != 1 else ''} folded (predicted/observed depth "
+        f"{verdict.ratio:.2f}, phase coverage {verdict.cov * 100.0:.0f} %)"
+    )
+    repeat = (
+        f"{verdict.n_match} other event{'s' if verdict.n_match != 1 else ''} at n*P "
+        f"(or odd n*P/2), chance p={_short_p(verdict.p_tail)}"
+    )
+    if verdict.phase and verdict.repeat:
+        return (
+            f"variability: the catalogue period {which} {phase} and the dip repeats at "
+            f"multiples of it: {repeat}"
+        )
+    if verdict.phase:
+        return f"variability: the catalogue period {which} {phase}"
+    return f"variability: the dip repeats at multiples of the catalogue period {which}: {repeat}"
+
+
+def variability_reasons(
+    cur: psycopg.Cursor,
+    night_id: int,
+    skip: Collection[int] = (),
+    settings: DbSettings | None = None,
+) -> dict[int, str]:
+    """The ``VARIABILITY`` rule on one night: ``{det_id: reason}`` of the events it rejects.
+
+    Reads only. Judges every search transit detection of the night (not in ``skip``, with a
+    ``tc_bjd_tdb`` and ``duration_h``) of an object with a catalogue period
+    (:func:`_variability_period`) and a light curve on the night, with
+    :func:`relphot.dip_variability.variability_verdict`: the other nights are the object's other
+    light curves, the other events its search events on other nights. One query each for the
+    catalogue rows, light curves and events of all the night's eligible objects.
+    """
+    s = settings if settings is not None else DbSettings()
+    skip_ids = {int(i) for i in skip}
+    cur.execute(_VARIABILITY_EVENTS_SQL, (night_id,))
+    events = [row for row in cur.fetchall() if row[0] not in skip_ids]
+    if not events:
+        return {}
+
+    cur.execute(_CATALOG_SQL, ([int(o) for o in {e[1] for e in events}],))
+    rows: dict[int, list[tuple]] = {}
+    for obj_id, catalog, name, type_, period, period_err, sep in cur.fetchall():
+        rows.setdefault(obj_id, []).append((catalog, name, type_, period, period_err, sep))
+    periods = {obj_id: _variability_period(r) for obj_id, r in rows.items()}
+    events = [e for e in events if periods.get(e[1]) is not None]
+    if not events:
+        return {}
+
+    obj_ids = sorted({int(e[1]) for e in events})
+    cur.execute(_LC_SQL, (obj_ids,))
+    lcs: dict[int, dict[int, tuple]] = {}
+    for obj_id, lc_night, bjd, flux, flux_err in cur.fetchall():
+        lcs.setdefault(obj_id, {})[lc_night] = (bjd, flux, flux_err)
+    cur.execute(_OTHER_EVENTS_SQL, (obj_ids,))
+    object_events: dict[int, list[tuple]] = {}
+    for det_id, obj_id, ev_night, tc, duration in cur.fetchall():
+        object_events.setdefault(obj_id, []).append((det_id, ev_night, tc, duration))
+
+    reasons: dict[int, str] = {}
+    for det_id, obj_id, tc, duration in events:
+        night_lcs = lcs.get(obj_id, {})
+        if night_id not in night_lcs:
+            continue
+        period, period_err, catalog = periods[obj_id]
+        others = [ev for ev in object_events.get(obj_id, []) if ev[1] != night_id]
+        verdict = variability_verdict(
+            night_lcs[night_id],
+            [lc for other_night, lc in sorted(night_lcs.items()) if other_night != night_id],
+            tc, duration, [ev[2] for ev in others], [ev[3] for ev in others],
+            period, period_err, s,
+        )
+        if verdict.fired:
+            reasons[det_id] = _variability_reason(period, catalog, verdict)
+    return reasons
 
 
 def shape_reasons(
@@ -331,16 +482,17 @@ def update_auto_verdicts(
     """Re-evaluate every night in ``night_ids`` from its stored transit shapes (module docstring).
 
     Per night: the ``transit_coincidence`` rows are deleted and inserted afresh and every rule
-    (coincidence, then :func:`shape_reasons`) is evaluated; an event rejected by one or more rules
-    gets ``auto_status = 'REJECTED'`` and ``auto_reason`` = the reasons of all the rules that fire,
-    joined by ``"; "``. The verdict is computed from scratch from the stored shapes each time and
-    only the rows whose ``auto_status`` / ``auto_reason`` differ are written, so a re-run is
-    idempotent and a reason disappears exactly when its rule no longer fires (a transit
-    detection no rule rejects is cleared). A person's ``status`` is never touched. Events in
-    ``skip_det_ids`` keep their stored verdict and coincidence row (module docstring). The whole
-    night is judged, whichever objects were just analysed. Returns the report with
-    ``changed_obj_ids`` (sorted): the objects that have an event whose automatic verdict
-    (rejected or not) changed, whose flags the caller must refresh. Does not commit.
+    (coincidence, then :func:`shape_reasons`, then :func:`variability_reasons`) is evaluated; an
+    event rejected by one or more rules gets ``auto_status = 'REJECTED'`` and ``auto_reason`` =
+    the reasons of all the rules that fire, joined by ``"; "``. The verdict is computed from
+    scratch from the stored shapes (and light curves) each time and only the rows whose
+    ``auto_status`` / ``auto_reason`` differ are written, so a re-run is idempotent and a reason
+    disappears exactly when its rule no longer fires (a transit detection no rule rejects is
+    cleared). A person's ``status`` is never touched. Events in ``skip_det_ids`` keep their stored
+    verdict and coincidence row (module docstring). The whole night is judged, whichever objects
+    were just analysed. Returns the report with ``changed_obj_ids`` (sorted): the objects that
+    have an event whose automatic verdict (rejected or not) changed, whose flags the caller must
+    refresh. Does not commit.
     """
     s = settings if settings is not None else DbSettings()
     report = CoincidenceReport()
@@ -417,6 +569,8 @@ def update_auto_verdicts(
                 ).items():
                     fired[rule][det_id] = why
 
+            fired["VARIABILITY"] = variability_reasons(cur, night_id, skip, s)
+
             desired: dict[int, str] = {}
             for rule in _RULE_ORDER:
                 for det_id, why in fired[rule].items():
@@ -452,13 +606,15 @@ def update_auto_verdicts(
             report.n_edge_outlier += len(fired["EDGE_OUTLIER"])
             report.n_no_dip += len(fired["NO_DIP"])
             report.n_no_baseline += len(fired["NO_BASELINE"])
+            report.n_variability += len(fired["VARIABILITY"])
 
     report.changed_obj_ids = sorted(changed)
     logger.info(
         "auto verdicts: %d nights, %d events judged, %d auto-rejected (coincidence %d, "
-        "edge outlier %d, no dip %d, no baseline %d), %d objects changed",
+        "edge outlier %d, no dip %d, no baseline %d, variability %d), %d objects changed",
         report.n_nights, report.n_events, report.n_rejected, report.n_coincidence,
-        report.n_edge_outlier, report.n_no_dip, report.n_no_baseline, len(report.changed_obj_ids),
+        report.n_edge_outlier, report.n_no_dip, report.n_no_baseline, report.n_variability,
+        len(report.changed_obj_ids),
     )
     return report
 

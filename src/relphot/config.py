@@ -516,6 +516,18 @@ class DbSettings:
     #: edge outlier excluded from the fit that was the only data beyond the search box on its side.)
     auto_nobaseline_min_epochs: int = 5
     auto_nobaseline_min_depth: float = 0.2
+    #: VARIABILITY (:mod:`relphot.dip_variability`), the fourth automatic rule: a search event of a
+    #: star with a CATALOGUE period (and no planet-catalogue row: a known planet host is never
+    #: judged) is rejected when that period explains the dip. Phase test: the star's other nights
+    #: folded at the period cover at least ``auto_var_phase_cov_min`` of the epochs inside the
+    #: event window, predict at least ``auto_var_phase_ratio_min`` of the observed depth and
+    #: beat a flat baseline in the window ...
+    auto_var_phase_cov_min: float = 0.8
+    auto_var_phase_ratio_min: float = 0.7
+    #: ... or repeat test: other search events of the star on other nights fall at multiples of
+    #: the period (or odd multiples of half of it) from this one and the probability of that many
+    #: matches by chance is at most ``auto_var_repeat_p_max``.
+    auto_var_repeat_p_max: float = 0.01
     #: Repeated transit events of one object (``relphot db analyze``, :mod:`relphot.db.families`):
     #: two eligible events are linked when both the depth / T14 / ingress match probability and the
     #: probability of a common trapezoid (joint refit of their light curves) are at least this.
@@ -599,6 +611,18 @@ class DbSettings:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             msg = f"db.auto_nobaseline_min_epochs must be an integer >= 1, got {value!r}"
             raise ConfigError(msg)
+        for name in ("auto_var_phase_cov_min", "auto_var_phase_ratio_min", "auto_var_repeat_p_max"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool) or not isinstance(value, int | float)
+                or not (math.isfinite(value) and value > 0)
+            ):
+                msg = f"db.{name} must be a positive number, got {value!r}"
+                raise ConfigError(msg)
+        for name in ("auto_var_phase_cov_min", "auto_var_repeat_p_max"):
+            if getattr(self, name) > 1:
+                msg = f"db.{name} must be in (0, 1], got {getattr(self, name)!r}"
+                raise ConfigError(msg)
         for name in (
             "repeat_p_min", "repeat_rho_max_cgs", "repeat_veto_dchi2",
             "repeat_n_sigma_window", "repeat_tc_err_floor_days",

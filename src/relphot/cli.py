@@ -1769,6 +1769,7 @@ def _run_db_analyze(args: argparse.Namespace) -> int:
         f"coincidence_nights={report.n_coincidence_nights} "
         f"auto_rejected={report.n_auto_rejected} edge_outlier={report.n_edge_outlier} "
         f"no_dip={report.n_no_dip} no_baseline={report.n_no_baseline} "
+        f"variability={report.n_variability} "
         f"repeat_links={report.n_repeat_links} repeat_families={report.n_repeat_families} "
         f"coarsened={report.n_coarsened} elapsed={report.elapsed_s:.1f}s"
     )

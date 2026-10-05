@@ -405,13 +405,29 @@ variability metrics and, before the trapezoid fit, in `analyze` (so RERUN shapes
 
 The same per-night pass that writes the coincidence veto (`update_auto_verdicts`) also applies three shape rules
 to the search events with a stored shape, and unions the reasons in `auto_reason` (`; `-joined, rule order
-coincidence, EDGE_OUTLIER, NO_DIP, NO_BASELINE; a person's status always wins; recomputed from scratch, only
+coincidence, EDGE_OUTLIER, NO_DIP, NO_BASELINE, VARIABILITY; a person's status always wins; recomputed from scratch, only
 changed rows are written, so a re-run is idempotent and a reason goes exactly when its rule stops firing):
 `EDGE_OUTLIER` (the fit excluded edge epochs that were the only data beyond the search box on that side), `NO_DIP`
 (converged depth < `db.auto_nodip_depth` = 1e-3), `NO_BASELINE` (converged, fewer than
 `db.auto_nobaseline_min_epochs` = 5 epochs outside the fitted trapezoid and depth > `db.auto_nobaseline_min_depth`
 = 0.2). Read-only replay on the live DB (1598 search events): 118 / 15 / 20 events, union 152 (REJECTED 121,
 UNCONFIRMED 31, CONFIRMED 0 of 2).
+
+A fourth rule, `VARIABILITY` (`relphot.dip_variability`, `coincidence.variability_reasons`; not a shape rule: it needs
+no `transit_shape` row), rejects a search event when the star's CATALOGUE period explains the dip. Eligible: the
+object has a `catalog_match` row outside `PLANET_CATALOGS` with `period > 0` (a VSX `EP` type is ignored) and NO row in
+`PLANET_CATALOGS` (a known planet host is never judged: its period is a transit period); the period is that of the
+nearest such row, as catalogued (no refinement; `period_err`, else 1e-4 P, widens the repeat test). It fires on the
+event's own `tc_bjd_tdb` / `duration_h` when either test does: PHASE (the object's other nights, each with >= 8
+epochs after the spike clip, folded at P with one free offset per night, cover >= `db.auto_var_phase_cov_min` = 0.8
+of the in-window epochs, predict >= `db.auto_var_phase_ratio_min` = 0.7 of the observed depth and beat a flat baseline
+in the window) or REPEAT (>= 1 other search event of the object, on another night, at n P or odd n P/2 from this one
+with Poisson-binomial chance probability <= `db.auto_var_repeat_p_max` = 0.01). An event night with fewer than 12
+epochs is not judged. The reason names the test(s) with their numbers (`variability: the catalogue period P=... d
+(<catalog>) predicts this dip from N other nights folded (predicted/observed depth ..., phase coverage ... %)` and/or
+`... the dip repeats at multiples of the catalogue period ...: k other events at n*P (or odd n*P/2), chance p=...`).
+Prototype measurement on the live DB (2265 search events): 15 events fire (14 ECL, 1 RR), none of the stars without a
+literature period.
 
 `relphot db analyze --keep-vetted` and `relphot db reload-search` leave vetted events alone (`relphot.db.vetted`:
 CONFIRMED/REJECTED status or notes, a RERUN event, a supersede link, any event of an object with a
